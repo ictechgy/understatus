@@ -18,7 +18,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ictechgy/understatus.git"
+    "url": "git+https://github.com/ictechgy/understatus.git"
   },
   "homepage": "https://github.com/ictechgy/understatus",
   "engines": {
