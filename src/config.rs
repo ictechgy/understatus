@@ -376,7 +376,10 @@ fn apply_theme(config: &mut Config, raw_toml: &str) {
 /// 부분 섹션/부재 섹션도 `None`으로 흡수해 `false`를 반환하므로 프리셋이 채운다.
 /// "키 존재"만 판정하며 값의 타입/길이 유효성은 검사하지 않는다(`apply_theme` 주석 참조).
 fn has_key(value: &toml::Value, section: &str, key: &str) -> bool {
-    value.get(section).and_then(|table| table.get(key)).is_some()
+    value
+        .get(section)
+        .and_then(|table| table.get(key))
+        .is_some()
 }
 
 /// `chain_command`에 포함된 `$HOME`/`~`를 사용자 홈 경로로 확장한다.
@@ -447,10 +450,7 @@ mod tests {
         assert_eq!(config.chain.order, "self_first");
         assert_eq!(config.color.mode, "auto");
         // CALM 글리프 사다리(단일 셀 폭): ○ ▁ ▄ ▆ ◆.
-        assert_eq!(
-            config.cpu.load_glyphs,
-            vec!["○", "▁", "▄", "▆", "◆"]
-        );
+        assert_eq!(config.cpu.load_glyphs, vec!["○", "▁", "▄", "▆", "◆"]);
         // 펄스 숨쉬기 끝점: high/low 테라코타(hue shift 없음).
         assert_eq!(
             config.color.pulse_palette,

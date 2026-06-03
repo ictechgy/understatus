@@ -178,7 +178,10 @@ mod tests {
         assert_eq!(calm.load_glyphs, default.cpu.load_glyphs, "load_glyphs");
         assert_eq!(calm.pulse_style, default.pulse.pulse_style, "pulse_style");
         assert_eq!(calm.band_tints, default.color.band_tints, "band_tints");
-        assert_eq!(calm.pulse_palette, default.color.pulse_palette, "pulse_palette");
+        assert_eq!(
+            calm.pulse_palette, default.color.pulse_palette,
+            "pulse_palette"
+        );
         assert_eq!(calm.label_color, default.color.label_color, "label_color");
         assert_eq!(calm.separator, default.color.separator, "separator");
         assert_eq!(
@@ -191,7 +194,11 @@ mod tests {
     /// `THEME_KEYS`가 8개이고 각 경로가 유효 섹션을 가리키는지(동기화 누락 가드).
     #[test]
     fn theme_keys_match_preset_fields() {
-        assert_eq!(THEME_KEYS.len(), 8, "THEME_KEYS는 ThemePreset 필드와 1:1(8개)");
+        assert_eq!(
+            THEME_KEYS.len(),
+            8,
+            "THEME_KEYS는 ThemePreset 필드와 1:1(8개)"
+        );
         let valid_sections = ["cpu", "pulse", "color"];
         for (section, key) in THEME_KEYS {
             assert!(
@@ -216,9 +223,7 @@ mod tests {
     #[test]
     fn all_preset_hex_are_valid() {
         let is_valid_hex = |s: &str| {
-            s.len() == 7
-                && s.starts_with('#')
-                && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+            s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
         };
         for (name, _) in catalog() {
             let p = preset(name).expect("catalog 이름은 항상 프리셋 존재");
@@ -238,7 +243,11 @@ mod tests {
     fn emoji_glyphs_are_single_char_width_two() {
         let emoji = preset("emoji").expect("emoji 프리셋 존재");
         for glyph in &emoji.load_glyphs {
-            assert_eq!(glyph.chars().count(), 1, "emoji 글리프는 단일 코드포인트: {glyph}");
+            assert_eq!(
+                glyph.chars().count(),
+                1,
+                "emoji 글리프는 단일 코드포인트: {glyph}"
+            );
             let code = glyph.chars().next().expect("비어있지 않음") as u32;
             assert!(
                 (0x1F300..=0x1FAFF).contains(&code),

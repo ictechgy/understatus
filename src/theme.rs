@@ -286,11 +286,19 @@ mod tests {
         // 밴드 0–3은 cool blue-gray, 밴드 4는 warm 테라코타(#b87848).
         assert_eq!(
             band_tint(0, &cfg),
-            ColorSpec { r: 0x5a, g: 0x68, b: 0x78 }
+            ColorSpec {
+                r: 0x5a,
+                g: 0x68,
+                b: 0x78
+            }
         );
         assert_eq!(
             band_tint(4, &cfg),
-            ColorSpec { r: 0xb8, g: 0x78, b: 0x48 }
+            ColorSpec {
+                r: 0xb8,
+                g: 0x78,
+                b: 0x48
+            }
         );
         // 밴드 4(warm)는 밴드 3(cool)과 명확히 다른 톤이어야 한다(유일한 warm 예외).
         assert_ne!(band_tint(3, &cfg), band_tint(4, &cfg));
@@ -336,18 +344,26 @@ mod tests {
     #[test]
     fn pulse_color_breathes_between_terracotta_endpoints() {
         let cfg = Config::default(); // pulse_palette = ["#b87848", "#7a5030"]
-        // wave=0(phase=0.75) → start(high 테라코타 #b87848).
+                                     // wave=0(phase=0.75) → start(high 테라코타 #b87848).
         let high = pulse_color(95.0, 22_500, true, &cfg).expect("펄스 ON 틴트");
         assert_eq!(
             high,
-            ColorSpec { r: 0xb8, g: 0x78, b: 0x48 },
+            ColorSpec {
+                r: 0xb8,
+                g: 0x78,
+                b: 0x48
+            },
             "wave=0 끝점은 high 테라코타여야 함"
         );
         // wave=1(phase=0.25) → end(low dim 테라코타 #7a5030).
         let low = pulse_color(95.0, 7_500, true, &cfg).expect("펄스 ON 틴트");
         assert_eq!(
             low,
-            ColorSpec { r: 0x7a, g: 0x50, b: 0x30 },
+            ColorSpec {
+                r: 0x7a,
+                g: 0x50,
+                b: 0x30
+            },
             "wave=1 끝점은 low dim 테라코타여야 함"
         );
     }
@@ -368,11 +384,8 @@ mod tests {
     #[test]
     fn samples_per_period_default_is_six() {
         let cfg = Config::default(); // pulse_period_seconds=30, refresh=5
-        // 불변식: pulse_period(30) / refresh(5) = 6 ≥ 6
-        assert_eq!(
-            samples_per_period(&cfg, cfg.refresh.interval_seconds),
-            6
-        );
+                                     // 불변식: pulse_period(30) / refresh(5) = 6 ≥ 6
+        assert_eq!(samples_per_period(&cfg, cfg.refresh.interval_seconds), 6);
         assert!(
             samples_per_period(&cfg, cfg.refresh.interval_seconds) >= 6,
             "불변식: samples_per_period ≥ 6 (지각성)"
@@ -382,7 +395,7 @@ mod tests {
     #[test]
     fn samples_per_period_guards_zero_interval() {
         let cfg = Config::default(); // pulse_period_seconds=30
-        // 0 나눗셈 방어: interval=0이면 1초로 간주 → 30/1=30.
+                                     // 0 나눗셈 방어: interval=0이면 1초로 간주 → 30/1=30.
         assert_eq!(samples_per_period(&cfg, 0), 30);
     }
 }

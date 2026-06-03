@@ -615,7 +615,14 @@ mod tests {
     /// traversal/유니코드/특수문자/NUL은 전부 제거되어 결과에 `.`/`/`/`\`가 하나도 없어야 한다.
     #[test]
     fn sanitize_session_key_strips_unsafe() {
-        for raw in ["../../etc", "a/b\\c", "a b", "한글-세션", "x\0y", "/abs/path"] {
+        for raw in [
+            "../../etc",
+            "a/b\\c",
+            "a b",
+            "한글-세션",
+            "x\0y",
+            "/abs/path",
+        ] {
             let key = sanitize_session_key(raw);
             assert!(
                 !key.contains('.') && !key.contains('/') && !key.contains('\\'),
@@ -752,10 +759,8 @@ mod tests {
     /// 같은 session_key의 write→read는 같은 payload/timestamp를 돌려줘야 한다(세션 경로 라운드트립).
     #[test]
     fn session_named_cache_roundtrip() {
-        let base = std::env::temp_dir().join(format!(
-            "understatus-session-rt-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("understatus-session-rt-{}", std::process::id()));
         let path = session_cache_file_in(&base, "SESS-RT", "net_counters");
         write_cache_entry(&path, 7_777, "100 200");
         let (written_ms, payload) = read_cache_entry(&path).expect("세션 캐시 읽기 실패");

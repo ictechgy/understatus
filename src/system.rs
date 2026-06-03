@@ -289,8 +289,10 @@ extern "C" {
 
     // CFArray.
     fn CFArrayGetCount(array: *const libc::c_void) -> libc::c_long;
-    fn CFArrayGetValueAtIndex(array: *const libc::c_void, index: libc::c_long)
-        -> *const libc::c_void;
+    fn CFArrayGetValueAtIndex(
+        array: *const libc::c_void,
+        index: libc::c_long,
+    ) -> *const libc::c_void;
 
     // CFDictionary: 키로 값을 조회(get 규칙, CFRelease 금지).
     fn CFDictionaryGetValue(
@@ -337,11 +339,7 @@ const CF_COMPARE_EQUAL: libc::c_long = 0;
 /// `dict`가 유효한 CFDictionaryRef라는 전제하에 호출한다. 키 CFString은 함수 내부에서
 /// 생성/해제한다. 값 부재/타입 불일치 시 `None`.
 unsafe fn dict_number(dict: *const libc::c_void, key: &std::ffi::CStr) -> Option<i64> {
-    let cf_key = CFStringCreateWithCString(
-        std::ptr::null(),
-        key.as_ptr(),
-        CF_STRING_ENCODING_UTF8,
-    );
+    let cf_key = CFStringCreateWithCString(std::ptr::null(), key.as_ptr(), CF_STRING_ENCODING_UTF8);
     if cf_key.is_null() {
         return None;
     }
@@ -892,10 +890,7 @@ mod tests {
     #[test]
     fn live_disk_path_in_range_or_none() {
         if let Some(disk) = sample_disk() {
-            assert!(
-                (0.0..=100.0).contains(&disk),
-                "disk out of range: {disk}"
-            );
+            assert!((0.0..=100.0).contains(&disk), "disk out of range: {disk}");
         }
     }
 
