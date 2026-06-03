@@ -60,7 +60,7 @@ cargo build --release
 ### Install into Claude Code
 
 ```bash
-understatus install
+understatus install [--interval N] [--theme NAME] [--yes]
 ```
 
 This patches `~/.claude/settings.json` non-destructively:
@@ -68,7 +68,19 @@ This patches `~/.claude/settings.json` non-destructively:
 1. Reads your current `statusLine.command` (if any).
 2. Saves it as `chain_command` in `~/.config/understatus/config.toml`.
 3. Replaces `statusLine.command` with the understatus binary path.
-4. Injects `"refreshInterval": 5` (sourced from `config.toml [refresh].interval_seconds`).
+4. Injects `"refreshInterval": N` into `settings.json` and mirrors the same value to `config.toml [refresh].interval_seconds`.
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--interval N` | Set refresh interval in seconds (integer ≥ 1). |
+| `--theme NAME` | Set the theme (see [Themes](#themes) for valid names). |
+| `--yes` / `-y` | Skip interactive prompts even in a TTY; use flags / inherited / default values. |
+
+**Interactive prompts (TTY only, without `--yes`):** If a flag is omitted and stdin is a TTY, install asks for each missing value (up to 3 retries per item). Empty input accepts the inherited or default value.
+
+**Interval inheritance on reinstall:** When `--interval` is not supplied, the existing `[refresh].interval_seconds` from `config.toml` is reused. Priority: `--interval` flag > existing config value > default (5 s). This prevents the interval from silently resetting to 5 when you reinstall to change only the theme.
 
 ### Uninstall
 
@@ -80,14 +92,14 @@ Restores `statusLine.command` and `refreshInterval` to their exact pre-install s
 
 ---
 
-### ⚠️ Global side-effect: `refreshInterval = 5`
+### ⚠️ Global side-effect: `refreshInterval`
 
-`understatus install` writes `"refreshInterval": 5` into `settings.json`. This value applies to the **entire** statusLine subsystem — not just understatus:
+`understatus install` writes `"refreshInterval": N` into `settings.json` (default N = 5). This value applies to the **entire** statusLine subsystem — not just understatus:
 
-- understatus itself spawns as a new process every 5 seconds.
-- Any **chained command** (e.g. `lterm-omc-hud.mjs`) is also re-executed every 5 seconds.
+- understatus itself spawns as a new process every N seconds.
+- Any **chained command** (e.g. `lterm-omc-hud.mjs`) is also re-executed every N seconds.
 
-To decouple heavy chain children, understatus caches their stdout via `chain_cache_ttl_seconds` (default 10 s). The chained child re-spawns at most once per TTL — not every 5 s.
+To decouple heavy chain children, understatus caches their stdout via `chain_cache_ttl_seconds` (default 10 s). The chained child re-spawns at most once per TTL — not every N seconds.
 
 **To save battery on laptops**, raise the interval:
 
@@ -97,9 +109,44 @@ To decouple heavy chain children, understatus caches their stdout via `chain_cac
 interval_seconds = 10   # default: 5
 ```
 
-Note: increasing `interval_seconds` proportionally slows the terracotta breath animation. Adjust `pulse_period_seconds` accordingly to keep it smooth (`pulse_period / interval >= 6`).
+Note: increasing `interval_seconds` proportionally slows the terracotta breath animation. Adjust `pulse_period_seconds` accordingly to keep it smooth (`pulse_period / interval >= 6`). If `pulse_period / interval < 6` at install time, understatus prints a warning to stderr.
 
 `understatus uninstall` reverts `refreshInterval` precisely — no residue left behind.
+
+---
+
+## Themes
+
+understatus ships five built-in themes. Set the active theme in one line:
+
+```toml
+# ~/.config/understatus/config.toml
+theme = "vivid"
+```
+
+Or switch after install without reinstalling:
+
+```bash
+understatus theme vivid        # switch to vivid; takes effect on next render
+understatus theme              # show current theme and usage hint
+understatus themes             # list all available themes
+```
+
+### Theme table
+
+| Name | Glyph ramp (idle → crit) | Description |
+|------|--------------------------|-------------|
+| `calm` | `○ ▁ ▄ ▆ ◆` | Cool blue-grey ladder + terracotta breath at critical. **Default.** |
+| `mono` | `○ ▁ ▄ ▆ ◆` | Greyscale only — zero hue across all bands. |
+| `vivid` | `░ ▒ ▓ █ █` | Traffic-light colors (green → amber → red) with block-fill glyphs. |
+| `ember` | `· ∙ • ● ◉` | Warm amber/terracotta monochromatic ladder with dot glyphs. |
+| `emoji` | `😌 🙂 😅 🥵 🔥` | Emoji face ramp. Each glyph occupies 2 terminal columns. |
+
+**COLOR-ONCE principle:** Color is applied to the glyph character only. Numeric values (CPU%, memory, cost, etc.) are always uncolored regardless of theme.
+
+**Critical breath (≥90% CPU):** The critical-band glyph breathes between `pulse_palette[0]` (bright) and `pulse_palette[1]` (dim) over `pulse_period_seconds`. Hue never shifts — only brightness. The animation requires at least 6 render frames per period (`pulse_period / interval_seconds >= 6`); if this is not satisfied, install prints a warning.
+
+**Per-key override:** `theme` fills only the keys not explicitly set in your config. Any of the eight theme-owned keys (`load_glyphs`, `band_tints`, `pulse_palette`, `label_color`, `separator`, `separator_color`, `hud_seam`, `pulse_style`) written in your config take precedence over the preset.
 
 ---
 
@@ -110,8 +157,9 @@ All keys are optional; omitting a key uses its default.
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `theme` | `"calm"` | Active theme preset. Valid values: `calm`, `mono`, `vivid`, `ember`, `emoji`. The theme fills all eight visual keys not explicitly set in config; individual keys can still override it. |
 | `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency. |
-| `[cpu] load_glyphs` | `["○","▁","▄","▆","◆"]` | Glyphs for idle→critical load stages. Color is applied to the glyph only. To restore the original emoji theme: `["😌","🙂","😅","🥵","🔥"]`. |
+| `[cpu] load_glyphs` | `["○","▁","▄","▆","◆"]` | Glyphs for idle→critical load stages. Color is applied to the glyph only. Filled by the active theme; override by writing this key explicitly. |
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
 | `[pulse] pulse_off_threshold` | `80` | CPU% below which the breath turns off (hysteresis). |
 | `[pulse] pulse_period_seconds` | `30` | One full breath cycle in seconds. Keep `period / interval_seconds >= 6` for smooth animation. |
@@ -129,13 +177,13 @@ All keys are optional; omitting a key uses its default.
 | `[display] show_disk` | `true` | Show disk usage via `statfs("/")`. |
 | `[display] show_network` | `true` | Show network throughput (getifaddrs counter delta). First render has no delta — omitted silently. |
 | `[color] mode` | `"auto"` | `"auto"` \| `"truecolor"` \| `"256"` \| `"none"`. Respects `NO_COLOR`. |
-| `[color] band_tints` | see below | Five hex colors for idle→critical glyph tint. Defaults: cool blue-grey ladder + terracotta at index 4. |
-| `[color] pulse_palette` | `["#b87848","#7a5030"]` | High/low terracotta brightness for the breath animation. |
+| `[color] band_tints` | see below | Five hex colors for idle→critical glyph tint. Filled by the active theme; override by writing this key explicitly. |
+| `[color] pulse_palette` | `["#b87848","#7a5030"]` | High/low brightness endpoints for the breath animation. Filled by the active theme; override by writing this key explicitly. |
 | `[color] label_color` | `"#6b7280"` | Dimmed color for labels, units, arrows, and git marker. |
 | `[color] separator` | `" · "` | Segment separator string. |
 | `[color] separator_color` | `"#3b4048"` | Color for separator and HUD seam. |
 | `[color] hud_seam` | `"│"` | Character placed between understatus output and the chained command output. |
-| `[refresh] interval_seconds` | `5` | Value written to `settings.json` as `refreshInterval`. ⚠️ Global side-effect — see above. |
+| `[refresh] interval_seconds` | `5` | Value written to `settings.json` as `refreshInterval`. Set via `install --interval` or the interactive prompt. On reinstall the existing value is inherited unless `--interval` overrides it. ⚠️ Global side-effect — see above. |
 
 **Default `band_tints`** (cool blue-grey brightness ladder, warm terracotta only at critical):
 
@@ -152,24 +200,26 @@ Claude Code  (every refreshInterval seconds)
    │  stdin: one JSON line
    ▼
 understatus binary  (new process per call — no daemon, no state files, no locks)
-   ├─ parse stdin  → ClaudeInput
+   ├─ parse stdin  → ClaudeInput  (session_id extracted here)
    ├─ double-sample CPU  → cpu_percent (0–100%, average across all cores)
    │     on failure → loadavg fallback: min(load1 / ncpu × 100, 100)
    ├─ memory (host_statistics64)
-   ├─ battery (IOKit, 30 s TTL cache)        ← omitted on desktops
+   ├─ battery (IOKit, 30 s TTL cache)        ← machine-global; omitted on desktops
    ├─ disk    (statfs("/"))
    ├─ network (getifaddrs counter delta)     ← omitted on first render
-   ├─ glyph + band tint (color on glyph only)
-   │   at ≥90% CPU → terracotta brightness breath on ◆
+   ├─ glyph + band tint (color on glyph only, theme-driven)
+   │   at ≥90% CPU → brightness breath on the critical-band glyph
    ├─ chain_command child (TTL cache + 500 ms timeout)
    └─ compose → stdout (single newline)
 ```
 
 **CPU measurement:** Two `/proc`-equivalent snapshots are taken ~25 ms apart within the same process invocation. The delta gives true instantaneous utilization — not a smoothed load average. If the syscall fails (rare), `loadavg` serves as a silent fallback.
 
-**Glyph + tint design:** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored.
+**Glyph + tint design (COLOR-ONCE):** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored. The active theme fills these colors; individual config keys override the preset.
 
-**Terracotta breath:** When CPU stays at ≥90%, the `◆` glyph cycles between `pulse_palette[0]` (brighter terracotta) and `pulse_palette[1]` (darker terracotta) over `pulse_period_seconds`. Hue never shifts — only brightness. This is the `"calm"` pulse style.
+**Terracotta breath:** When CPU stays at ≥90%, the critical-band glyph cycles between `pulse_palette[0]` (brighter) and `pulse_palette[1]` (dimmer) over `pulse_period_seconds`. Hue never shifts — only brightness. This is the `"calm"` pulse style. Smooth animation requires `pulse_period / interval_seconds >= 6` (6 or more render frames per cycle).
+
+**Session cache isolation:** Per-render caches (chain command output, pulse state, network counter delta) are keyed by `session_id`. Multiple terminal windows running understatus simultaneously do not share or corrupt each other's cached values. Battery state is machine-global and is shared across sessions.
 
 ---
 
@@ -206,9 +256,12 @@ macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리
 
 **주요 특징**
 
-- **절제된 글리프 테마** — 부하 단계: `○ ▁ ▄ ▆ ◆`. 색은 글리프에만, 숫자 값은 무색, 라벨·구분자는 디밍. CPU ≥90%에서만 `◆`가 테라코타 명도 호흡(`#b87848`↔`#7a5030`).
+- **5종 테마** — `calm`(기본), `mono`, `vivid`, `ember`, `emoji`. 테마는 8개 시각 키(글리프·색상 등)를 한 번에 설정하며, 개별 키를 config.toml에 명시하면 테마보다 우선합니다.
+- **COLOR-ONCE 원칙** — 색은 글리프 문자에만 적용. 숫자 값(CPU%, 비용 등)은 항상 무색.
+- **≥90% 호흡** — CPU가 90% 이상으로 유지되면 임계 밴드 글리프가 테라코타 명도로 천천히 숨쉽니다(hue 변화 없음). 부드러운 애니메이션에는 `pulse_period / interval_seconds >= 6` 조건이 필요하며, 위반 시 설치 시점에 경고가 출력됩니다.
 - **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격) 직접 측정. loadavg 아님.
 - **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원.
+- **세션 캐시 격리** — 체인 출력·펄스 상태·네트워크 델타 캐시는 `session_id`별로 분리되어 여러 터미널을 동시에 열어도 값이 섞이지 않습니다. 배터리는 머신 전역.
 
 **설치**
 
@@ -226,14 +279,34 @@ npm install -g understatus
 **Claude Code에 적용**
 
 ```bash
-understatus install   # ~/.claude/settings.json 패치 (비파괴)
-understatus uninstall # 원상 복원
+understatus install [--interval N] [--theme NAME] [--yes]
+understatus uninstall   # 원상 복원
 ```
 
-> ⚠️ `install`은 `settings.json`에 `"refreshInterval": 5`를 전역 주입합니다. 체이닝된 기존 명령도 5초마다 재실행 대상이 됩니다. 배터리 절약이 필요하면 `config.toml`에서 `interval_seconds = 10`으로 올리세요.
+`--interval`/`--theme` 미지정 + TTY 환경이면 각 항목을 대화형으로 묻습니다. `--yes`(또는 비TTY)이면 플래그·기존값·기본값을 그대로 사용합니다. 재설치 시 `--interval`을 지정하지 않으면 기존 `config.toml`의 interval이 그대로 승계됩니다(기본 5초로 초기화되지 않습니다).
+
+> ⚠️ `install`은 `settings.json`에 `"refreshInterval": N`을 전역 주입합니다. 체이닝된 기존 명령도 N초마다 재실행 대상이 됩니다. 배터리 절약이 필요하면 `config.toml`에서 `interval_seconds = 10`으로 올리세요.
+
+**테마 관리**
+
+```bash
+understatus theme vivid    # 테마 전환 (config.toml만 수정, 즉시 적용)
+understatus theme          # 현재 테마 및 사용법 확인
+understatus themes         # 사용 가능한 테마 목록
+```
+
+| 이름 | 글리프 램프 (idle → crit) | 설명 |
+|------|--------------------------|------|
+| `calm` | `○ ▁ ▄ ▆ ◆` | 차가운 blue-grey + 테라코타 호흡 (기본) |
+| `mono` | `○ ▁ ▄ ▆ ◆` | 무채색, 제로 색상 |
+| `vivid` | `░ ▒ ▓ █ █` | 신호등 색 + 블록 글리프 |
+| `ember` | `· ∙ • ● ◉` | 따뜻한 앰버/테라코타 단색 + 도트 글리프 |
+| `emoji` | `😌 🙂 😅 🥵 🔥` | 이모지 표정 램프 (각 글리프 2칸 폭) |
 
 설정 파일: `~/.config/understatus/config.toml` (없으면 모두 기본값)
 
-기존 이모지 테마 복원: `config.toml`에서 `load_glyphs = ["😌","🙂","😅","🥵","🔥"]`
+```toml
+theme = "vivid"   # 한 줄로 테마 지정; 개별 키 override 가능
+```
 
 macOS 전용 · Apple Silicon(arm64) + Intel(x86\_64) · Rust 1.75+ · MIT 라이선스
