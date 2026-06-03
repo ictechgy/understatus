@@ -232,7 +232,9 @@ fn parse_theme_prompt(line: &str) -> Result<String, String> {
     if themes::is_known(trimmed) {
         return Ok(trimmed.to_string());
     }
-    Err(format!("알 수 없는 테마 '{trimmed}'. 'themes' 명령으로 목록을 확인하세요."))
+    Err(format!(
+        "알 수 없는 테마 '{trimmed}'. 'themes' 명령으로 목록을 확인하세요."
+    ))
 }
 
 /// 대화형 흐름으로 (interval, theme)을 해석한다. reader/writer/is_tty/승계값 주입(테스트 가능).
@@ -276,10 +278,7 @@ fn resolve_interval<R: BufRead, W: Write>(
         return fallback;
     }
     for _ in 0..MAX_PROMPT_RETRIES {
-        let _ = write!(
-            writer,
-            "Refresh interval in seconds [{fallback}]: "
-        );
+        let _ = write!(writer, "Refresh interval in seconds [{fallback}]: ");
         let _ = writer.flush();
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -394,8 +393,13 @@ fn run_render_pipeline() {
 
     // (8) self + chain 합성 후 한 줄 출력. 체인이 있으면 dim HUD seam("│")으로 소유권 경계 표시.
     let color_on = std::env::var_os("NO_COLOR").is_none() && cfg.color.mode != "none";
-    let line =
-        render::compose_with_seam(&self_segment, &chain_output, &cfg.chain.order, &cfg, color_on);
+    let line = render::compose_with_seam(
+        &self_segment,
+        &chain_output,
+        &cfg.chain.order,
+        &cfg,
+        color_on,
+    );
     println!("{line}");
 }
 
@@ -585,8 +589,7 @@ mod tests {
         };
         let mut reader = Cursor::new(Vec::new()); // 즉시 EOF.
         let mut writer = Vec::new();
-        let (interval, theme) =
-            resolve_install_params(&args, &mut reader, &mut writer, true, None);
+        let (interval, theme) = resolve_install_params(&args, &mut reader, &mut writer, true, None);
         assert_eq!(interval, 5);
         assert_eq!(theme, "calm");
     }
@@ -601,8 +604,7 @@ mod tests {
         };
         let mut reader = Cursor::new(b"vivid\n".to_vec());
         let mut writer = Vec::new();
-        let (interval, theme) =
-            resolve_install_params(&args, &mut reader, &mut writer, true, None);
+        let (interval, theme) = resolve_install_params(&args, &mut reader, &mut writer, true, None);
         assert_eq!(interval, 7, "interval은 플래그값(프롬프트 안 함)");
         assert_eq!(theme, "vivid", "theme은 프롬프트값");
     }
@@ -647,8 +649,7 @@ mod tests {
         };
         let mut reader = Cursor::new(Vec::new());
         let mut writer = Vec::new();
-        let (interval, _) =
-            resolve_install_params(&args, &mut reader, &mut writer, false, None);
+        let (interval, _) = resolve_install_params(&args, &mut reader, &mut writer, false, None);
         assert_eq!(interval, 5);
     }
 
@@ -662,8 +663,7 @@ mod tests {
         };
         let mut reader = Cursor::new(b"\n".to_vec()); // interval 프롬프트에 빈 줄.
         let mut writer = Vec::new();
-        let (interval, _) =
-            resolve_install_params(&args, &mut reader, &mut writer, true, Some(10));
+        let (interval, _) = resolve_install_params(&args, &mut reader, &mut writer, true, Some(10));
         assert_eq!(interval, 10);
     }
 }

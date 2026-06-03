@@ -693,7 +693,10 @@ mod tests {
             "dim 가운뎃점 구분자 필요: {line:?}"
         );
         // 옛 공백 단독 구분자(이모지 시절)는 더 이상 쓰지 않는다.
-        assert!(!line.contains("% mem"), "구분자는 가운뎃점이어야 함: {line:?}");
+        assert!(
+            !line.contains("% mem"),
+            "구분자는 가운뎃점이어야 함: {line:?}"
+        );
     }
 
     #[test]
@@ -929,13 +932,19 @@ mod tests {
         cfg.color.mode = "none".to_string();
         // None → 생략.
         let line_none = render(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
-        assert!(!line_none.contains("disk"), "disk None이면 생략: {line_none:?}");
+        assert!(
+            !line_none.contains("disk"),
+            "disk None이면 생략: {line_none:?}"
+        );
         // toggle off → 생략.
         cfg.display.show_disk = false;
         let mut snap = sample_snap(10.0);
         snap.disk_percent = Some(63.0);
         let line_off = render(&sample_input(), &snap, &cfg, 0, false);
-        assert!(!line_off.contains("disk"), "show_disk=false면 생략: {line_off:?}");
+        assert!(
+            !line_off.contains("disk"),
+            "show_disk=false면 생략: {line_off:?}"
+        );
     }
 
     #[test]
@@ -967,7 +976,10 @@ mod tests {
             tx_bps: 512.0,
         });
         let line_off = render(&sample_input(), &snap, &cfg, 0, false);
-        assert!(!line_off.contains('↓'), "show_network=false면 생략: {line_off:?}");
+        assert!(
+            !line_off.contains('↓'),
+            "show_network=false면 생략: {line_off:?}"
+        );
     }
 
     #[test]

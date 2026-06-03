@@ -34,7 +34,6 @@ const TYPE_KEY: &str = "type";
 /// statusLine 내부 padding 키 이름.
 const PADDING_KEY: &str = "padding";
 
-
 /// 설치가 기록하는 라운드트립 복원 정보.
 ///
 /// `apply_install`이 반환하고 `apply_uninstall`이 소비한다. uninstall이 주입 전
@@ -67,7 +66,11 @@ struct InstallRecord {
 /// # 반환
 /// uninstall이 정확 복원에 사용할 [`InstallRecord`]. 멱등 재설치 시에는 원본(=직전 설치가
 /// 보존한 chain_command/refreshInterval)을 그대로 담아 반환한다.
-fn apply_install(settings: &mut Value, understatus_path: &str, refresh_interval: u64) -> InstallRecord {
+fn apply_install(
+    settings: &mut Value,
+    understatus_path: &str,
+    refresh_interval: u64,
+) -> InstallRecord {
     let root = ensure_object(settings);
 
     let existing_status_line = root.get(STATUS_LINE_KEY).cloned();
@@ -268,10 +271,7 @@ pub fn install(interval: u64, theme: &str) -> Result<()> {
         if let Some(command) = &original_command {
             set_chain_command(table, command);
         }
-        table.insert(
-            "theme".to_string(),
-            toml::Value::String(theme.to_string()),
-        );
+        table.insert("theme".to_string(), toml::Value::String(theme.to_string()));
         set_refresh_interval(table, interval);
         Ok(())
     })?;
@@ -295,10 +295,7 @@ pub fn install(interval: u64, theme: &str) -> Result<()> {
 pub fn set_theme(name: &str) -> Result<()> {
     validate_theme(name)?;
     edit_config_doc(|table| {
-        table.insert(
-            "theme".to_string(),
-            toml::Value::String(name.to_string()),
-        );
+        table.insert("theme".to_string(), toml::Value::String(name.to_string()));
         Ok(())
     })
 }
@@ -786,13 +783,19 @@ mod tests {
         let existing = "[chain]\nchain_command = \"node old.mjs\"\n";
         let serialized = edit_config_doc_str(Some(existing), |table| {
             set_chain_command(table, "node old.mjs");
-            table.insert("theme".to_string(), toml::Value::String("ember".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("ember".to_string()),
+            );
             set_refresh_interval(table, 7);
             Ok(())
         })
         .expect("변환 성공");
         let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
-        assert_eq!(parsed.get("theme").and_then(toml::Value::as_str), Some("ember"));
+        assert_eq!(
+            parsed.get("theme").and_then(toml::Value::as_str),
+            Some("ember")
+        );
         assert_eq!(
             parsed
                 .get("refresh")
@@ -847,13 +850,19 @@ mod tests {
     #[test]
     fn edit_config_doc_str_creates_from_none() {
         let serialized = edit_config_doc_str(None, |table| {
-            table.insert("theme".to_string(), toml::Value::String("vivid".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("vivid".to_string()),
+            );
             set_refresh_interval(table, 5);
             Ok(())
         })
         .expect("변환 성공");
         let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
-        assert_eq!(parsed.get("theme").and_then(toml::Value::as_str), Some("vivid"));
+        assert_eq!(
+            parsed.get("theme").and_then(toml::Value::as_str),
+            Some("vivid")
+        );
         assert_eq!(
             parsed
                 .get("refresh")
@@ -873,7 +882,10 @@ mod tests {
         })
         .expect("변환 성공");
         let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
-        assert_eq!(parsed.get("theme").and_then(toml::Value::as_str), Some("mono"));
+        assert_eq!(
+            parsed.get("theme").and_then(toml::Value::as_str),
+            Some("mono")
+        );
         let glyphs = parsed
             .get("cpu")
             .and_then(|t| t.get("load_glyphs"))
@@ -888,12 +900,18 @@ mod tests {
         let existing =
             "theme = \"calm\"\n[chain]\nchain_command = \"x\"\n[refresh]\ninterval_seconds = 10\n";
         let serialized = edit_config_doc_str(Some(existing), |table| {
-            table.insert("theme".to_string(), toml::Value::String("vivid".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("vivid".to_string()),
+            );
             Ok(())
         })
         .expect("변환 성공");
         let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
-        assert_eq!(parsed.get("theme").and_then(toml::Value::as_str), Some("vivid"));
+        assert_eq!(
+            parsed.get("theme").and_then(toml::Value::as_str),
+            Some("vivid")
+        );
         // chain/refresh 보존.
         assert_eq!(
             parsed
@@ -943,7 +961,10 @@ mod tests {
     fn theme_command_does_not_change_interval() {
         let existing = "theme = \"calm\"\n[refresh]\ninterval_seconds = 12\n";
         let serialized = edit_config_doc_str(Some(existing), |table| {
-            table.insert("theme".to_string(), toml::Value::String("ember".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("ember".to_string()),
+            );
             Ok(())
         })
         .expect("변환 성공");
@@ -1090,18 +1111,27 @@ mod tests {
 
         // (1) 파일 부재에서 1회 write → 재read 시 키 존재.
         edit_config_doc(|table| {
-            table.insert("theme".to_string(), toml::Value::String("vivid".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("vivid".to_string()),
+            );
             set_refresh_interval(table, 5);
             Ok(())
         })
         .expect("디스크 write 성공");
         let raw1 = std::fs::read_to_string(&path).expect("재read 성공");
         let parsed1: toml::Value = toml::from_str(&raw1).expect("재파싱");
-        assert_eq!(parsed1.get("theme").and_then(toml::Value::as_str), Some("vivid"));
+        assert_eq!(
+            parsed1.get("theme").and_then(toml::Value::as_str),
+            Some("vivid")
+        );
 
         // (2) 멱등 재write → 동일 결과.
         edit_config_doc(|table| {
-            table.insert("theme".to_string(), toml::Value::String("vivid".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("vivid".to_string()),
+            );
             set_refresh_interval(table, 5);
             Ok(())
         })
@@ -1111,13 +1141,19 @@ mod tests {
 
         // (3) 무관 키 보존: theme만 바꿔도 refresh 유지.
         edit_config_doc(|table| {
-            table.insert("theme".to_string(), toml::Value::String("ember".to_string()));
+            table.insert(
+                "theme".to_string(),
+                toml::Value::String("ember".to_string()),
+            );
             Ok(())
         })
         .expect("부분 변경 성공");
         let raw3 = std::fs::read_to_string(&path).expect("재read 성공");
         let parsed3: toml::Value = toml::from_str(&raw3).expect("재파싱");
-        assert_eq!(parsed3.get("theme").and_then(toml::Value::as_str), Some("ember"));
+        assert_eq!(
+            parsed3.get("theme").and_then(toml::Value::as_str),
+            Some("ember")
+        );
         assert_eq!(
             parsed3
                 .get("refresh")
