@@ -639,18 +639,27 @@ fn sample_net_counters() -> Option<(u64, u64)> {
 /// 다음 렌더에서 그 직전값과 현재값의 델타로 rate를 산출한다(계획서 §F P2, 단기 TTL 예외).
 /// 첫 렌더(이전값 부재)나 `dt<=0`에서는 `None`을 반환한다(데몬/영속 상태 아님).
 ///
+/// # 인자
+/// - `session_key`: 세션 캐시 격리 키. net_counters 델타를 세션(터미널)별로 분리한다.
+///
 /// # 반환
 /// [`NetThroughput`] 또는 `None`(첫 렌더/카운터 조회 실패/dt<=0). 항상 무패닉(AC5).
-fn sample_net() -> Option<NetThroughput> {
-    /// 네트워크 카운터 델타 캐시 파일명(`~/Library/Caches/understatus/net_counters`).
+fn sample_net(session_key: &str) -> Option<NetThroughput> {
+    /// 네트워크 카운터 델타 캐시 파일명(`.../sessions/<key>/net_counters`).
     const NET_CACHE_FILE: &str = "net_counters";
 
     let (now_rx, now_tx) = sample_net_counters()?;
     let now_ms = crate::chain::cache_now_millis();
 
     // 직전 렌더 카운터를 읽는다(payload 포맷: "rx tx"). 다음 렌더를 위해 항상 현재값으로 갱신.
-    let prev = crate::chain::read_named_cache(NET_CACHE_FILE);
-    crate::chain::write_named_cache(NET_CACHE_FILE, now_ms, &format!("{now_rx} {now_tx}"));
+    // 세션 변형을 경유해 다른 세션의 prev가 이 세션 델타를 교란하지 않게 한다(§11.3).
+    let prev = crate::chain::read_session_named_cache(session_key, NET_CACHE_FILE);
+    crate::chain::write_session_named_cache(
+        session_key,
+        NET_CACHE_FILE,
+        now_ms,
+        &format!("{now_rx} {now_tx}"),
+    );
 
     let (prev_ms, payload) = prev?;
     let (prev_rx, prev_tx) = parse_net_counters(&payload)?;
@@ -673,16 +682,17 @@ fn parse_net_counters(payload: &str) -> Option<(u64, u64)> {
     Some((rx, tx))
 }
 
-// CONTRACT: signature is frozen — implement body only, do not change this signature
+// CONTRACT 해제(§11.3 버그 수정): net_counters 세션 격리를 위해 `session_key`를 추가한다.
 /// 설정에 따라 시스템 전체 스냅샷을 한 번에 수집한다.
 ///
 /// # 인자
 /// - `cfg`: 샘플 윈도(`cpu.sample_window_ms`), 표시 토글(`display.show_battery/show_disk/show_network`) 등.
+/// - `session_key`: 세션 캐시 격리 키(net_counters 델타에만 전달, battery는 전역 유지).
 ///
 /// # 반환
 /// CPU/메모리/배터리/디스크/네트워크를 채운 [`SystemSnapshot`]. 각 항목은 실패 시 안전 저하하며,
 /// 표시 토글이 꺼져 있으면 해당 샘플링 작업 자체를 건너뛴다(불필요한 syscall 회피).
-pub fn sample_system(cfg: &Config) -> SystemSnapshot {
+pub fn sample_system(cfg: &Config, session_key: &str) -> SystemSnapshot {
     SystemSnapshot {
         cpu_percent: sample_cpu_reactive(cfg.cpu.sample_window_ms),
         mem_percent: sample_memory(),
@@ -700,7 +710,7 @@ pub fn sample_system(cfg: &Config) -> SystemSnapshot {
         },
         // 네트워크(P2, getifaddrs 델타). 토글 off면 생략, 첫 렌더/실패 시 None.
         net: if cfg.display.show_network {
-            sample_net()
+            sample_net(session_key)
         } else {
             None
         },
@@ -894,5 +904,38 @@ mod tests {
     #[test]
     fn live_net_counters_no_panic() {
         let _ = sample_net_counters();
+    }
+
+    /// net_counters 세션 독립성(§11.3): 한 세션 키의 prev가 다른 세션 키 델타에 영향을 주지
+    /// 않아야 한다. `sample_net`이 경유하는 세션 변형(read/write_session_named_cache)을 직접
+    /// 검증한다. 키마다 다른 prev를 써도 각 키 read가 자기 값만 돌려주면 델타가 교란되지 않는다.
+    /// 충돌/오염 방지를 위해 프로세스 고유 키를 쓰고 끝나면 정리한다(HOME은 macOS 전용 보장).
+    #[test]
+    fn net_delta_session_independent() {
+        const NET_CACHE_FILE: &str = "net_counters";
+        let pid = std::process::id();
+        let key_a = format!("netindep-A-{pid}");
+        let key_b = format!("netindep-B-{pid}");
+
+        // 두 세션에 서로 다른 카운터(prev)를 기록한다.
+        crate::chain::write_session_named_cache(&key_a, NET_CACHE_FILE, 1_000, "100 200");
+        crate::chain::write_session_named_cache(&key_b, NET_CACHE_FILE, 1_000, "999 888");
+
+        // 각 세션 read가 자기 값만 돌려줘야 한다(상호 오염 없음).
+        let a = crate::chain::read_session_named_cache(&key_a, NET_CACHE_FILE);
+        let b = crate::chain::read_session_named_cache(&key_b, NET_CACHE_FILE);
+        assert_eq!(a.as_ref().map(|(_, p)| p.as_str()), Some("100 200"));
+        assert_eq!(b.as_ref().map(|(_, p)| p.as_str()), Some("999 888"));
+
+        // 정리: 세션 디렉터리 제거(런타임 GC 없음 → 테스트가 직접 청소).
+        if let Some(home) = std::env::var_os("HOME") {
+            let root = std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("understatus")
+                .join("sessions");
+            let _ = std::fs::remove_dir_all(root.join(&key_a));
+            let _ = std::fs::remove_dir_all(root.join(&key_b));
+        }
     }
 }
