@@ -18,11 +18,11 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const path = require('path');
 
-// package.json에서 버전을 읽어옵니다
-const packageJson = JSON.parse(
-  fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')
-);
-const VERSION = packageJson.version; // "0.1.0"
+// 네이티브 바이너리를 받아오는 GitHub 릴리스 태그.
+// npm 래퍼 패키지 버전(package.json)과는 분리되어 있습니다 —
+// 래퍼(이 스크립트/런처)만 패치 게시될 수 있으므로, 바이너리는 항상
+// 아래 고정된 릴리스에서 받습니다. 새 바이너리 릴리스를 낼 때 이 값을 올리세요.
+const VERSION = '0.1.0';
 
 // 플랫폼 확인: macOS 전용 패키지
 if (process.platform !== 'darwin') {
