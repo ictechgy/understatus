@@ -20,7 +20,7 @@ class Understatus < Formula
   #     | shasum -a 256
   # Or use `brew fetch --build-from-source ictechgy/understatus/understatus` once the
   # tap is registered, which prints the sha256 automatically.
-  sha256 "REPLACE_WITH_SOURCE_TARBALL_SHA256"
+  sha256 "9fd9f0d3d521a9b33d0d965a65db411040251740be93c8448109db71ac42cebe"
 
   license "MIT"
 
