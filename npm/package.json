@@ -1,0 +1,27 @@
+{
+  "name": "understatus",
+  "version": "0.1.0",
+  "description": "Claude Code statusline addon for macOS — CPU, memory, session info with a calm glyph theme",
+  "bin": {
+    "understatus": "bin/understatus.js"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64", "x64"],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/understatus.js",
+    "README.md"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ictechgy/understatus.git"
+  },
+  "homepage": "https://github.com/ictechgy/understatus",
+  "engines": {
+    "node": ">=16"
+  }
+}

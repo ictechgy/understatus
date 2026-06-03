@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          cd target/${{ matrix.target }}/release
+          tar czf understatus-${VERSION}-${{ matrix.target }}.tar.gz understatus
+          shasum -a 256 understatus-${VERSION}-${{ matrix.target }}.tar.gz > understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.target }}/release/understatus-*-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/understatus-*-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true

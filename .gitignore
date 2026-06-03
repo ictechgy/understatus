@@ -1,0 +1,6 @@
+/target
+.omc/
+.DS_Store
+*.log
+node_modules/
+npm/bin/

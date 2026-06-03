@@ -1,0 +1,4 @@
+{
+  "_comment": "AC2 픽스처: 최소 페이로드. session_id/model/workspace/cost/context_window 등 대부분의 필드가 없음. parse_claude_input이 누락 필드를 안전하게 처리하는지(패닉 없이 기본값/생략)를 검증. git 브랜치는 workspace.git_worktree/repo 에서 파생되므로 해당 키가 없으면 브랜치 세그먼트도 생략.",
+  "session_id": "min-session-00000000000000000001"
+}

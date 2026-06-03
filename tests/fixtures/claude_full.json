@@ -1,0 +1,20 @@
+{
+  "session_id": "0c5f8a2e-1b3d-4f6a-9c8e-2d7b4a1f0e9c",
+  "cwd": "/Users/jinhongan/Desktop/status_ticon/understatus",
+  "model": {
+    "id": "claude-opus-4-8",
+    "display_name": "Claude Opus 4.8"
+  },
+  "workspace": {
+    "current_dir": "/Users/jinhongan/Desktop/status_ticon/understatus",
+    "project_dir": "/Users/jinhongan/Desktop/status_ticon/understatus",
+    "git_worktree": "/Users/jinhongan/Desktop/status_ticon/understatus",
+    "repo": "/Users/jinhongan/Desktop/status_ticon/understatus"
+  },
+  "cost": {
+    "total_cost_usd": 1.2345
+  },
+  "context_window": {
+    "used_percentage": 37.5
+  }
+}

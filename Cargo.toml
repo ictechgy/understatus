@@ -1,0 +1,27 @@
+[package]
+name = "understatus"
+version = "0.1.0"
+edition = "2021"
+description = "A calm, unobtrusive macOS statusline addon for AI coding CLIs (Claude Code): CPU/memory/disk/network + session info with a quiet glyph theme."
+# macOS 전용 크레이트 (host_processor_info / sysctl / IOKit FFI 의존)
+license = "MIT"
+repository = "https://github.com/ictechgy/understatus"
+homepage = "https://github.com/ictechgy/understatus"
+readme = "README.md"
+keywords = ["statusline", "claude-code", "cli", "macos", "cpu"]
+categories = ["command-line-utilities"]
+authors = ["ictechgy"]
+rust-version = "1.75"
+exclude = [".omc", "docs", "npm", "homebrew", ".github", "tests/fixtures"]
+
+[dependencies]
+# host_processor_info / sysctl / IOKit FFI (system.rs 더블샘플 CPU, 메모리, 배터리)
+libc = "0.2"
+# Claude stdin JSON 파싱 + Config TOML 역직렬화
+serde = { version = "1", features = ["derive"] }
+# Claude Code stdin JSON 파싱 (claude.rs)
+serde_json = "1"
+# ~/.config/understatus/config.toml 파싱 (config.rs)
+toml = "0.8"
+# install/uninstall 등 fallible 경로의 에러 전파 (install.rs)
+anyhow = "1"

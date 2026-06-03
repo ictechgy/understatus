@@ -1,0 +1,21 @@
+{
+  "_comment": "AC2 픽스처: 유효한 Claude 페이로드지만 context_window.used_percentage = null. 첫 API 호출 전 또는 /compact 직후에 발생. 렌더 시 컨텍스트 세그먼트 생략 확인용.",
+  "session_id": "a1b2c3d4-0000-null-ctx-000000000001",
+  "cwd": "/Users/jinhongan/projects/myapp",
+  "model": {
+    "id": "claude-sonnet-4-6",
+    "display_name": "Claude Sonnet 4.6"
+  },
+  "workspace": {
+    "current_dir": "/Users/jinhongan/projects/myapp",
+    "project_dir": "/Users/jinhongan/projects/myapp",
+    "git_worktree": "/Users/jinhongan/projects/myapp",
+    "repo": "/Users/jinhongan/projects/myapp"
+  },
+  "cost": {
+    "total_cost_usd": 0.0
+  },
+  "context_window": {
+    "used_percentage": null
+  }
+}
