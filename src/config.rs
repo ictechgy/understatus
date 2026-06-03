@@ -5,12 +5,20 @@
 
 use serde::Deserialize;
 
+use crate::themes;
+
 /// understatus 전체 설정. 각 섹션은 §H-8 TOML의 테이블에 1:1 대응한다.
 ///
 /// `#[serde(default)]`로 부분 설정/누락 섹션을 안전하게 기본값으로 채운다.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// 적용 테마 이름. config.toml 최상위 `theme = "vivid"`.
+    ///
+    /// 미설정/미지 테마면 calm으로 안전 저하한다. `String::default()`는 `""`이므로
+    /// `#[serde(default = "default_theme")]`로 명시적으로 "calm" 기본값을 보장한다.
+    #[serde(default = "default_theme")]
+    pub theme: String,
     /// `[cpu]`: 이모지 임계값, 더블샘플 윈도, 정밀 모드.
     pub cpu: CpuConfig,
     /// `[pulse]`: 펄스 히스테리시스 임계값, 주기, 스타일.
@@ -219,10 +227,18 @@ impl Default for RefreshConfig {
     }
 }
 
+/// `theme` 필드의 serde 기본값("calm"). 키 부재 = calm = 현행 동일(하위호환).
+fn default_theme() -> String {
+    "calm".to_string()
+}
+
 impl Default for Config {
     /// 계획서 §H-8 TOML의 전 항목 기본값으로 [`Config`]를 구성한다.
     fn default() -> Self {
         Self {
+            // theme 기본값은 calm. calm 프리셋 = 아래 테마 필드 기본값과 정확히 동일
+            // (themes::preset_calm_matches_default_config 테스트로 결합).
+            theme: default_theme(),
             cpu: CpuConfig::default(),
             pulse: PulseConfig::default(),
             chain: ChainConfig::default(),
@@ -283,14 +299,84 @@ fn config_path() -> Option<std::path::PathBuf> {
 pub fn parse_config_str(contents: &str) -> Config {
     match toml::from_str::<Config>(contents) {
         Ok(mut config) => {
+            // 미설정 테마 키를 프리셋 구체값으로 채운다(우선순위: 사용자키 > 프리셋 > calm).
+            apply_theme(&mut config, contents);
             expand_chain_command(&mut config);
             config
         }
         Err(error) => {
-            eprintln!("understatus: config.toml 파싱 실패({error}). 기본값으로 진행합니다.");
+            // 타입 불일치(band_tints에 문자열 등)도 이 경로 → 전체 기본값(=calm, theme 무시) 폴백.
+            eprintln!(
+                "understatus: config.toml 파싱 실패({error}). 기본값으로 진행합니다(theme 설정 포함 전체 기본값 사용)."
+            );
             Config::default()
         }
     }
+}
+
+/// 테마 해석: `config.theme` 프리셋을 조회한 뒤 원본 TOML에 **명시되지 않은** 테마 키만
+/// 프리셋 값으로 채운다(우선순위: 사용자키 > 프리셋 > calm). 미지 테마면 경고 후 calm(패닉 금지).
+///
+/// # 인자
+/// - `config`: in-place로 테마 키를 채울 설정(이미 serde로 calm 기본 채워진 상태).
+/// - `raw_toml`: 원본 TOML 본문(키 명시 여부 판정용 재파싱 소스).
+///
+/// # 주의
+/// `has_key`는 "키 존재"만 보고 "값 유효성"은 보지 않는다. 사용자가 타입은 맞지만
+/// 길이가 부족하거나 hex 형식이 깨진 `band_tints`(예 `["#fff"]`)를 적으면 프리셋이
+/// 채우지 않아 그 값이 그대로 다운스트림으로 흐르고, render/theme의 `.get()`/`parse_hex`
+/// 폴백 색으로 표시된다(우선순위 규칙의 의도된 귀결, 패닉 없음).
+fn apply_theme(config: &mut Config, raw_toml: &str) {
+    let preset = match themes::preset(&config.theme) {
+        Some(preset) => preset,
+        None => {
+            eprintln!(
+                "understatus: 알 수 없는 테마 '{}'. calm으로 진행합니다.",
+                config.theme
+            );
+            themes::preset("calm").expect("calm은 항상 존재")
+        }
+    };
+
+    // 원본을 toml::Value로 재파싱해 각 테마 키의 명시 여부를 판정한다.
+    // 재파싱 실패(여기 도달 가능성은 낮음 — 이미 Config로 파싱 성공)면 프리셋 미적용.
+    let Ok(value) = toml::from_str::<toml::Value>(raw_toml) else {
+        return;
+    };
+
+    use themes::THEME_KEYS as keys;
+    if !has_key(&value, keys[0].0, keys[0].1) {
+        config.cpu.load_glyphs = preset.load_glyphs;
+    }
+    if !has_key(&value, keys[1].0, keys[1].1) {
+        config.pulse.pulse_style = preset.pulse_style;
+    }
+    if !has_key(&value, keys[2].0, keys[2].1) {
+        config.color.band_tints = preset.band_tints;
+    }
+    if !has_key(&value, keys[3].0, keys[3].1) {
+        config.color.pulse_palette = preset.pulse_palette;
+    }
+    if !has_key(&value, keys[4].0, keys[4].1) {
+        config.color.label_color = preset.label_color;
+    }
+    if !has_key(&value, keys[5].0, keys[5].1) {
+        config.color.separator = preset.separator;
+    }
+    if !has_key(&value, keys[6].0, keys[6].1) {
+        config.color.separator_color = preset.separator_color;
+    }
+    if !has_key(&value, keys[7].0, keys[7].1) {
+        config.color.hud_seam = preset.hud_seam;
+    }
+}
+
+/// `[section].key`가 원본 TOML에 실제로 적혀 있는지 판정한다.
+///
+/// 부분 섹션/부재 섹션도 `None`으로 흡수해 `false`를 반환하므로 프리셋이 채운다.
+/// "키 존재"만 판정하며 값의 타입/길이 유효성은 검사하지 않는다(`apply_theme` 주석 참조).
+fn has_key(value: &toml::Value, section: &str, key: &str) -> bool {
+    value.get(section).and_then(|table| table.get(key)).is_some()
 }
 
 /// `chain_command`에 포함된 `$HOME`/`~`를 사용자 홈 경로로 확장한다.
@@ -439,5 +525,142 @@ mod tests {
         let config = parse_config_str(toml);
         let command = config.chain.chain_command.expect("chain_command 있어야 함");
         assert_eq!(command, format!("{home}/bin/myhud"));
+    }
+
+    /// 블로킹 D 필수 게이트: `Config::default().theme == "calm"`.
+    ///
+    /// 기존 default 테스트(default_impl_matches_spec)가 theme 필드를 검사하지 않는
+    /// 구멍을 메운다. `Config::default()`에 `theme: "calm"` 누락 시 즉시 실패한다.
+    #[test]
+    fn theme_default_is_calm_string() {
+        assert_eq!(Config::default().theme, "calm");
+    }
+
+    /// theme="vivid" + override 없음 → vivid 프리셋의 틴트/글리프로 채워져야 한다.
+    #[test]
+    fn theme_vivid_fills_unset_keys() {
+        let config = parse_config_str(r#"theme = "vivid""#);
+        assert_eq!(config.theme, "vivid");
+        // vivid 블록 글리프 + 신호등 색.
+        assert_eq!(config.cpu.load_glyphs, vec!["░", "▒", "▓", "█", "█"]);
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#2f9150", "#3fb083", "#cda23e", "#f0a24e", "#e34a3a"]
+        );
+        assert_eq!(config.color.pulse_palette, vec!["#e34a3a", "#bf4135"]);
+    }
+
+    /// theme="vivid" + 사용자 band_tints 명시 → 사용자 값 우선, 나머지는 vivid.
+    #[test]
+    fn user_key_overrides_preset() {
+        let toml = r##"
+            theme = "vivid"
+            [color]
+            band_tints = ["#111111", "#222222", "#333333", "#444444", "#555555"]
+        "##;
+        let config = parse_config_str(toml);
+        // band_tints는 사용자 값 우선.
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#111111", "#222222", "#333333", "#444444", "#555555"]
+        );
+        // pulse_palette는 명시 안 했으므로 vivid 프리셋.
+        assert_eq!(config.color.pulse_palette, vec!["#e34a3a", "#bf4135"]);
+        // load_glyphs도 명시 안 했으므로 vivid.
+        assert_eq!(config.cpu.load_glyphs, vec!["░", "▒", "▓", "█", "█"]);
+    }
+
+    /// theme 키 부재 → calm(현행과 동일). 기존 calm 값으로 채워져야 한다.
+    #[test]
+    fn missing_theme_key_is_calm() {
+        let config = parse_config_str("");
+        assert_eq!(config.theme, "calm");
+        assert_eq!(config.cpu.load_glyphs, vec!["○", "▁", "▄", "▆", "◆"]);
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#5a6878", "#6d8296", "#86a0b4", "#9fbfce", "#b87848"]
+        );
+    }
+
+    /// 미지 테마 → calm 폴백(경고). calm 값으로 채워져야 한다.
+    #[test]
+    fn unknown_theme_falls_back_to_calm() {
+        let config = parse_config_str(r#"theme = "neon-does-not-exist""#);
+        // theme 문자열 자체는 사용자가 적은 값 유지(해석만 calm).
+        assert_eq!(config.theme, "neon-does-not-exist");
+        assert_eq!(config.cpu.load_glyphs, vec!["○", "▁", "▄", "▆", "◆"]);
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#5a6878", "#6d8296", "#86a0b4", "#9fbfce", "#b87848"]
+        );
+    }
+
+    /// 미지 테마 + 사용자 band_tints 명시 → 사용자값 보존 + 나머지 calm(Architect 권고 3b).
+    #[test]
+    fn unknown_theme_preserves_user_keys() {
+        let toml = r##"
+            theme = "neon-does-not-exist"
+            [color]
+            band_tints = ["#abcdef", "#abcdef", "#abcdef", "#abcdef", "#abcdef"]
+        "##;
+        let config = parse_config_str(toml);
+        // 사용자 band_tints 보존.
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#abcdef", "#abcdef", "#abcdef", "#abcdef", "#abcdef"]
+        );
+        // 나머지는 calm 폴백.
+        assert_eq!(config.color.pulse_palette, vec!["#b87848", "#7a5030"]);
+    }
+
+    /// theme="vivid" + band_tints="blue"(타입 불일치) → from_str 실패 → 전체 default(=calm), theme 무시.
+    #[test]
+    fn type_mismatch_falls_back_to_full_default() {
+        let toml = r#"
+            theme = "vivid"
+            [color]
+            band_tints = "blue"
+        "#;
+        let config = parse_config_str(toml);
+        // 파싱 실패 → Config::default() = calm. theme 무시.
+        assert_eq!(config.theme, "calm");
+        assert_eq!(config.cpu.load_glyphs, vec!["○", "▁", "▄", "▆", "◆"]);
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#5a6878", "#6d8296", "#86a0b4", "#9fbfce", "#b87848"]
+        );
+    }
+
+    /// theme="vivid" + band_tints=["#fff"](타입 OK, 길이 1) → has_key true → 프리셋 미충전,
+    /// 사용자값 보존(Architect 권고 3b). "키 존재 ≠ 값 유효" 한계 고정.
+    #[test]
+    fn valid_type_but_short_array_preserved() {
+        let toml = r##"
+            theme = "vivid"
+            [color]
+            band_tints = ["#fff"]
+        "##;
+        let config = parse_config_str(toml);
+        // 길이 1이어도 has_key true → 프리셋 미충전 → 사용자값 그대로.
+        assert_eq!(config.color.band_tints, vec!["#fff"]);
+        // 다른 미명시 키는 vivid.
+        assert_eq!(config.color.pulse_palette, vec!["#e34a3a", "#bf4135"]);
+    }
+
+    /// theme="vivid" + band_tints=["nothex",...](타입 OK, 길이 5, hex 형식 깨짐) → has_key true →
+    /// 프리셋 미충전, 사용자값 보존(Architect 권고 3a). "길이 부족"과 별개 폴백 경로.
+    #[test]
+    fn valid_type_broken_hex_preserved() {
+        let toml = r##"
+            theme = "vivid"
+            [color]
+            band_tints = ["nothex", "#a", "#b", "#c", "#d"]
+        "##;
+        let config = parse_config_str(toml);
+        // 형식이 깨져도 has_key true → 프리셋 미충전 → 사용자값 그대로(다운스트림 parse_hex가 폴백색 처리).
+        assert_eq!(
+            config.color.band_tints,
+            vec!["nothex", "#a", "#b", "#c", "#d"]
+        );
     }
 }
