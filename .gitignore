@@ -3,4 +3,5 @@
 .DS_Store
 *.log
 node_modules/
-npm/bin/
+# 다운로드된 네이티브 바이너리만 무시 (postinstall이 받음). 런처 소스(understatus.js)는 추적.
+/npm/bin/understatus
