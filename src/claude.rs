@@ -97,7 +97,35 @@ fn derive_git_branch(workspace: &RawWorkspace) -> Option<String> {
         .git_worktree
         .as_deref()
         .or(workspace.repo.as_deref())?;
+    // 외부 입력 경로 검증(traversal 차단): stdin으로 들어온 신뢰 불가 경로이므로
+    // `..` 상위 디렉터리 이동이 섞인 입력은 임의 위치 `.git/HEAD` 탐색을 노릴 수 있어 거부한다.
+    if !is_safe_base_path(base_path) {
+        return None;
+    }
     read_branch_from_git_dir(base_path)
+}
+
+/// 외부 입력으로 받은 git 워크트리 경로가 안전한지(상위 디렉터리 이동이 없는지) 검사한다.
+///
+/// # 인자
+/// - `base_path`: stdin의 `workspace.git_worktree`/`repo`에서 온 신뢰 불가 경로 문자열.
+///
+/// # 반환
+/// 경로가 비어 있지 않고 `..`(상위 디렉터리) 컴포넌트를 포함하지 않으면 `true`.
+///
+/// # 주의
+/// 외부 입력 경로 검증(traversal 차단): `../`로 의도하지 않은 상위 경로의 `.git/HEAD`를
+/// 읽는 path traversal 정보 탐색을 막기 위함이다. 절대경로 자체는 허용하되(정상 워크트리
+/// 보존), 심볼릭 링크 차단은 호출 측의 canonicalize 검증과 함께 다층 방어로 동작한다.
+fn is_safe_base_path(base_path: &str) -> bool {
+    use std::path::{Component, Path};
+    if base_path.trim().is_empty() {
+        return false;
+    }
+    // `..` 컴포넌트가 하나라도 있으면 traversal 시도로 보고 거부한다.
+    !Path::new(base_path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
 }
 
 /// 주어진 git 작업트리 경로에서 `.git/HEAD`를 읽어 현재 브랜치명을 추출한다.
@@ -112,7 +140,15 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     use std::path::Path;
     // 표준 워크트리는 `<base>/.git/HEAD`. (linked worktree의 gitfile 케이스는 v1 범위 밖.)
     let head_path = Path::new(base_path).join(".git").join("HEAD");
-    let contents = std::fs::read_to_string(head_path).ok()?;
+    // 외부 입력 경로 검증(심볼릭 차단): canonicalize로 심볼릭 링크/`.` 등을 해소한 실제
+    // 경로가 여전히 `.git/HEAD`로 끝나는지 확인한다. 심볼릭 링크가 다른 파일을 가리키면
+    // 끝이 달라져 거부되고, 경로가 없으면 canonicalize가 Err → None으로 안전 저하한다.
+    // (정상 워크트리의 실재 `.git/HEAD`는 문제없이 해소되므로 정상 동작은 보존된다.)
+    let canonical = std::fs::canonicalize(&head_path).ok()?;
+    if !canonical.ends_with(Path::new(".git").join("HEAD")) {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&canonical).ok()?;
     let trimmed = contents.trim();
     // 심볼릭 ref만 브랜치명을 가진다: "ref: refs/heads/main".
     let branch = trimmed.strip_prefix("ref: refs/heads/")?;
@@ -305,6 +341,24 @@ mod tests {
     #[test]
     fn nonexistent_worktree_yields_no_branch() {
         let raw = r#"{ "workspace": { "git_worktree": "/nonexistent/path/xyz" } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.git_branch, None);
+    }
+
+    /// 외부 입력 경로 검증(traversal 차단): `..`가 섞인 git_worktree는 거부되어 None이어야 한다.
+    /// 악의적 stdin이 상위 경로의 `.git/HEAD`를 탐색하지 못하게 막는다.
+    #[test]
+    fn git_worktree_with_parent_traversal_rejected() {
+        let raw = r#"{ "workspace": { "git_worktree": "/some/repo/../../etc" } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.git_branch, None);
+    }
+
+    /// 외부 입력 경로 검증: `/etc` 같은 임의 절대경로는 `.git/HEAD` 부재로 None이어야 한다.
+    /// (절대경로 자체는 허용하되 의도한 HEAD 파일이 없으므로 안전하게 None으로 저하한다.)
+    #[test]
+    fn absolute_system_path_yields_no_branch() {
+        let raw = r#"{ "workspace": { "git_worktree": "/etc" } }"#;
         let input = parse_claude_input(raw);
         assert_eq!(input.git_branch, None);
     }
