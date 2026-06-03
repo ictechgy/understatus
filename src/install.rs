@@ -235,13 +235,15 @@ pub fn install(interval: u64, theme: &str) -> Result<()> {
         .with_context(|| format!("settings.json JSON 파싱 실패: {}", settings_path.display()))?;
 
     // 백업: 아직 백업이 없을 때만 원본 전체를 보관(멱등 — 재설치가 백업을 덮지 않는다).
+    // settings.json 교체 이전에 원본을 보존해야 라운드트립(uninstall 정확 복원)이 보장된다.
     let backup_path = backup_json_path(&settings_path);
     if !backup_path.exists() {
         std::fs::write(&backup_path, &raw)
             .with_context(|| format!("백업 파일 쓰기 실패: {}", backup_path.display()))?;
     }
 
-    // 기존 statusLine.command를 chain_command로 보존(이미 설치된 경우 건너뜀 — 멱등).
+    // 기존 settings.json의 statusLine.command를 chain_command로 보존(이미 설치된 경우 건너뜀 — 멱등).
+    // settings.json을 교체하기 전에 원본 명령을 읽어 둔다.
     let original_command = settings
         .get(STATUS_LINE_KEY)
         .and_then(|status_line| status_line.get(COMMAND_KEY))
@@ -249,17 +251,18 @@ pub fn install(interval: u64, theme: &str) -> Result<()> {
         .filter(|command| *command != understatus_path)
         .map(str::to_string);
 
-    // 순수 변환 적용 후 2-space pretty JSON으로 기록(settings 측 interval 미러).
-    let _record = apply_install(&mut settings, &understatus_path, interval);
-    write_pretty_json(&settings_path, &settings)?;
-
     // 호흡 경고용: 기존 config.toml에서 사용자 pulse_period_seconds를 반영(BLOCKING-2).
+    // config.toml을 수정하기 전 원본에서 사용자 값을 읽어야 한다.
     // 파일 부재/파싱 실패면 parse_config_str/unwrap_or_default가 Config::default()로 안전 저하.
     let cfg_for_warn = read_existing_config_str()
         .as_deref()
         .map(config::parse_config_str)
         .unwrap_or_default();
 
+    // 쓰기 순서(부분 설치 방지): config.toml을 settings.json보다 **먼저** 기록한다.
+    // config 단계가 실패하면 settings.json은 손대지 않은 상태로 에러를 전파해야 한다.
+    // settings.json을 먼저 교체했다가 config 쓰기가 실패하면 settings는 understatus로
+    // 바뀌었는데 config는 미기록인 부분 설치가 발생한다(HIGH 블로커).
     // config.toml 단일 read-modify-write로 chain(있으면)+theme+interval 1회 기록.
     edit_config_doc(|table| {
         if let Some(command) = &original_command {
@@ -272,6 +275,11 @@ pub fn install(interval: u64, theme: &str) -> Result<()> {
         set_refresh_interval(table, interval);
         Ok(())
     })?;
+
+    // config.toml 기록 성공 확인 후에만 settings.json을 understatus로 교체+refreshInterval 주입.
+    // 순수 변환 적용 후 2-space pretty JSON으로 기록(settings 측 interval 미러).
+    let _record = apply_install(&mut settings, &understatus_path, interval);
+    write_pretty_json(&settings_path, &settings)?;
 
     warn_if_pulse_period_too_short(&cfg_for_warn, interval);
     Ok(())
@@ -352,6 +360,10 @@ pub(crate) fn existing_interval(existing: Option<&str>) -> Option<u64> {
         .get("refresh")?
         .get("interval_seconds")?
         .as_integer()
+        // CLI `parse_interval`은 `>= 1`만 허용한다. 승계 경로도 동일 규약을 지켜
+        // 음수(i64→u64 wrap으로 거대값)와 0(검증 우회)을 차단한다.
+        // `>= 1`인 값만 승계하고, 나머지는 None으로 떨어뜨려 기본 5 폴백을 타게 한다.
+        .filter(|n| *n >= 1)
         .map(|n| n as u64)
 }
 
@@ -527,29 +539,46 @@ where
 }
 
 /// 최상위 테이블에 `[chain].chain_command`를 설정한다(다른 키 보존). 기존 merge_chain_command 본문 이식.
+///
+/// `[chain]`이 존재하나 테이블이 아니면(손상된 config) 조용히 무시하지 않고 새 테이블로
+/// 교체한다. 그래야 install이 값을 반드시 기록한다(부분 설치/값 누락 방지). 조용한 no-op은
+/// 기존 merge_chain_command 동작(에러)에서 회귀한 것이므로 install 성공을 보장하도록 복구한다.
 fn set_chain_command(table: &mut toml::value::Table, command: &str) {
     let chain = table
         .entry("chain".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if let Some(chain_table) = chain.as_table_mut() {
-        chain_table.insert(
-            "chain_command".to_string(),
-            toml::Value::String(command.to_string()),
-        );
+    // 섹션이 비-table(손상)이면 새 빈 테이블로 덮어써 키 기록을 보장한다.
+    if !chain.is_table() {
+        *chain = toml::Value::Table(toml::map::Map::new());
     }
+    let chain_table = chain
+        .as_table_mut()
+        .expect("set_chain_command: 위에서 테이블로 보장했으므로 항상 Some");
+    chain_table.insert(
+        "chain_command".to_string(),
+        toml::Value::String(command.to_string()),
+    );
 }
 
 /// 최상위 테이블에 `[refresh].interval_seconds`를 설정한다(install 미러; 다른 키 보존).
+///
+/// `[refresh]`가 존재하나 테이블이 아니면(손상된 config) 조용히 무시하지 않고 새 테이블로
+/// 교체한다. 그래야 install이 interval을 반드시 기록한다(부분 설치/값 누락 방지).
 fn set_refresh_interval(table: &mut toml::value::Table, interval: u64) {
     let refresh = table
         .entry("refresh".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    if let Some(refresh_table) = refresh.as_table_mut() {
-        refresh_table.insert(
-            "interval_seconds".to_string(),
-            toml::Value::Integer(interval as i64),
-        );
+    // 섹션이 비-table(손상)이면 새 빈 테이블로 덮어써 키 기록을 보장한다.
+    if !refresh.is_table() {
+        *refresh = toml::Value::Table(toml::map::Map::new());
     }
+    let refresh_table = refresh
+        .as_table_mut()
+        .expect("set_refresh_interval: 위에서 테이블로 보장했으므로 항상 Some");
+    refresh_table.insert(
+        "interval_seconds".to_string(),
+        toml::Value::Integer(interval as i64),
+    );
 }
 
 /// 호흡 불변식 위반(한 색 주기 안 프레임 < 6) 여부를 판정하는 **순수 함수**.
@@ -781,6 +810,39 @@ mod tests {
         );
     }
 
+    /// 손상된(비-table) [chain]/[refresh] 섹션이어도 install이 값을 확실히 기록한다(회귀 차단).
+    ///
+    /// `[chain]`/`[refresh]`가 문자열/정수 등 비-table로 들어오면 기존 구현은 조용히 no-op했다
+    /// (값 미기록 → 부분 설치). 이제 새 테이블로 교체하고 키를 기록해야 한다.
+    #[test]
+    fn set_section_keys_overwrite_non_table_section() {
+        // chain/refresh가 테이블이 아닌 스칼라로 손상된 입력.
+        let existing = "chain = \"corrupted\"\nrefresh = 42\n";
+        let serialized = edit_config_doc_str(Some(existing), |table| {
+            set_chain_command(table, "node old.mjs");
+            set_refresh_interval(table, 9);
+            Ok(())
+        })
+        .expect("변환 성공");
+        let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
+        // chain_command가 새 테이블에 기록됨(조용한 no-op 아님).
+        assert_eq!(
+            parsed
+                .get("chain")
+                .and_then(|t| t.get("chain_command"))
+                .and_then(toml::Value::as_str),
+            Some("node old.mjs")
+        );
+        // interval_seconds도 새 테이블에 기록됨.
+        assert_eq!(
+            parsed
+                .get("refresh")
+                .and_then(|t| t.get("interval_seconds"))
+                .and_then(toml::Value::as_integer),
+            Some(9)
+        );
+    }
+
     /// existing=None이면 빈 테이블에서 시작해 theme/interval만 든 유효 TOML을 만든다.
     #[test]
     fn edit_config_doc_str_creates_from_none() {
@@ -978,6 +1040,29 @@ mod tests {
         assert_eq!(existing_interval(None), None);
         // 파싱 실패 → None(안전 저하).
         assert_eq!(existing_interval(Some("not valid toml ===")), None);
+    }
+
+    /// 음수/0 interval_seconds는 승계되지 않고 None(→ 기본 5 폴백)이어야 한다(BLOCKING-2).
+    ///
+    /// i64→u64 직접 캐스트는 음수를 거대값으로 wrap하고 0도 통과시켜 CLI `>= 1` 검증을
+    /// 우회한다. 승계 경로도 `>= 1`만 허용함을 고정한다.
+    #[test]
+    fn existing_interval_rejects_non_positive() {
+        // 음수 → None(거대값 wrap 차단).
+        assert_eq!(
+            existing_interval(Some("[refresh]\ninterval_seconds = -1")),
+            None
+        );
+        // 0 → None(CLI `>= 1` 검증 우회 차단).
+        assert_eq!(
+            existing_interval(Some("[refresh]\ninterval_seconds = 0")),
+            None
+        );
+        // 경계값 1은 정상 승계.
+        assert_eq!(
+            existing_interval(Some("[refresh]\ninterval_seconds = 1")),
+            Some(1)
+        );
     }
 
     // --- 디스크 라운드트립(UNDERSTATUS_CONFIG 오버라이드 + CONFIG_PATH_LOCK 직렬, HOME 미변경) ---
