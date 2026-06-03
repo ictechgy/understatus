@@ -234,7 +234,8 @@ fn cache_dir() -> Option<PathBuf> {
 /// # 안전성
 /// pub API([`read_named_cache`]/[`write_named_cache`])로 외부가 미살균 name을 넘길 수 있으므로
 /// 경로 조립 직전 [`sanitize_session_key`]로 방어 살균한다. 현재 상수는 allowlist-clean이라
-/// no-op이며(경로 불변), 빈/전부-비허용 name은 `"default"`로 떨어져 캐시 디렉터리 밖으로 못 나간다.
+/// no-op이며(경로 불변), 빈 name은 `"default"`, 전부-비허용 name은 `default-<hash>`로 떨어져
+/// (둘 다 traversal-safe) 캐시 디렉터리 밖으로 못 나간다.
 fn cache_file(name: &str) -> Option<PathBuf> {
     let safe_name = sanitize_session_key(name);
     cache_dir().map(|dir| dir.join(safe_name))
@@ -248,7 +249,13 @@ fn cache_file(name: &str) -> Option<PathBuf> {
 /// # 반환
 /// `[A-Za-z0-9_-]`만 남긴 결과. 단, strip(비허용 문자 제거)이나 64자 절단이 실제로
 /// 발생한 경우에는 원본의 해시(16자 16진수, `u64` 전체)를 접미사로 붙여 서로 다른 원본이
-/// 같은 키로 충돌하는 것을 방지한다(단사성 보강). 결과가 비면 `"default"`를 반환한다.
+/// 같은 키로 충돌하는 것을 방지한다(단사성 보강).
+///
+/// 살균 후 결과가 비는 두 경우를 구분한다:
+/// - `raw` 자체가 진짜 빈 문자열(단일 세션 폴백, 빈 session_id) → `"default"`.
+/// - `raw`는 비어있지 않으나 전부 비허용 문자(예 `"../../"`, `"한글"`) → `format!("default-{}", short_hash(raw))`.
+///   비어있지 않은 서로 다른 입력이 모두 같은 `"default"` 네임스페이스를 공유해 세션 격리가
+///   약화되던 것을 막기 위해, 원본 해시로 결정론적 고유 키를 만든다.
 ///
 /// # 안전성
 /// `..`/`/`/`\`/공백/유니코드/NUL을 전부 제거하므로 경로 traversal·절대경로 주입을
@@ -261,7 +268,13 @@ pub fn sanitize_session_key(raw: &str) -> String {
         .take(64)
         .collect();
     if cleaned.is_empty() {
-        return "default".to_string();
+        // raw가 진짜 빈 문자열일 때만 "default"(단일 세션 폴백 유지).
+        if raw.is_empty() {
+            return "default".to_string();
+        }
+        // raw는 비어있지 않으나 전부 비허용 문자 → 원본 해시로 고유 키를 만들어 격리 보존.
+        // 해시 접미사만 사용하므로 traversal-safe 문자(`[a-f0-9-]`)만 남는다.
+        return format!("default-{}", short_hash(raw));
     }
     // strip 또는 절단이 발생했으면(원본과 문자열 동치가 깨지면) 충돌 방지용 해시 접미사를 붙인다.
     // 멀티바이트 안전: 바이트 길이가 아니라 String 동치 비교라 유니코드 제거도 정확히 잡는다.
@@ -309,7 +322,8 @@ fn short_hash(raw: &str) -> String {
 /// base 출처와 무관하게 매번 [`sanitize_session_key`]를 적용하므로 release 빌드에서도
 /// traversal 방어가 살아 있다. 살균은 멱등이라 이중 적용이 경로를 바꾸지 않는다.
 /// `name`도 동일하게 방어 살균한다(pub API로 미살균 name 유입 가능). 현재 상수는
-/// allowlist-clean이라 no-op이며(경로 불변), 빈/전부-비허용 name은 `"default"`로 떨어진다.
+/// allowlist-clean이라 no-op이며(경로 불변), 빈 name은 `"default"`, 전부-비허용 name은
+/// `default-<hash>`로 떨어진다(둘 다 traversal-safe).
 fn session_cache_file_in(base: &Path, session_key: &str, name: &str) -> PathBuf {
     let key = sanitize_session_key(session_key);
     let safe_name = sanitize_session_key(name);
@@ -653,12 +667,36 @@ mod tests {
         assert!(a.starts_with("sessA-") && b.starts_with("sessA-"));
     }
 
-    /// 빈 문자열/전부 비허용 문자는 "default"로 폴백해야 한다.
+    /// 진짜 빈 문자열만 "default"로 폴백하고, 비어있지 않은 전부-비허용 입력은
+    /// 서로 다른 `default-<hash>` 고유 키가 되어야 한다(세션 격리 보존, Fix C).
     #[test]
     fn sanitize_session_key_empty_falls_back() {
+        // raw가 진짜 빈 문자열일 때만 "default"(단일 세션 폴백 유지).
         assert_eq!(sanitize_session_key(""), "default");
-        assert_eq!(sanitize_session_key("../../"), "default");
-        assert_eq!(sanitize_session_key("한글"), "default");
+
+        // 비어있지 않은 전부-비허용 입력은 더 이상 "default"를 공유하지 않는다.
+        let traversal = sanitize_session_key("../../");
+        let hangul = sanitize_session_key("한글");
+        assert_ne!(traversal, "default", "traversal 입력이 default와 충돌");
+        assert_ne!(hangul, "default", "유니코드 입력이 default와 충돌");
+        // 서로 다른 비허용 입력은 서로 다른 키여야 한다(격리).
+        assert_ne!(
+            traversal, hangul,
+            "서로 다른 입력이 같은 키를 공유: {traversal} == {hangul}"
+        );
+        // default- 접두사 형태이며 traversal-safe 문자만 포함한다.
+        for key in [&traversal, &hangul] {
+            assert!(key.starts_with("default-"), "default- 접두사 누락: {key}");
+            assert!(
+                !key.contains('.') && !key.contains('/') && !key.contains('\\'),
+                "위험 문자가 남음: {key}"
+            );
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "allowlist 위반: {key}"
+            );
+        }
     }
 
     /// short_hash 출력은 항상 16자(`u64` 전체 16진수)여야 한다(폭 자기축소 회귀 차단).
