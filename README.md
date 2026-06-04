@@ -141,10 +141,10 @@ understatus themes             # list all available themes
 | `vivid` | `░ ▒ ▓ █ █` | Traffic-light colors (green → amber → red) with block-fill glyphs. |
 | `ember` | `· ∙ • ● ◉` | Warm amber/terracotta monochromatic ladder with dot glyphs. |
 | `emoji` | `😌 🙂 😅 🥵 🔥` | Emoji face ramp. Each glyph occupies 2 terminal columns. |
-| `neon` | `○ ▁ ▄ ▆ ◆` | Neon cyberpunk — electric cyan → magenta with hue-cycling pulse. |
-| `aurora` | `○ ▁ ▄ ▆ ◆` | Aurora borealis — teal → purple gradient with flash pulse. |
-| `sunset` | `○ ▁ ▄ ▆ ◆` | Sunset — gold → coral → purple with flash pulse. |
-| `spectrum` | `○ ▁ ▄ ▆ ◆` | Per-band rainbow — green → magenta with hue-cycling pulse. |
+| `neon` | `░ ▒ ▓ █ █` | Neon cyberpunk — electric cyan → magenta with hue-cycling pulse. |
+| `aurora` | `▁ ▃ ▅ ▆ █` | Aurora borealis — teal → purple gradient with flash pulse. |
+| `sunset` | `· ∙ • ● ◉` | Sunset — gold → coral → purple with flash pulse. |
+| `spectrum` | `▁ ▂ ▄ ▆ █` | Per-band rainbow — green → magenta with hue-cycling pulse. |
 
 **COLOR-ONCE principle:** Color is applied to the glyph character only. Numeric values (CPU%, memory, cost, etc.) are always uncolored regardless of theme.
 
@@ -355,10 +355,10 @@ understatus themes         # 사용 가능한 테마 목록
 | `vivid` | `░ ▒ ▓ █ █` | 신호등 색 + 블록 글리프 |
 | `ember` | `· ∙ • ● ◉` | 따뜻한 앰버/테라코타 단색 + 도트 글리프 |
 | `emoji` | `😌 🙂 😅 🥵 🔥` | 이모지 표정 램프 (각 글리프 2칸 폭) |
-| `neon` | `○ ▁ ▄ ▆ ◆` | 네온 사이버펑크 (일렉트릭 시안→마젠타, hue 순환 펄스) |
-| `aurora` | `○ ▁ ▄ ▆ ◆` | 오로라 청록→보라 그라데이션 (flash 펄스) |
-| `sunset` | `○ ▁ ▄ ▆ ◆` | 노을 골드→코랄→퍼플 (flash 펄스) |
-| `spectrum` | `○ ▁ ▄ ▆ ◆` | 밴드별 무지개 (초록→마젠타, hue 순환 펄스) |
+| `neon` | `░ ▒ ▓ █ █` | 네온 사이버펑크 (일렉트릭 시안→마젠타, hue 순환 펄스) |
+| `aurora` | `▁ ▃ ▅ ▆ █` | 오로라 청록→보라 그라데이션 (flash 펄스) |
+| `sunset` | `· ∙ • ● ◉` | 노을 골드→코랄→퍼플 (flash 펄스) |
+| `spectrum` | `▁ ▂ ▄ ▆ █` | 밴드별 무지개 (초록→마젠타, hue 순환 펄스) |
 
 **펄스 스타일**
 

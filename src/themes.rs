@@ -10,14 +10,14 @@
 ///
 /// # 주의
 /// `pulse_style`은 기존 테마("calm"·"mono"·"vivid"·"ember"·"emoji")에서는 "calm"이고,
-/// 신규 화려한 테마(neon·spectrum="hue", aurora·sunset="flash")에서는 bold 값을 예약한다.
-/// 현재 render/theme 어디서도 이 값이 분기에 쓰이지 않는 "데드 데이터"이며, 향후 펄스
-/// 애니메이션 구현 시 실제 시각 채널로 승격된다.
+/// 신규 화려한 테마(neon·spectrum="hue", aurora·sunset="flash")에서는 해당 스타일 값이다.
+/// `theme::pulse_color`(틴트 계산)와 `theme::pick_emoji`(swap 글리프 교대)가 소비하는
+/// 라이브 시각 채널이다. 유효 값: "calm" | "flash" | "hue" | "swap".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemePreset {
     /// `cpu.load_glyphs`(5개): idle/low/mid/high/crit 밴드 글리프.
     pub load_glyphs: Vec<String>,
-    /// `pulse.pulse_style`("calm" — 데드 데이터).
+    /// `pulse.pulse_style`("calm"|"flash"|"hue"|"swap" — 라이브 시각 채널).
     pub pulse_style: String,
     /// `color.band_tints`(5개 hex): 밴드별 글리프 틴트.
     pub band_tints: Vec<String>,
