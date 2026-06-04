@@ -338,9 +338,7 @@ mod tests {
         let names: Vec<&str> = catalog().iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            vec![
-                "calm", "mono", "vivid", "ember", "emoji", "neon", "aurora", "sunset", "spectrum"
-            ]
+            vec!["calm", "mono", "vivid", "ember", "emoji", "neon", "aurora", "sunset", "spectrum"]
         );
     }
 
