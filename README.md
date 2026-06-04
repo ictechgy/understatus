@@ -154,6 +154,55 @@ understatus themes             # list all available themes
 
 ---
 
+## Pulse styles
+
+When the pulse is active (CPU ≥ `pulse_on_threshold`), `pulse_style` controls how the critical-band glyph animates. There are four styles:
+
+| Style | Behavior |
+|-------|----------|
+| `calm` | Fixed glyph shape. Terracotta luminance breathing — hue never shifts, only brightness cycles between `pulse_palette[0]` (bright) and `pulse_palette[1]` (dim). Most subtle. **Default for original themes.** |
+| `flash` | Fixed glyph shape. Same terracotta endpoints as `calm`, but uses a sharper sine curve — the midpoint brightness contrast is more pronounced (punchier breathing). |
+| `hue` | Fixed glyph shape. The glyph tint cycles through the full hue wheel (rainbow shimmer) over one `pulse_period_seconds`. Saturation and value stay constant; only hue rotates 360°. |
+| `swap` | Hue cycling (same as `hue`) **plus** glyph shape alternation: the critical glyph swaps between its filled and hollow forms (e.g. `◆` ↔ `◇`) on the second half of each period. Most eye-catching. |
+
+**Flashy theme defaults:** The four bold themes ship with a fitting default style — `neon` and `spectrum` use `hue`; `aurora` and `sunset` use `flash`. The original five themes (`calm`, `mono`, `vivid`, `ember`, `emoji`) all use `calm`. All are overridable per the per-key override rule above.
+
+**When pulse is OFF:** Regardless of `pulse_style`, when CPU is below `pulse_off_threshold` the pulse is inactive and the glyph renders with its static `band_tints` color — no animation of any kind.
+
+### Trigger thresholds
+
+```toml
+# ~/.config/understatus/config.toml
+[pulse]
+pulse_on_threshold  = 90   # default: CPU% at which pulse activates
+pulse_off_threshold = 80   # default: CPU% below which pulse deactivates (hysteresis)
+```
+
+Lower the thresholds to pulse at a lower CPU load:
+
+```toml
+[pulse]
+pulse_on_threshold  = 75
+pulse_off_threshold = 65
+```
+
+### Changing the pulse style
+
+```toml
+# ~/.config/understatus/config.toml
+[pulse]
+pulse_style = "hue"   # calm | flash | hue | swap
+```
+
+Or switch from the command line (takes effect on the next render):
+
+```bash
+understatus pulse hue    # change pulse style
+understatus pulse        # print current style
+```
+
+---
+
 ## Configuration
 
 File: `~/.config/understatus/config.toml`  
@@ -167,7 +216,7 @@ All keys are optional; omitting a key uses its default.
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
 | `[pulse] pulse_off_threshold` | `80` | CPU% below which the breath turns off (hysteresis). |
 | `[pulse] pulse_period_seconds` | `30` | One full breath cycle in seconds. Keep `period / interval_seconds >= 6` for smooth animation. |
-| `[pulse] pulse_style` | `"calm"` | `"calm"` = fixed glyph shape + terracotta brightness breath (hue never changes). `"bold"` = legacy style. |
+| `[pulse] pulse_style` | `"calm"` | Pulse animation style when active. `"calm"` = terracotta luminance breath, hue-invariant (most subtle). `"flash"` = same endpoints, sharper midpoint contrast. `"hue"` = hue-wheel cycling (rainbow shimmer). `"swap"` = hue cycling + glyph shape alternation (most eye-catching). See [Pulse styles](#pulse-styles). |
 | `[chain] chain_command` | `""` | Populated by `install`. The command that runs alongside understatus. |
 | `[chain] order` | `"self_first"` | `"self_first"` or `"chain_first"` — which output appears on the left. |
 | `[chain] chain_cache_ttl_seconds` | `10` | How long (s) to cache the chained command's stdout before re-spawning it. |
@@ -221,7 +270,7 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 
 **Glyph + tint design (COLOR-ONCE):** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored. The active theme fills these colors; individual config keys override the preset.
 
-**Terracotta breath:** When CPU stays at ≥90%, the critical-band glyph cycles between `pulse_palette[0]` (brighter) and `pulse_palette[1]` (dimmer) over `pulse_period_seconds`. Hue never shifts — only brightness. This is the `"calm"` pulse style. Smooth animation requires `pulse_period / interval_seconds >= 6` (6 or more render frames per cycle).
+**Pulse animation:** When CPU stays at or above `pulse_on_threshold` (default 90%), the critical-band glyph animates according to `pulse_style`. The `"calm"` style cycles between `pulse_palette[0]` (brighter) and `pulse_palette[1]` (dimmer) with hue-invariant brightness breathing. `"flash"` uses the same endpoints but a sharper curve. `"hue"` rotates through the full hue wheel. `"swap"` adds glyph shape alternation on top of hue rotation. Smooth animation requires `pulse_period / interval_seconds >= 6` (6 or more render frames per cycle). See [Pulse styles](#pulse-styles).
 
 **Session cache isolation:** Per-render caches (chain command output, pulse state, network counter delta) are keyed by `session_id`. Multiple terminal windows running understatus simultaneously do not share or corrupt each other's cached values. Battery state is machine-global and is shared across sessions.
 
@@ -310,6 +359,34 @@ understatus themes         # 사용 가능한 테마 목록
 | `aurora` | `○ ▁ ▄ ▆ ◆` | 오로라 청록→보라 그라데이션 (flash 펄스) |
 | `sunset` | `○ ▁ ▄ ▆ ◆` | 노을 골드→코랄→퍼플 (flash 펄스) |
 | `spectrum` | `○ ▁ ▄ ▆ ◆` | 밴드별 무지개 (초록→마젠타, hue 순환 펄스) |
+
+**펄스 스타일**
+
+CPU가 `pulse_on_threshold`(기본 90%) 이상이면 임계 밴드 글리프가 `pulse_style`에 따라 애니메이션됩니다.
+
+| 스타일 | 동작 |
+|--------|------|
+| `calm` | 글리프 고정. 테라코타 명도 호흡 (hue 변화 없음). 가장 차분함. **기존 테마 기본.** |
+| `flash` | 글리프 고정. `calm`과 같은 끝점이지만 중간 위상 대비가 더 가파름 (더 강렬한 호흡). |
+| `hue` | 글리프 고정. 글리프 색이 한 주기(pulse_period_seconds) 동안 색상환 전체를 순환 (무지개 shimmer). |
+| `swap` | `hue` 순환 **+** 글리프 모양 교대: 주기 후반부에 `◆`↔`◇` 등 채움/빈 형태를 번갈아 표시. 가장 눈에 띔. |
+
+화려한 테마 기본: `neon`·`spectrum` = `hue`, `aurora`·`sunset` = `flash`. 기존 5종은 모두 `calm`. 개별 키로 재정의 가능.
+
+펄스가 OFF(CPU < `pulse_off_threshold`)이면 스타일과 무관하게 정적 밴드 틴트로 표시됩니다 (애니메이션 없음).
+
+```toml
+# ~/.config/understatus/config.toml
+[pulse]
+pulse_on_threshold  = 90   # 펄스 발동 CPU% (기본)
+pulse_off_threshold = 80   # 펄스 해제 CPU% — 히스테리시스 (기본)
+pulse_style = "hue"        # calm | flash | hue | swap
+```
+
+```bash
+understatus pulse hue    # 펄스 스타일 변경 (config.toml만 수정, 즉시 적용)
+understatus pulse        # 현재 펄스 스타일 확인
+```
 
 설정 파일: `~/.config/understatus/config.toml` (없으면 모두 기본값)
 
