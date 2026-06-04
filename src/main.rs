@@ -64,6 +64,12 @@ fn main() -> ExitCode {
     }
 }
 
+/// 서브커맨드에 허용된 위치 인자(값 1개)를 초과했는지 판정한다.
+/// `args[0]`=서브커맨드, `args[1]`=값. len>2면 잉여 인자.
+fn has_extra_args(args: &[String]) -> bool {
+    args.len() > 2
+}
+
 /// 설치 가능한 테마 기본값(미지정 + 비TTY/`--yes` 폴백).
 const DEFAULT_THEME: &str = "calm";
 /// 설치 가능한 갱신 주기 기본값(초).
@@ -119,6 +125,10 @@ fn run_install(args: &[String]) -> ExitCode {
 
 /// theme 서브커맨드를 실행한다(`theme <name>` → 교체, 이름 누락 → 현재 테마 + 사용법).
 fn run_theme(args: &[String]) -> ExitCode {
+    if has_extra_args(args) {
+        eprintln!("understatus: theme 명령은 테마 이름 하나만 받습니다. 사용법: understatus theme <name>");
+        return ExitCode::FAILURE;
+    }
     match args.get(1) {
         Some(name) => match install::set_theme(name) {
             Ok(()) => {
@@ -142,6 +152,10 @@ fn run_theme(args: &[String]) -> ExitCode {
 
 /// pulse 서브커맨드를 실행한다(`pulse <style>` → 교체, 스타일 누락 → 현재 스타일 + 사용법).
 fn run_pulse(args: &[String]) -> ExitCode {
+    if has_extra_args(args) {
+        eprintln!("understatus: pulse 명령은 스타일 인자 하나만 받습니다. 사용법: understatus pulse <calm|flash|hue|swap>");
+        return ExitCode::FAILURE;
+    }
     match args.get(1) {
         Some(style) => match install::set_pulse_style(style) {
             Ok(()) => {
@@ -480,6 +494,17 @@ fn print_version() {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn has_extra_args_detects_surplus() {
+        assert!(!has_extra_args(&["pulse".to_string()]));
+        assert!(!has_extra_args(&["pulse".to_string(), "hue".to_string()]));
+        assert!(has_extra_args(&[
+            "pulse".to_string(),
+            "hue".to_string(),
+            "typo".to_string()
+        ]));
+    }
 
     /// 인자 슬라이스를 만든다(args[0] == "install").
     fn install_argv(rest: &[&str]) -> Vec<String> {
