@@ -328,8 +328,6 @@ fn validate_theme(name: &str) -> Result<()> {
 ///
 /// # 반환
 /// 성공 시 `Ok(())`. 미지 스타일/I-O 실패는 [`anyhow::Error`]로 전파한다.
-// 다음 태스크(main.rs `pulse` 서브커맨드)에서 호출될 때까지 dead_code 경고를 억제한다.
-#[allow(dead_code)]
 pub fn set_pulse_style(style: &str) -> Result<()> {
     validate_pulse_style(style)?;
     edit_config_doc(|table| {

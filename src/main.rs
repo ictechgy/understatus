@@ -48,6 +48,7 @@ fn main() -> ExitCode {
             print_themes();
             ExitCode::SUCCESS
         }
+        Some("pulse") => run_pulse(&args),
         Some("--help") | Some("-h") => {
             print_help();
             ExitCode::SUCCESS
@@ -134,6 +135,28 @@ fn run_theme(args: &[String]) -> ExitCode {
             let current = config::load_config().theme;
             println!("understatus: 현재 테마는 '{current}'입니다.");
             println!("사용법: understatus theme <name>   (목록: understatus themes)");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// pulse 서브커맨드를 실행한다(`pulse <style>` → 교체, 스타일 누락 → 현재 스타일 + 사용법).
+fn run_pulse(args: &[String]) -> ExitCode {
+    match args.get(1) {
+        Some(style) => match install::set_pulse_style(style) {
+            Ok(()) => {
+                eprintln!("understatus: 펄스 스타일을 '{style}'로 변경했습니다.");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("understatus: 펄스 스타일 변경 실패: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            let current = config::load_config().pulse.pulse_style;
+            println!("understatus: 현재 펄스 스타일은 '{current}'입니다.");
+            println!("사용법: understatus pulse <calm|flash|hue|swap>");
             ExitCode::SUCCESS
         }
     }
@@ -436,6 +459,7 @@ fn print_help() {
          \x20 understatus uninstall      원본 설정을 정확 복원하며 제거\n\
          \x20 understatus theme <name>   설치 후 테마 교체(config.toml만 수정)\n\
          \x20 understatus themes         사용 가능한 테마 목록 출력\n\
+         \x20 understatus pulse <style>  펄스 스타일 교체(calm|flash|hue|swap, config.toml만 수정)\n\
          \x20 understatus --help         이 도움말 출력\n\
          \x20 understatus --version      버전 출력\n\
          \n\
