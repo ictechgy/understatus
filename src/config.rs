@@ -663,4 +663,37 @@ mod tests {
             vec!["nothex", "#a", "#b", "#c", "#d"]
         );
     }
+
+    /// theme="neon" + override 없음 → neon 프리셋 틴트/글리프/pulse_style로 채워져야 한다.
+    #[test]
+    fn theme_neon_fills_unset_keys() {
+        let config = parse_config_str(r#"theme = "neon""#);
+        assert_eq!(config.theme, "neon");
+        assert_eq!(config.cpu.load_glyphs, vec!["░", "▒", "▓", "█", "█"]);
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#2bd6ff", "#1ea0ff", "#7c5cff", "#c33cff", "#ff2bd0"]
+        );
+        assert_eq!(config.color.pulse_palette, vec!["#ff2bd0", "#7a1f8a"]);
+        // 화려한 테마의 bold 기본 pulse_style이 해석되어 들어온다.
+        assert_eq!(config.pulse.pulse_style, "hue");
+    }
+
+    /// theme="spectrum" + 사용자 pulse_style 명시 → 사용자 값 우선(나머지는 spectrum).
+    #[test]
+    fn user_pulse_style_overrides_flashy_preset() {
+        let toml = r#"
+            theme = "spectrum"
+            [pulse]
+            pulse_style = "calm"
+        "#;
+        let config = parse_config_str(toml);
+        // 사용자가 calm으로 끈 경우 우선(개별 키 > 프리셋).
+        assert_eq!(config.pulse.pulse_style, "calm");
+        // band_tints는 명시 안 했으므로 spectrum.
+        assert_eq!(
+            config.color.band_tints,
+            vec!["#2fd36b", "#d4d13e", "#f0922e", "#e8443a", "#d23ad0"]
+        );
+    }
 }
