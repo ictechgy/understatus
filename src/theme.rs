@@ -133,10 +133,7 @@ pub fn pulse_color(
         return None;
     }
 
-    // CALM 숨쉬기: 사인파로 phase(0..1)→wave(0..1)를 만들어 팔레트 두 끝점을 LERP.
     let phase = pulse_phase(now_ms, cfg);
-    let wave = (f64::sin(2.0 * std::f64::consts::PI * phase) + 1.0) / 2.0;
-
     // 팔레트 부재/짧을 때 안전 기본값(테라코타 high↔low).
     let start = palette_color(cfg, 0).unwrap_or(ColorSpec {
         r: 0xb8,
@@ -149,11 +146,42 @@ pub fn pulse_color(
         b: 0x30,
     });
 
-    Some(ColorSpec {
+    let tint = match cfg.pulse.pulse_style.as_str() {
+        // hue/swap: 기준색(start)의 hue를 한 주기 동안 360° 회전(S/V 유지) → 무지개 시머.
+        // swap의 글리프 교대는 pick_emoji가 담당하고, 틴트는 hue와 동일하게 순환한다.
+        "hue" | "swap" => hue_rotate(start, phase),
+        // flash: calm과 같은 두 끝점, 더 가파른 곡선(어두운 구간 길고 밝은 스파이크 짧음).
+        "flash" => luminance_breath(start, end, flash_wave(phase)),
+        // calm(기본) + 미지 스타일: 현행 휘도 호흡(hue 불변).
+        _ => luminance_breath(start, end, calm_wave(phase)),
+    };
+    Some(tint)
+}
+
+/// calm 휘도 호흡의 사인파 wave(0..1). `wave=0`→start, `wave=1`→end.
+fn calm_wave(phase: f64) -> f64 {
+    (f64::sin(2.0 * std::f64::consts::PI * phase) + 1.0) / 2.0
+}
+
+/// flash 호흡 wave: calm wave에 감마(2.2)를 적용해 곡선을 가파르게(중간톤 대비↑).
+/// 끝점(wave 0/1)은 calm과 동일하게 보존되어 high/low 색은 변하지 않는다.
+fn flash_wave(phase: f64) -> f64 {
+    calm_wave(phase).powf(2.2)
+}
+
+/// 두 끝점을 wave로 LERP한 틴트를 만든다(휘도 호흡 공통).
+fn luminance_breath(start: ColorSpec, end: ColorSpec, wave: f64) -> ColorSpec {
+    ColorSpec {
         r: lerp_channel(start.r, end.r, wave),
         g: lerp_channel(start.g, end.g, wave),
         b: lerp_channel(start.b, end.b, wave),
-    })
+    }
+}
+
+/// 기준색의 hue를 위상만큼(0..1 → 0..360°) 회전한 틴트(S/V 유지).
+fn hue_rotate(base: ColorSpec, phase: f64) -> ColorSpec {
+    let (h, s, v) = rgb_to_hsv(base);
+    hsv_to_rgb(h + 360.0 * phase, s, v)
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -202,6 +230,52 @@ fn palette_color(cfg: &Config, index: usize) -> Option<ColorSpec> {
 /// render 단계가 호출한다. 형식이 잘못되면 `None`(호출자가 기본값으로 저하).
 pub fn parse_hex_pub(hex: &str) -> Option<ColorSpec> {
     parse_hex(hex)
+}
+
+/// [`ColorSpec`](RGB)을 HSV로 변환한다. 반환 `(h: 0–360, s: 0–1, v: 0–1)`.
+///
+/// hue 순환 펄스(`pulse_style="hue"`)에서 기준색의 색상환 위치를 얻는 데 쓴다.
+/// 무채색(델타 0)이면 h=0으로 안전 처리한다(패닉 없음).
+fn rgb_to_hsv(c: ColorSpec) -> (f64, f64, f64) {
+    let r = c.r as f64 / 255.0;
+    let g = c.g as f64 / 255.0;
+    let b = c.b as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    (h.rem_euclid(360.0), s, max)
+}
+
+/// HSV(`h: 0–360`, `s/v: 0–1`)를 [`ColorSpec`](RGB)으로 변환한다. 채널은 clamp(0–255).
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> ColorSpec {
+    let h = h.rem_euclid(360.0);
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to_u8 = |f: f64| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    ColorSpec {
+        r: to_u8(r1),
+        g: to_u8(g1),
+        b: to_u8(b1),
+    }
 }
 
 /// "#rrggbb" 또는 "rrggbb" 형식의 헥스 문자열을 [`ColorSpec`]으로 파싱한다.
@@ -397,5 +471,93 @@ mod tests {
         let cfg = Config::default(); // pulse_period_seconds=30
                                      // 0 나눗셈 방어: interval=0이면 1초로 간주 → 30/1=30.
         assert_eq!(samples_per_period(&cfg, 0), 30);
+    }
+
+    #[test]
+    fn rgb_hsv_roundtrip_within_tolerance() {
+        // 대표 색들이 RGB→HSV→RGB 라운드트립 시 채널 오차 ≤ 2여야 한다.
+        for c in [
+            ColorSpec { r: 0xff, g: 0x2b, b: 0xd0 },
+            ColorSpec { r: 0x2f, g: 0xd3, b: 0x6b },
+            ColorSpec { r: 0xb8, g: 0x78, b: 0x48 },
+            ColorSpec { r: 0x00, g: 0x00, b: 0x00 },
+            ColorSpec { r: 0xff, g: 0xff, b: 0xff },
+        ] {
+            let (h, s, v) = rgb_to_hsv(c);
+            let back = hsv_to_rgb(h, s, v);
+            assert!(
+                (back.r as i16 - c.r as i16).abs() <= 2
+                    && (back.g as i16 - c.g as i16).abs() <= 2
+                    && (back.b as i16 - c.b as i16).abs() <= 2,
+                "라운드트립 오차 초과: {c:?} -> {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hsv_to_rgb_rotates_hue() {
+        // 같은 S/V에서 hue만 120°씩 돌리면 빨강→초록→파랑 계열로 바뀐다.
+        let red = hsv_to_rgb(0.0, 1.0, 1.0);
+        let green = hsv_to_rgb(120.0, 1.0, 1.0);
+        let blue = hsv_to_rgb(240.0, 1.0, 1.0);
+        assert_eq!(red, ColorSpec { r: 255, g: 0, b: 0 });
+        assert_eq!(green, ColorSpec { r: 0, g: 255, b: 0 });
+        assert_eq!(blue, ColorSpec { r: 0, g: 0, b: 255 });
+    }
+
+    /// flash: calm과 같은 끝점(phase 0.25/0.75)이지만 중간 위상(0.5)에서 틴트가 다르다.
+    #[test]
+    fn pulse_color_flash_sharpens_midtone() {
+        let mut cfg = Config::default();
+        cfg.pulse.pulse_style = "flash".to_string();
+        let mut calm = Config::default();
+        calm.pulse.pulse_style = "calm".to_string();
+        // 끝점은 동일(wave 0/1 지점).
+        assert_eq!(
+            pulse_color(95.0, 22_500, true, &cfg),
+            pulse_color(95.0, 22_500, true, &calm),
+            "flash와 calm은 high 끝점(phase=0.75)에서 동일"
+        );
+        assert_eq!(
+            pulse_color(95.0, 7_500, true, &cfg),
+            pulse_color(95.0, 7_500, true, &calm),
+            "flash와 calm은 low 끝점(phase=0.25)에서 동일"
+        );
+        // 중간(phase=0.5, 15000ms)은 곡선이 달라 틴트가 다르다.
+        assert_ne!(
+            pulse_color(95.0, 15_000, true, &cfg),
+            pulse_color(95.0, 15_000, true, &calm),
+            "flash는 중간 위상에서 calm과 다른(더 가파른) 틴트"
+        );
+    }
+
+    /// hue: 위상에 따라 기준색의 hue가 회전해 서로 다른 색이 나온다(phase 0 ≈ 기준색).
+    #[test]
+    fn pulse_color_hue_rotates() {
+        let mut cfg = Config::default();
+        cfg.pulse.pulse_style = "hue".to_string();
+        // phase=0(now=0) → 기준색(pulse_palette[0] = #b87848)에 근사.
+        let base = pulse_color(95.0, 0, true, &cfg).expect("hue 틴트");
+        assert!(
+            (base.r as i16 - 0xb8).abs() <= 2
+                && (base.g as i16 - 0x78).abs() <= 2
+                && (base.b as i16 - 0x48).abs() <= 2,
+            "phase 0은 기준색에 근사: {base:?}"
+        );
+        // 서로 다른 위상은 서로 다른 색.
+        let q = pulse_color(95.0, 7_500, true, &cfg).expect("hue 틴트");
+        let h = pulse_color(95.0, 15_000, true, &cfg).expect("hue 틴트");
+        assert_ne!(base, q);
+        assert_ne!(q, h);
+    }
+
+    /// 펄스 OFF이면 스타일과 무관하게 None(정적 틴트는 render가 밴드 틴트로 결정).
+    #[test]
+    fn pulse_color_off_is_none_regardless_of_style() {
+        for style in ["calm", "flash", "hue", "swap"] {
+            let mut cfg = Config::default();
+            cfg.pulse.pulse_style = style.to_string();
+            assert_eq!(pulse_color(95.0, 1_234, false, &cfg), None, "{style} OFF");
+        }
     }
 }
