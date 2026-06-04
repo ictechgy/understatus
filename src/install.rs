@@ -321,6 +321,37 @@ fn validate_theme(name: &str) -> Result<()> {
     ))
 }
 
+/// 설치 후 펄스 스타일만 교체한다(config.toml `[pulse].pulse_style`만, settings.json 무접근).
+///
+/// # 인자
+/// - `style`: 적용할 펄스 스타일. [`validate_pulse_style`]를 통과해야 한다(미지면 하드 에러 + 목록).
+///
+/// # 반환
+/// 성공 시 `Ok(())`. 미지 스타일/I-O 실패는 [`anyhow::Error`]로 전파한다.
+// 다음 태스크(main.rs `pulse` 서브커맨드)에서 호출될 때까지 dead_code 경고를 억제한다.
+#[allow(dead_code)]
+pub fn set_pulse_style(style: &str) -> Result<()> {
+    validate_pulse_style(style)?;
+    edit_config_doc(|table| {
+        set_pulse_style_key(table, style);
+        Ok(())
+    })
+}
+
+/// 펄스 스타일 이름이 출시 스타일인지 하드 검증한다(순수 함수, I/O 없음).
+///
+/// `set_pulse_style`(및 향후 모든 쓰기 경로)이 공유하는 단일 검증점이다. 미지 스타일이면
+/// 사용 가능 목록을 담은 에러를 돌려 디스크 쓰기 이전에 중단하게 한다(render calm 폴백 의존 방지).
+fn validate_pulse_style(style: &str) -> Result<()> {
+    if theme::is_known_pulse_style(style) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "알 수 없는 펄스 스타일 '{style}'. 사용 가능: {}",
+        theme::PULSE_STYLES.join(", ")
+    ))
+}
+
 /// 출시 테마 이름을 쉼표로 이어 돌려준다(에러 메시지용).
 fn known_theme_names() -> String {
     themes::catalog()
@@ -575,6 +606,26 @@ fn set_refresh_interval(table: &mut toml::value::Table, interval: u64) {
     refresh_table.insert(
         "interval_seconds".to_string(),
         toml::Value::Integer(interval as i64),
+    );
+}
+
+/// 최상위 테이블에 `[pulse].pulse_style`을 설정한다(다른 키 보존). `set_chain_command`와 동형.
+///
+/// `[pulse]`가 존재하나 테이블이 아니면(손상된 config) 새 테이블로 교체해 키 기록을 보장한다
+/// (조용한 no-op로 인한 부분 기록 방지).
+fn set_pulse_style_key(table: &mut toml::value::Table, style: &str) {
+    let pulse = table
+        .entry("pulse".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !pulse.is_table() {
+        *pulse = toml::Value::Table(toml::map::Map::new());
+    }
+    let pulse_table = pulse
+        .as_table_mut()
+        .expect("set_pulse_style_key: 위에서 테이블로 보장했으므로 항상 Some");
+    pulse_table.insert(
+        "pulse_style".to_string(),
+        toml::Value::String(style.to_string()),
     );
 }
 
@@ -1168,6 +1219,80 @@ mod tests {
         match prev {
             Some(value) => std::env::set_var("UNDERSTATUS_CONFIG", value),
             None => std::env::remove_var("UNDERSTATUS_CONFIG"),
+        }
+    }
+
+    /// set_pulse_style 변환은 [pulse].pulse_style만 교체하고 다른 키를 보존한다(인메모리).
+    #[test]
+    fn set_pulse_style_replaces_only_pulse_style_key() {
+        let existing =
+            "theme = \"neon\"\n[pulse]\npulse_period_seconds = 30\n[refresh]\ninterval_seconds = 5\n";
+        let serialized = edit_config_doc_str(Some(existing), |table| {
+            set_pulse_style_key(table, "hue");
+            Ok(())
+        })
+        .expect("변환 성공");
+        let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
+        assert_eq!(
+            parsed
+                .get("pulse")
+                .and_then(|t| t.get("pulse_style"))
+                .and_then(toml::Value::as_str),
+            Some("hue")
+        );
+        assert_eq!(
+            parsed
+                .get("pulse")
+                .and_then(|t| t.get("pulse_period_seconds"))
+                .and_then(toml::Value::as_integer),
+            Some(30)
+        );
+        assert_eq!(
+            parsed.get("theme").and_then(toml::Value::as_str),
+            Some("neon")
+        );
+        assert_eq!(
+            parsed
+                .get("refresh")
+                .and_then(|t| t.get("interval_seconds"))
+                .and_then(toml::Value::as_integer),
+            Some(5)
+        );
+    }
+
+    /// 손상된(비-table) [pulse] 섹션이어도 pulse_style을 확실히 기록한다(부분 기록 방지).
+    #[test]
+    fn set_pulse_style_key_overwrites_non_table_section() {
+        let existing = "pulse = \"corrupted\"\n";
+        let serialized = edit_config_doc_str(Some(existing), |table| {
+            set_pulse_style_key(table, "flash");
+            Ok(())
+        })
+        .expect("변환 성공");
+        let parsed: toml::Value = toml::from_str(&serialized).expect("재파싱 성공");
+        assert_eq!(
+            parsed
+                .get("pulse")
+                .and_then(|t| t.get("pulse_style"))
+                .and_then(toml::Value::as_str),
+            Some("flash")
+        );
+    }
+
+    /// set_pulse_style은 미지 스타일을 거부하고 에러에 사용 가능 목록을 포함한다.
+    #[test]
+    fn set_pulse_style_rejects_unknown() {
+        let error = set_pulse_style("bogus").expect_err("미지 스타일은 Err");
+        let message = format!("{error}");
+        assert!(message.contains("bogus"), "에러에 입력 스타일 포함");
+        assert!(message.contains("calm"), "에러에 사용 가능 목록 포함");
+    }
+
+    /// validate_pulse_style은 4개 출시 스타일을 통과시킨다.
+    #[test]
+    fn validate_pulse_style_accepts_known() {
+        for style in ["calm", "flash", "hue", "swap"] {
+            assert!(validate_pulse_style(style).is_ok(), "{style} 통과");
         }
     }
 
