@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn parse_theme_prompt_invalid_is_err() {
         assert!(parse_theme_prompt("99").is_err());
-        assert!(parse_theme_prompt("neon").is_err());
+        assert!(parse_theme_prompt("invalid_theme").is_err());
     }
 
     // --- resolve_install_params ---
