@@ -161,7 +161,7 @@ When the pulse is active (CPU ≥ `pulse_on_threshold`), `pulse_style` controls 
 | Style | Behavior |
 |-------|----------|
 | `calm` | Fixed glyph shape. Terracotta luminance breathing — hue never shifts, only brightness cycles between `pulse_palette[0]` (bright) and `pulse_palette[1]` (dim). Most subtle. **Default for original themes.** |
-| `flash` | Fixed glyph shape. Same terracotta endpoints as `calm`, but uses a sharper sine curve — the midpoint brightness contrast is more pronounced (punchier breathing). |
+| `flash` | Fixed glyph shape. Uses the theme's own `pulse_palette` endpoints (the same high/low colors as that theme's `calm` breath), but applies a sharper sine curve — the midpoint brightness contrast is more pronounced (punchier breathing). |
 | `hue` | Fixed glyph shape. The glyph tint cycles through the full hue wheel (rainbow shimmer) over one `pulse_period_seconds`. Saturation and value stay constant; only hue rotates 360°. |
 | `swap` | Hue cycling (same as `hue`) **plus** glyph shape alternation: the critical glyph swaps between its filled and hollow forms (e.g. `◆` ↔ `◇`) on the second half of each period. Most eye-catching. |
 
@@ -177,6 +177,8 @@ When the pulse is active (CPU ≥ `pulse_on_threshold`), `pulse_style` controls 
 pulse_on_threshold  = 90   # default: CPU% at which pulse activates
 pulse_off_threshold = 80   # default: CPU% below which pulse deactivates (hysteresis)
 ```
+
+The pulse turns ON when CPU reaches `pulse_on_threshold` (90) and stays ON until CPU drops below `pulse_off_threshold` (80) — so it keeps animating briefly during cool-down. This avoids flicker at the boundary.
 
 Lower the thresholds to pulse at a lower CPU load:
 
@@ -216,7 +218,7 @@ All keys are optional; omitting a key uses its default.
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
 | `[pulse] pulse_off_threshold` | `80` | CPU% below which the breath turns off (hysteresis). |
 | `[pulse] pulse_period_seconds` | `30` | One full breath cycle in seconds. Keep `period / interval_seconds >= 6` for smooth animation. |
-| `[pulse] pulse_style` | `"calm"` | Pulse animation style when active. `"calm"` = terracotta luminance breath, hue-invariant (most subtle). `"flash"` = same endpoints, sharper midpoint contrast. `"hue"` = hue-wheel cycling (rainbow shimmer). `"swap"` = hue cycling + glyph shape alternation (most eye-catching). See [Pulse styles](#pulse-styles). |
+| `[pulse] pulse_style` | `"calm"` | Pulse animation style when active. `"calm"` = theme's `pulse_palette` luminance breath, hue-invariant (most subtle). `"flash"` = same `pulse_palette` endpoints, sharper midpoint contrast. `"hue"` = hue-wheel cycling (rainbow shimmer). `"swap"` = hue cycling + glyph shape alternation (most eye-catching). See [Pulse styles](#pulse-styles). |
 | `[chain] chain_command` | `""` | Populated by `install`. The command that runs alongside understatus. |
 | `[chain] order` | `"self_first"` | `"self_first"` or `"chain_first"` — which output appears on the left. |
 | `[chain] chain_cache_ttl_seconds` | `10` | How long (s) to cache the chained command's stdout before re-spawning it. |
@@ -270,7 +272,7 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 
 **Glyph + tint design (COLOR-ONCE):** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored. The active theme fills these colors; individual config keys override the preset.
 
-**Pulse animation:** When CPU stays at or above `pulse_on_threshold` (default 90%), the critical-band glyph animates according to `pulse_style`. The `"calm"` style cycles between `pulse_palette[0]` (brighter) and `pulse_palette[1]` (dimmer) with hue-invariant brightness breathing. `"flash"` uses the same endpoints but a sharper curve. `"hue"` rotates through the full hue wheel. `"swap"` adds glyph shape alternation on top of hue rotation. Smooth animation requires `pulse_period / interval_seconds >= 6` (6 or more render frames per cycle). See [Pulse styles](#pulse-styles).
+**Pulse animation:** When CPU stays at or above `pulse_on_threshold` (default 90%), the critical-band glyph animates according to `pulse_style`. The `"calm"` style cycles between `pulse_palette[0]` (brighter) and `pulse_palette[1]` (dimmer) with hue-invariant brightness breathing. `"flash"` uses the same theme `pulse_palette` endpoints but a sharper curve (punchier breathing). `"hue"` rotates through the full hue wheel. `"swap"` adds glyph shape alternation on top of hue rotation. The pulse stays ON until CPU drops below `pulse_off_threshold` (default 80%) — keeping the animation going briefly during cool-down to avoid boundary flicker. Smooth animation requires `pulse_period / interval_seconds >= 6` (6 or more render frames per cycle). See [Pulse styles](#pulse-styles).
 
 **Session cache isolation:** Per-render caches (chain command output, pulse state, network counter delta) are keyed by `session_id`. Multiple terminal windows running understatus simultaneously do not share or corrupt each other's cached values. Battery state is machine-global and is shared across sessions.
 
@@ -367,7 +369,7 @@ CPU가 `pulse_on_threshold`(기본 90%) 이상이면 임계 밴드 글리프가 
 | 스타일 | 동작 |
 |--------|------|
 | `calm` | 글리프 고정. 테라코타 명도 호흡 (hue 변화 없음). 가장 차분함. **기존 테마 기본.** |
-| `flash` | 글리프 고정. `calm`과 같은 끝점이지만 중간 위상 대비가 더 가파름 (더 강렬한 호흡). |
+| `flash` | 글리프 고정. 해당 테마의 `pulse_palette` 끝점(`calm` 호흡과 동일한 high/low 색)을 사용하되 더 가파른 사인 곡선 적용 — 중간 위상 대비가 더 강렬함. |
 | `hue` | 글리프 고정. 글리프 색이 한 주기(pulse_period_seconds) 동안 색상환 전체를 순환 (무지개 shimmer). |
 | `swap` | `hue` 순환 **+** 글리프 모양 교대: 주기 후반부에 `◆`↔`◇` 등 채움/빈 형태를 번갈아 표시. 가장 눈에 띔. |
 
@@ -382,6 +384,8 @@ pulse_on_threshold  = 90   # 펄스 발동 CPU% (기본)
 pulse_off_threshold = 80   # 펄스 해제 CPU% — 히스테리시스 (기본)
 pulse_style = "hue"        # calm | flash | hue | swap
 ```
+
+펄스는 CPU가 `pulse_on_threshold`(90)에 도달하면 켜지고, `pulse_off_threshold`(80) 미만으로 떨어질 때까지 유지됩니다 — 냉각 중에도 잠시 애니메이션이 지속되어 경계에서 깜빡임을 방지합니다.
 
 ```bash
 understatus pulse hue    # 펄스 스타일 변경 (config.toml만 수정, 즉시 적용)
