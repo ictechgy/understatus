@@ -9,8 +9,10 @@
 /// 모든 프리셋은 8개 키를 전부 구체값으로 정의한다(부분 프리셋 금지).
 ///
 /// # 주의
-/// `pulse_style`은 현재 전 테마 "calm"이며 render/theme 어디서도 분기에 쓰이지
-/// 않는 "데드 데이터"다(향후 bold 펄스 구현 시 실제 시각 채널로 승격 예정).
+/// `pulse_style`은 기존 테마("calm"·"mono"·"vivid"·"ember"·"emoji")에서는 "calm"이고,
+/// 신규 화려한 테마(neon·spectrum="hue", aurora·sunset="flash")에서는 bold 값을 예약한다.
+/// 현재 render/theme 어디서도 이 값이 분기에 쓰이지 않는 "데드 데이터"이며, 향후 펄스
+/// 애니메이션 구현 시 실제 시각 채널로 승격된다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemePreset {
     /// `cpu.load_glyphs`(5개): idle/low/mid/high/crit 밴드 글리프.
@@ -46,13 +48,17 @@ pub const THEME_KEYS: &[(&str, &str)] = &[
     ("color", "hud_seam"),
 ];
 
-/// 출시 테마 (이름, 한 줄 설명) 목록. 출시 순서대로(calm 기본 → mono → vivid → ember → emoji).
+/// 출시 테마 (이름, 한 줄 설명) 목록. 출시 순서대로(calm 기본 → mono → vivid → ember → emoji → neon → aurora → sunset → spectrum).
 const CATALOG: &[(&str, &str)] = &[
     ("calm", "차가운 blue-grey + 테라코타 호흡 (기본)"),
     ("mono", "무채색, 제로 색상"),
     ("vivid", "신호등 색 + 블록 글리프"),
     ("ember", "따뜻한 앰버/테라코타 단색"),
     ("emoji", "이모지 표정 램프 (2칸 폭)"),
+    ("neon", "네온 사이버펑크 (시안→마젠타, hue 순환)"),
+    ("aurora", "오로라 청록→보라 그라데이션 (flash)"),
+    ("sunset", "노을 골드→퍼플 (flash)"),
+    ("spectrum", "밴드별 무지개 (초록→마젠타, hue 순환)"),
 ];
 
 /// 문자열 슬라이스 배열을 `Vec<String>`으로 변환하는 내부 헬퍼.
@@ -135,6 +141,62 @@ fn emoji_preset() -> ThemePreset {
     }
 }
 
+/// neon 프리셋. 네온 사이버펑크 — 일렉트릭 시안→마젠타 + 셰이드 블록. 기본 펄스 hue.
+fn neon_preset() -> ThemePreset {
+    ThemePreset {
+        load_glyphs: to_owned(&["░", "▒", "▓", "█", "█"]),
+        pulse_style: "hue".to_string(),
+        band_tints: to_owned(&["#2bd6ff", "#1ea0ff", "#7c5cff", "#c33cff", "#ff2bd0"]),
+        pulse_palette: to_owned(&["#ff2bd0", "#7a1f8a"]),
+        label_color: "#6b7c99".to_string(),
+        separator: " · ".to_string(),
+        separator_color: "#2a3550".to_string(),
+        hud_seam: "│".to_string(),
+    }
+}
+
+/// aurora 프리셋. 청록→보라 오로라 그라데이션 + 바 램프. 기본 펄스 flash.
+fn aurora_preset() -> ThemePreset {
+    ThemePreset {
+        load_glyphs: to_owned(&["▁", "▃", "▅", "▆", "█"]),
+        pulse_style: "flash".to_string(),
+        band_tints: to_owned(&["#2ad6a0", "#1fb6b0", "#2f9fe0", "#6c7cf0", "#b46cf0"]),
+        pulse_palette: to_owned(&["#b46cf0", "#5a3a8a"]),
+        label_color: "#6b7c8a".to_string(),
+        separator: " · ".to_string(),
+        separator_color: "#2a3848".to_string(),
+        hud_seam: "│".to_string(),
+    }
+}
+
+/// sunset 프리셋. 골드→코랄→핑크→퍼플 노을 + 따뜻한 도트. 기본 펄스 flash.
+fn sunset_preset() -> ThemePreset {
+    ThemePreset {
+        load_glyphs: to_owned(&["·", "∙", "•", "●", "◉"]),
+        pulse_style: "flash".to_string(),
+        band_tints: to_owned(&["#ffd166", "#ff9e4f", "#ff6b6b", "#ef476f", "#c44ad0"]),
+        pulse_palette: to_owned(&["#ef476f", "#8a2a48"]),
+        label_color: "#8a7a6f".to_string(),
+        separator: " · ".to_string(),
+        separator_color: "#4a3a40".to_string(),
+        hud_seam: "│".to_string(),
+    }
+}
+
+/// spectrum 프리셋. 밴드별 무지개(초록→노랑→주황→빨강→마젠타). 기본 펄스 hue.
+fn spectrum_preset() -> ThemePreset {
+    ThemePreset {
+        load_glyphs: to_owned(&["▁", "▂", "▄", "▆", "█"]),
+        pulse_style: "hue".to_string(),
+        band_tints: to_owned(&["#2fd36b", "#d4d13e", "#f0922e", "#e8443a", "#d23ad0"]),
+        pulse_palette: to_owned(&["#d23ad0", "#7a1f78"]),
+        label_color: "#6b7280".to_string(),
+        separator: " · ".to_string(),
+        separator_color: "#3b4048".to_string(),
+        hud_seam: "│".to_string(),
+    }
+}
+
 /// 알려진 테마 이름을 프리셋으로 조회한다.
 ///
 /// # 인자
@@ -149,6 +211,10 @@ pub fn preset(name: &str) -> Option<ThemePreset> {
         "vivid" => Some(vivid_preset()),
         "ember" => Some(ember_preset()),
         "emoji" => Some(emoji_preset()),
+        "neon" => Some(neon_preset()),
+        "aurora" => Some(aurora_preset()),
+        "sunset" => Some(sunset_preset()),
+        "spectrum" => Some(spectrum_preset()),
         _ => None,
     }
 }
@@ -266,10 +332,55 @@ mod tests {
         assert!(!is_known(""), "빈 문자열은 미지 테마");
     }
 
-    /// catalog 순서가 출시 순서(calm, mono, vivid, ember, emoji)와 일치해야 한다.
+    /// catalog 순서가 출시 순서(calm..emoji 다음 neon..spectrum)와 일치해야 한다.
     #[test]
     fn catalog_order_is_release_order() {
         let names: Vec<&str> = catalog().iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["calm", "mono", "vivid", "ember", "emoji"]);
+        assert_eq!(
+            names,
+            vec![
+                "calm", "mono", "vivid", "ember", "emoji", "neon", "aurora", "sunset", "spectrum"
+            ]
+        );
+    }
+
+    /// 신규 화려한 4종의 핵심 값(글리프·밴드 틴트·펄스 팔레트·기본 pulse_style)을 고정한다.
+    #[test]
+    fn flashy_presets_core_values() {
+        let neon = preset("neon").expect("neon 존재");
+        assert_eq!(neon.load_glyphs, vec!["░", "▒", "▓", "█", "█"]);
+        assert_eq!(
+            neon.band_tints,
+            vec!["#2bd6ff", "#1ea0ff", "#7c5cff", "#c33cff", "#ff2bd0"]
+        );
+        assert_eq!(neon.pulse_palette, vec!["#ff2bd0", "#7a1f8a"]);
+        assert_eq!(neon.pulse_style, "hue");
+
+        let aurora = preset("aurora").expect("aurora 존재");
+        assert_eq!(aurora.load_glyphs, vec!["▁", "▃", "▅", "▆", "█"]);
+        assert_eq!(
+            aurora.band_tints,
+            vec!["#2ad6a0", "#1fb6b0", "#2f9fe0", "#6c7cf0", "#b46cf0"]
+        );
+        assert_eq!(aurora.pulse_palette, vec!["#b46cf0", "#5a3a8a"]);
+        assert_eq!(aurora.pulse_style, "flash");
+
+        let sunset = preset("sunset").expect("sunset 존재");
+        assert_eq!(sunset.load_glyphs, vec!["·", "∙", "•", "●", "◉"]);
+        assert_eq!(
+            sunset.band_tints,
+            vec!["#ffd166", "#ff9e4f", "#ff6b6b", "#ef476f", "#c44ad0"]
+        );
+        assert_eq!(sunset.pulse_palette, vec!["#ef476f", "#8a2a48"]);
+        assert_eq!(sunset.pulse_style, "flash");
+
+        let spectrum = preset("spectrum").expect("spectrum 존재");
+        assert_eq!(spectrum.load_glyphs, vec!["▁", "▂", "▄", "▆", "█"]);
+        assert_eq!(
+            spectrum.band_tints,
+            vec!["#2fd36b", "#d4d13e", "#f0922e", "#e8443a", "#d23ad0"]
+        );
+        assert_eq!(spectrum.pulse_palette, vec!["#d23ad0", "#7a1f78"]);
+        assert_eq!(spectrum.pulse_style, "hue");
     }
 }
