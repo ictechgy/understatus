@@ -510,11 +510,31 @@ mod tests {
     fn rgb_hsv_roundtrip_within_tolerance() {
         // 대표 색들이 RGB→HSV→RGB 라운드트립 시 채널 오차 ≤ 2여야 한다.
         for c in [
-            ColorSpec { r: 0xff, g: 0x2b, b: 0xd0 },
-            ColorSpec { r: 0x2f, g: 0xd3, b: 0x6b },
-            ColorSpec { r: 0xb8, g: 0x78, b: 0x48 },
-            ColorSpec { r: 0x00, g: 0x00, b: 0x00 },
-            ColorSpec { r: 0xff, g: 0xff, b: 0xff },
+            ColorSpec {
+                r: 0xff,
+                g: 0x2b,
+                b: 0xd0,
+            },
+            ColorSpec {
+                r: 0x2f,
+                g: 0xd3,
+                b: 0x6b,
+            },
+            ColorSpec {
+                r: 0xb8,
+                g: 0x78,
+                b: 0x48,
+            },
+            ColorSpec {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00,
+            },
+            ColorSpec {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
         ] {
             let (h, s, v) = rgb_to_hsv(c);
             let back = hsv_to_rgb(h, s, v);
