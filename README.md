@@ -117,7 +117,7 @@ Note: increasing `interval_seconds` proportionally slows the terracotta breath a
 
 ## Themes
 
-understatus ships five built-in themes. Set the active theme in one line:
+understatus ships nine built-in themes. Set the active theme in one line:
 
 ```toml
 # ~/.config/understatus/config.toml
@@ -141,6 +141,10 @@ understatus themes             # list all available themes
 | `vivid` | `░ ▒ ▓ █ █` | Traffic-light colors (green → amber → red) with block-fill glyphs. |
 | `ember` | `· ∙ • ● ◉` | Warm amber/terracotta monochromatic ladder with dot glyphs. |
 | `emoji` | `😌 🙂 😅 🥵 🔥` | Emoji face ramp. Each glyph occupies 2 terminal columns. |
+| `neon` | `○ ▁ ▄ ▆ ◆` | Neon cyberpunk — electric cyan → magenta with hue-cycling pulse. |
+| `aurora` | `○ ▁ ▄ ▆ ◆` | Aurora borealis — teal → purple gradient with flash pulse. |
+| `sunset` | `○ ▁ ▄ ▆ ◆` | Sunset — gold → coral → purple with flash pulse. |
+| `spectrum` | `○ ▁ ▄ ▆ ◆` | Per-band rainbow — green → magenta with hue-cycling pulse. |
 
 **COLOR-ONCE principle:** Color is applied to the glyph character only. Numeric values (CPU%, memory, cost, etc.) are always uncolored regardless of theme.
 
@@ -157,7 +161,7 @@ All keys are optional; omitting a key uses its default.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `theme` | `"calm"` | Active theme preset. Valid values: `calm`, `mono`, `vivid`, `ember`, `emoji`. The theme fills all eight visual keys not explicitly set in config; individual keys can still override it. |
+| `theme` | `"calm"` | Active theme preset. Valid values: `calm`, `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. The theme fills all eight visual keys not explicitly set in config; individual keys can still override it. |
 | `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency. |
 | `[cpu] load_glyphs` | `["○","▁","▄","▆","◆"]` | Glyphs for idle→critical load stages. Color is applied to the glyph only. Filled by the active theme; override by writing this key explicitly. |
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
@@ -256,7 +260,7 @@ macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리
 
 **주요 특징**
 
-- **5종 테마** — `calm`(기본), `mono`, `vivid`, `ember`, `emoji`. 테마는 8개 시각 키(글리프·색상 등)를 한 번에 설정하며, 개별 키를 config.toml에 명시하면 테마보다 우선합니다.
+- **9종 테마** — `calm`(기본), `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. 테마는 8개 시각 키(글리프·색상 등)를 한 번에 설정하며, 개별 키를 config.toml에 명시하면 테마보다 우선합니다.
 - **COLOR-ONCE 원칙** — 색은 글리프 문자에만 적용. 숫자 값(CPU%, 비용 등)은 항상 무색.
 - **≥90% 호흡** — CPU가 90% 이상으로 유지되면 임계 밴드 글리프가 테라코타 명도로 천천히 숨쉽니다(hue 변화 없음). 부드러운 애니메이션에는 `pulse_period / interval_seconds >= 6` 조건이 필요하며, 위반 시 설치 시점에 경고가 출력됩니다.
 - **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격) 직접 측정. loadavg 아님.
@@ -302,6 +306,10 @@ understatus themes         # 사용 가능한 테마 목록
 | `vivid` | `░ ▒ ▓ █ █` | 신호등 색 + 블록 글리프 |
 | `ember` | `· ∙ • ● ◉` | 따뜻한 앰버/테라코타 단색 + 도트 글리프 |
 | `emoji` | `😌 🙂 😅 🥵 🔥` | 이모지 표정 램프 (각 글리프 2칸 폭) |
+| `neon` | `○ ▁ ▄ ▆ ◆` | 네온 사이버펑크 (일렉트릭 시안→마젠타, hue 순환 펄스) |
+| `aurora` | `○ ▁ ▄ ▆ ◆` | 오로라 청록→보라 그라데이션 (flash 펄스) |
+| `sunset` | `○ ▁ ▄ ▆ ◆` | 노을 골드→코랄→퍼플 (flash 펄스) |
+| `spectrum` | `○ ▁ ▄ ▆ ◆` | 밴드별 무지개 (초록→마젠타, hue 순환 펄스) |
 
 설정 파일: `~/.config/understatus/config.toml` (없으면 모두 기본값)
 
