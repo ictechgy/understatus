@@ -126,7 +126,9 @@ fn run_install(args: &[String]) -> ExitCode {
 /// theme 서브커맨드를 실행한다(`theme <name>` → 교체, 이름 누락 → 현재 테마 + 사용법).
 fn run_theme(args: &[String]) -> ExitCode {
     if has_extra_args(args) {
-        eprintln!("understatus: theme 명령은 테마 이름 하나만 받습니다. 사용법: understatus theme <name>");
+        eprintln!(
+            "understatus: theme 명령은 테마 이름 하나만 받습니다. 사용법: understatus theme <name>"
+        );
         return ExitCode::FAILURE;
     }
     match args.get(1) {
