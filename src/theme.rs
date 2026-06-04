@@ -132,13 +132,9 @@ fn alt_glyph(glyph: &str) -> String {
 }
 
 /// 알려진 펄스 스타일 목록(설치/`pulse` 명령의 하드 검증 + render 분기 SSOT).
-// 다음 태스크(install.rs 쓰기 경로)에서 참조될 때까지 dead_code 경고를 억제한다.
-#[allow(dead_code)]
 pub const PULSE_STYLES: &[&str] = &["calm", "flash", "hue", "swap"];
 
 /// 유효 펄스 스타일 이름인지 판정한다(쓰기 경로 하드 검증용).
-// 다음 태스크(install.rs 쓰기 경로)에서 호출될 때까지 dead_code 경고를 억제한다.
-#[allow(dead_code)]
 pub fn is_known_pulse_style(name: &str) -> bool {
     PULSE_STYLES.contains(&name)
 }
