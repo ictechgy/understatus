@@ -64,11 +64,15 @@ pub struct PulseConfig {
     pub pulse_off_threshold: f64,
     /// 색 출렁임 한 주기 길이(초). 불변식: pulse_period / refreshInterval ≥ 6.
     pub pulse_period_seconds: u64,
-    /// "calm"(기본) | "bold"(레거시).
+    /// 펄스 스타일: "calm"(기본) | "flash" | "hue" | "swap".
     ///
-    /// - "calm": 글리프 모양은 **고정**, 글리프 틴트만 테라코타 high↔low 사이를
-    ///   부드럽게 숨쉬듯 보간한다(hue shift 없음).
-    /// - "bold": 레거시 옵션. 빨강↔주황 과감 스윙 + 글리프 깜빡임(기본값 아님).
+    /// - "calm": 글리프 모양 **고정**, 틴트만 테라코타 high↔low를 숨쉬듯 보간(hue 불변).
+    /// - "flash": 같은 두 끝점, 더 가파른 곡선(감마 2.2)으로 대비를 키운 호흡.
+    /// - "hue": 글리프 고정, 틴트 hue를 한 주기 동안 360° 회전(무지개 시머).
+    /// - "swap": hue 순환 + 위상 후반 글리프 모양 교대(◆↔◇ 등).
+    ///
+    /// `theme::pulse_color`(틴트)와 `theme::pick_emoji`(swap 글리프)가 소비한다.
+    /// 미지 값은 런타임에서 calm으로 안전 저하(쓰기 경로는 하드 검증).
     pub pulse_style: String,
 }
 
@@ -445,7 +449,7 @@ mod tests {
     fn default_impl_matches_spec() {
         let config = Config::default();
         assert_eq!(config.cpu.emoji_thresholds, [25.0, 50.0, 75.0, 90.0]);
-        // CALM: pulse_style 기본은 "calm"(레거시 "bold" 아님).
+        // CALM: pulse_style 기본은 "calm"(기본 스타일).
         assert_eq!(config.pulse.pulse_style, "calm");
         assert_eq!(config.chain.order, "self_first");
         assert_eq!(config.color.mode, "auto");
@@ -675,7 +679,7 @@ mod tests {
             vec!["#2bd6ff", "#1ea0ff", "#7c5cff", "#c33cff", "#ff2bd0"]
         );
         assert_eq!(config.color.pulse_palette, vec!["#ff2bd0", "#7a1f8a"]);
-        // 화려한 테마의 bold 기본 pulse_style이 해석되어 들어온다.
+        // 화려한 테마의 기본 pulse_style(hue)이 해석되어 들어온다.
         assert_eq!(config.pulse.pulse_style, "hue");
     }
 
