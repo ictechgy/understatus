@@ -82,28 +82,65 @@ pub fn band_tint(band: usize, cfg: &Config) -> ColorSpec {
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
-/// 현재 CPU% 밴드에 해당하는 **고정** load glyph를 고른다(CALM 디자인).
+/// 현재 CPU% 밴드에 해당하는 load glyph를 고른다.
 ///
 /// # 인자
 /// - `cpu_percent`: 진짜 순간 CPU%(0–100).
-/// - `now_ms`: (미사용) 시그니처 고정을 위해 보존. CALM에선 글리프가 깜빡이지 않음.
-/// - `pulse_on`: (미사용) 시그니처 고정을 위해 보존. 펄스 중에도 글리프 모양은 고정.
-/// - `cfg`: `cpu.emoji_thresholds`, `cpu.load_glyphs`.
+/// - `now_ms`: 현재 시각(ms). swap 스타일의 위상 계산에 사용.
+/// - `pulse_on`: 이번 프레임 펄스 on 여부. swap 스타일에서만 글리프 교대에 사용.
+/// - `cfg`: `cpu.emoji_thresholds`, `cpu.load_glyphs`, `pulse.pulse_style`.
 ///
 /// # 반환
 /// 밴드에 매핑된 글리프 문자열(`load_glyphs[band]`). 기본 ○ ▁ ▄ ▆ ◆.
-/// 펄스가 켜져도 글리프 **모양은 바뀌지 않는다**(틴트만 숨쉰다, §H-4 CALM).
+/// swap 스타일 + 펄스 ON일 때만 위상 후반부(≥0.5)에서 글리프를 교대한다.
+/// 그 외(calm/flash/hue 및 펄스 OFF)는 글리프 모양이 고정된다(CALM 디자인).
 /// `load_glyphs`가 비었거나 짧으면 안전 기본값 글리프로 저하한다(패닉 금지).
 pub fn pick_emoji(cpu_percent: f64, now_ms: u128, pulse_on: bool, cfg: &Config) -> String {
-    // CALM: 펄스 상태/시각과 무관하게 밴드 글리프는 고정(깜빡임 없음).
-    let _ = now_ms;
-    let _ = pulse_on;
     let band = band_index(cpu_percent, cfg);
     const FALLBACK: [&str; 5] = ["○", "▁", "▄", "▆", "◆"];
-    match cfg.cpu.load_glyphs.get(band) {
+    let base = match cfg.cpu.load_glyphs.get(band) {
         Some(glyph) if !glyph.is_empty() => glyph.clone(),
         _ => FALLBACK[band.min(FALLBACK.len() - 1)].to_string(),
+    };
+    // swap 스타일 + 펄스 ON일 때만 위상 후반부에서 글리프를 교대한다(그 외엔 고정 — CALM).
+    if pulse_on && cfg.pulse.pulse_style == "swap" && pulse_phase(now_ms, cfg) >= 0.5 {
+        return alt_glyph(&base);
     }
+    base
+}
+
+/// swap 스타일에서 글리프의 "교대형"(filled↔hollow 등)을 돌려준다. 매핑 없으면 원본 유지(no-op).
+fn alt_glyph(glyph: &str) -> String {
+    let alt = match glyph {
+        "◆" => "◇",
+        "◇" => "◆",
+        "●" => "○",
+        "○" => "●",
+        "◉" => "◎",
+        "◎" => "◉",
+        "█" => "░",
+        "░" => "█",
+        "▓" => "▒",
+        "▒" => "▓",
+        "▆" => "▂",
+        "▂" => "▆",
+        "▄" => "▁",
+        "▁" => "▄",
+        other => other,
+    };
+    alt.to_string()
+}
+
+/// 알려진 펄스 스타일 목록(설치/`pulse` 명령의 하드 검증 + render 분기 SSOT).
+// 다음 태스크(install.rs 쓰기 경로)에서 참조될 때까지 dead_code 경고를 억제한다.
+#[allow(dead_code)]
+pub const PULSE_STYLES: &[&str] = &["calm", "flash", "hue", "swap"];
+
+/// 유효 펄스 스타일 이름인지 판정한다(쓰기 경로 하드 검증용).
+// 다음 태스크(install.rs 쓰기 경로)에서 호출될 때까지 dead_code 경고를 억제한다.
+#[allow(dead_code)]
+pub fn is_known_pulse_style(name: &str) -> bool {
+    PULSE_STYLES.contains(&name)
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -559,5 +596,45 @@ mod tests {
             cfg.pulse.pulse_style = style.to_string();
             assert_eq!(pulse_color(95.0, 1_234, false, &cfg), None, "{style} OFF");
         }
+    }
+
+    /// swap: 펄스 ON이면 위상 전반(phase<0.5)은 band 글리프, 후반(phase>=0.5)은 alt 글리프.
+    #[test]
+    fn pick_emoji_swap_alternates_glyph() {
+        let mut cfg = Config::default(); // crit 밴드 글리프 ◆
+        cfg.pulse.pulse_style = "swap".to_string();
+        // pulse_period=30s → now=0 phase 0(전반) → ◆; now=20000 phase 0.666(후반) → 교대 ◇.
+        assert_eq!(pick_emoji(95.0, 0, true, &cfg), "◆");
+        assert_eq!(pick_emoji(95.0, 20_000, true, &cfg), "◇");
+    }
+
+    /// swap이라도 펄스 OFF면 글리프 고정(저부하에서 깜빡이지 않음).
+    #[test]
+    fn pick_emoji_swap_stable_when_off() {
+        let mut cfg = Config::default();
+        cfg.pulse.pulse_style = "swap".to_string();
+        assert_eq!(pick_emoji(95.0, 0, false, &cfg), "◆");
+        assert_eq!(pick_emoji(95.0, 20_000, false, &cfg), "◆");
+    }
+
+    /// calm/flash/hue는 글리프를 교대하지 않는다(펄스 ON이어도 고정).
+    #[test]
+    fn pick_emoji_non_swap_styles_stable() {
+        for style in ["calm", "flash", "hue"] {
+            let mut cfg = Config::default();
+            cfg.pulse.pulse_style = style.to_string();
+            assert_eq!(pick_emoji(95.0, 0, true, &cfg), "◆", "{style} 전반");
+            assert_eq!(pick_emoji(95.0, 20_000, true, &cfg), "◆", "{style} 후반");
+        }
+    }
+
+    #[test]
+    fn pulse_styles_registry() {
+        assert!(is_known_pulse_style("calm"));
+        assert!(is_known_pulse_style("flash"));
+        assert!(is_known_pulse_style("hue"));
+        assert!(is_known_pulse_style("swap"));
+        assert!(!is_known_pulse_style("bogus"));
+        assert_eq!(PULSE_STYLES, &["calm", "flash", "hue", "swap"]);
     }
 }
