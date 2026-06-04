@@ -305,6 +305,7 @@ pub fn parse_config_str(contents: &str) -> Config {
         Ok(mut config) => {
             // 미설정 테마 키를 프리셋 구체값으로 채운다(우선순위: 사용자키 > 프리셋 > calm).
             apply_theme(&mut config, contents);
+            warn_unknown_pulse_style(&config);
             expand_chain_command(&mut config);
             config
         }
@@ -372,6 +373,20 @@ fn apply_theme(config: &mut Config, raw_toml: &str) {
     }
     if !has_key(&value, keys[7].0, keys[7].1) {
         config.color.hud_seam = preset.hud_seam;
+    }
+}
+
+/// 해석된 `pulse_style`이 미지 값이면 stderr 경고 1줄(값은 보존, render가 calm으로 안전 저하).
+///
+/// theme 미지값 경고(`apply_theme`)와 대칭. 레거시 "bold"를 손편집으로 남긴 사용자에게도
+/// 안내가 된다. 핫패스이지만 출력은 미지 값일 때만(정상 config는 무출력).
+fn warn_unknown_pulse_style(config: &Config) {
+    if !crate::theme::is_known_pulse_style(&config.pulse.pulse_style) {
+        eprintln!(
+            "understatus: 알 수 없는 pulse_style '{}'. calm으로 진행합니다(사용 가능: {}).",
+            config.pulse.pulse_style,
+            crate::theme::PULSE_STYLES.join(", ")
+        );
     }
 }
 
@@ -615,6 +630,20 @@ mod tests {
         );
         // 나머지는 calm 폴백.
         assert_eq!(config.color.pulse_palette, vec!["#b87848", "#7a5030"]);
+    }
+
+    /// 미지 pulse_style은 값이 보존되며(경고는 부작용) 파싱은 성공해야 한다.
+    #[test]
+    fn unknown_pulse_style_is_preserved() {
+        let config = parse_config_str("[pulse]\npulse_style = \"bogus\"\n");
+        assert_eq!(config.pulse.pulse_style, "bogus");
+    }
+
+    /// 알려진 pulse_style은 그대로 유지된다.
+    #[test]
+    fn known_pulse_style_unchanged() {
+        let config = parse_config_str("[pulse]\npulse_style = \"hue\"\n");
+        assert_eq!(config.pulse.pulse_style, "hue");
     }
 
     /// theme="vivid" + band_tints="blue"(타입 불일치) → from_str 실패 → 전체 default(=calm), theme 무시.
