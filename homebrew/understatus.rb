@@ -10,12 +10,12 @@ class Understatus < Formula
   homepage "https://github.com/ictechgy/understatus"
 
   # URL points to the source tarball for the v0.2.0 release tag.
-  url "https://github.com/ictechgy/understatus/archive/refs/tags/v0.2.0.tar.gz"
+  url "https://github.com/ictechgy/understatus/archive/refs/tags/v0.3.0.tar.gz"
 
   # SHA-256 of the v0.2.0 source tarball.
-  #   curl -L https://github.com/ictechgy/understatus/archive/refs/tags/v0.2.0.tar.gz \
+  #   curl -L https://github.com/ictechgy/understatus/archive/refs/tags/v0.3.0.tar.gz \
   #     | shasum -a 256
-  sha256 "526ca84237e7023fbb2a07867d17b132540884bb528607111f38cd8f0bc639f4"
+  sha256 "ff52509b92ef1d79557c50abdde5f089c3bf0164b76e72ce3f6196ae25b9bab9"
 
   license "MIT"
 
