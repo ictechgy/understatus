@@ -293,13 +293,17 @@ struct RawContextWindow {
 #[derive(Debug, Deserialize, Default)]
 struct RawLtermInput {
     // 스키마 완전성을 위해 역직렬화하지만 라인 렌더에는 쓰지 않는다(`source`는 호출부 분기로 결정됨).
+    // forward-compat: 미소비 필드는 타입에 관대하게(Value) 받아, 타입 드리프트(예: 숫자 대신
+    // 문자열)가 와도 from_str이 실패하지 않게 한다. 이 필드의 타입 어긋남이 session/pane 등
+    // 정상 필드 매핑까지 깨뜨려 전체 payload가 default로 저하되는 것을 막는다.
     #[serde(default)]
     #[allow(dead_code)]
-    source: Option<String>,
+    source: Option<serde_json::Value>,
     // 버전 협상용. Phase 1은 읽되 분기 없이 무시한다(forward-compat, spec §4.1).
+    // lterm이 "version":"1"처럼 문자열로 보내도 파싱 전체가 실패하지 않도록 Value로 받는다.
     #[serde(default)]
     #[allow(dead_code)]
-    version: Option<u32>,
+    version: Option<serde_json::Value>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -311,12 +315,14 @@ struct RawLtermInput {
     #[serde(default)]
     cwd: Option<String>,
     // 폭 맞춤 힌트. 최종 폭 권위는 lterm이므로 understatus는 참고만 한다(현재 미소비).
+    // Phase 1은 미소비이므로 Value로 관대하게 받는다(타입 드리프트 격리). 추후 소비 시
+    // 숫자 변환은 그 시점에 별도로 처리한다.
     #[serde(default)]
     #[allow(dead_code)]
-    cols: Option<u32>,
+    cols: Option<serde_json::Value>,
     #[serde(default)]
     #[allow(dead_code)]
-    rows: Option<u32>,
+    rows: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -576,5 +582,28 @@ mod tests {
         let with_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1", "version": 99 }"#);
         let without_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1" }"#);
         assert_eq!(with_version, without_version);
+    }
+
+    /// 미소비/forward-compat 필드(version/cols/rows)가 타입 드리프트(문자열 등)해도
+    /// 전체 파싱이 실패하지 않고 session/pane/agent/cwd 등 useful 필드는 보존되어야 한다(무패닉).
+    /// 과거: 이 필드들이 strict Option<u32>라 "version":"1" 등이 오면 from_str이 전체 실패해
+    /// default로 저하되며 정상 필드까지 소실됐다.
+    #[test]
+    fn lterm_ignored_field_type_drift_preserves_useful_fields() {
+        let raw = r#"{
+            "session": "codex",
+            "pane": "%3",
+            "agent": "codex",
+            "cwd": "/Users/me/dev/app",
+            "version": "1",
+            "cols": "120",
+            "rows": "40"
+        }"#;
+        let input = parse_lterm_input(raw);
+        // 타입 드리프트한 ignored 필드가 있어도 useful 필드가 살아남아야 한다.
+        assert_eq!(input.session_id.as_deref(), Some("codex/%3"));
+        assert_eq!(input.model_display_name.as_deref(), Some("codex"));
+        assert_eq!(input.cwd.as_deref(), Some("/Users/me/dev/app"));
+        assert_eq!(input.git_branch, None);
     }
 }
