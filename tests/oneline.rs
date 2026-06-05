@@ -9,6 +9,10 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// chain 실행 여부를 stdout으로 직접 관측하기 위한 센티널. chain_command가 도는 경우에만
+/// 자식 stdout에 합성되어 self 세그먼트와 함께 한 줄에 나타난다.
+const CHAIN_SENTINEL: &str = "CHAINSENTINEL";
+
 /// 빌드된 understatus 바이너리에 stdin/인자를 주어 실행하고 stdout 바이트를 반환한다.
 ///
 /// # 인자
@@ -18,14 +22,23 @@ use std::process::{Command, Stdio};
 /// # 반환
 /// 자식 stdout 바이트 전체. NO_COLOR=1로 색을 끄고, 설정은 부재 경로로 기본값을 강제한다.
 fn run_understatus(args: &[&str], stdin: &str) -> Vec<u8> {
+    // 존재하지 않는 설정 경로 → 전 항목 기본값(테스트 격리, chain_command 없음).
+    run_understatus_with_config(args, stdin, "/nonexistent/understatus-test-config.toml")
+}
+
+/// [`run_understatus`]와 동일하되 `UNDERSTATUS_CONFIG` 경로를 명시 주입한다.
+///
+/// chain_command가 설정된 임시 config를 주입해 chain 실행 여부를 stdout으로 직접 관측하기 위함이다.
+///
+/// # 인자
+/// - `args`: render 서브커맨드 뒤 플래그.
+/// - `stdin`: 자식 stdin으로 전달할 JSON 본문.
+/// - `config_path`: `UNDERSTATUS_CONFIG`로 주입할 config.toml 경로.
+fn run_understatus_with_config(args: &[&str], stdin: &str, config_path: &str) -> Vec<u8> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_understatus"))
         .args(args)
         .env("NO_COLOR", "1")
-        // 존재하지 않는 설정 경로 → 전 항목 기본값(테스트 격리, chain_command 없음).
-        .env(
-            "UNDERSTATUS_CONFIG",
-            "/nonexistent/understatus-test-config.toml",
-        )
+        .env("UNDERSTATUS_CONFIG", config_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -46,6 +59,28 @@ fn run_understatus(args: &[&str], stdin: &str) -> Vec<u8> {
         output.status
     );
     output.stdout
+}
+
+/// chain_command가 센티널을 출력하도록 설정한 임시 config.toml을 만들고 그 경로를 반환한다.
+///
+/// chain 자식은 `sh -c <command>`로 실행되므로 `printf CHAINSENTINEL`이 도는지로 chain
+/// 실행 여부를 직접 검증한다. 테스트마다 고유 경로를 써서 캐시/병렬 간섭을 피한다.
+///
+/// # 인자
+/// - `tag`: 파일명 고유화 태그(테스트별 충돌/캐시 격리용).
+///
+/// # 반환
+/// 작성된 config.toml의 절대 경로 문자열.
+fn write_chain_config(tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "understatus-chain-cfg-{}-{}.toml",
+        std::process::id(),
+        tag
+    ));
+    // [chain] chain_command가 sh -c로 실행된다. 센티널만 출력하는 최소 명령.
+    let toml = format!("[chain]\nchain_command = \"printf {CHAIN_SENTINEL}\"\n");
+    std::fs::write(&path, toml).expect("임시 config 작성 실패");
+    path.to_string_lossy().into_owned()
 }
 
 /// --oneline은 정확히 1행을 후행 개행 없이 출력해야 한다(spec §6.3).
@@ -80,21 +115,57 @@ fn default_render_has_trailing_newline() {
     );
 }
 
-/// --oneline은 chain을 수행하지 않는다(HUD seam "│"가 출력에 없어야 함).
+/// --oneline은 chain을 수행하지 않는다(실제 chain_command 설정 상태에서 직접 증명).
 ///
-/// 기본 설정엔 chain_command가 없지만, oneline 경로는 cfg와 무관하게 chain 분기를
-/// 아예 건너뛴다. seam("│")은 chain 출력이 있을 때만 끼므로 부재로 간접 확인한다.
+/// 기본 config 대신 chain_command(센티널 출력)가 설정된 임시 config를 주입해 chain 실행
+/// 여부를 stdout 센티널로 직접 관측한다. 세 분기를 한 테스트에서 대조 검증한다:
+/// - `--oneline`(claude source): chain 미수행 → 센티널 **없음**(수정 #2).
+/// - 동일 config로 `--oneline` 없이(claude source): chain 수행 → 센티널 **있음**(대조군).
+/// - `--source lterm`(--oneline 없이): chain 비활성 → 센티널 **없음**(수정 #3).
+///
+/// 각 분기는 서로 다른 session/pane(=session_key)을 써서 chain 캐시 교차 오염을 피한다.
 #[test]
 fn oneline_does_not_run_chain() {
-    let stdout = run_understatus(
-        &["render", "--source", "lterm", "--oneline"],
-        r#"{"source":"lterm","session":"s","pane":"%1"}"#,
+    let config = write_chain_config("oneline-chain-skip");
+
+    // (1) --oneline(claude source): chain 미수행 → 센티널 없음.
+    let oneline_out = run_understatus_with_config(
+        &["render", "--oneline"],
+        r#"{"session_id":"oneline-skip-a"}"#,
+        &config,
     );
-    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+    let oneline_text = String::from_utf8(oneline_out).expect("stdout는 UTF-8이어야 함");
     assert!(
-        !text.contains('│'),
-        "chain seam(│)이 없어야 함(chain 미수행): {text:?}"
+        !oneline_text.contains(CHAIN_SENTINEL),
+        "--oneline은 chain을 수행하면 안 됨(센티널 부재): {oneline_text:?}"
     );
+
+    // (2) 대조군: 동일 config로 --oneline 없이(claude source) → chain 수행 → 센티널 있음.
+    //   chain이 실제로 도는지 증명해 (1)의 부재가 chain-skip 때문임을 분리 검증한다.
+    let control_out = run_understatus_with_config(
+        &["render"],
+        r#"{"session_id":"oneline-skip-control"}"#,
+        &config,
+    );
+    let control_text = String::from_utf8(control_out).expect("stdout는 UTF-8이어야 함");
+    assert!(
+        control_text.contains(CHAIN_SENTINEL),
+        "대조군(--oneline 없음, claude)은 chain이 실제로 돌아 센티널이 있어야 함: {control_text:?}"
+    );
+
+    // (3) --source lterm(--oneline 없이): chain 비활성 → 센티널 없음(수정 #3).
+    let lterm_out = run_understatus_with_config(
+        &["render", "--source", "lterm"],
+        r#"{"source":"lterm","session":"oneline-skip-lterm","pane":"%1"}"#,
+        &config,
+    );
+    let lterm_text = String::from_utf8(lterm_out).expect("stdout는 UTF-8이어야 함");
+    assert!(
+        !lterm_text.contains(CHAIN_SENTINEL),
+        "--source lterm은 chain 기본 off여야 함(센티널 부재): {lterm_text:?}"
+    );
+
+    let _ = std::fs::remove_file(&config);
 }
 
 /// 작은 cols 힌트가 와도 강제 절단하지 않는다(최종 폭 권위는 lterm, spec §6.3).
