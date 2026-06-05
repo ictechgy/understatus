@@ -570,7 +570,8 @@ fn print_help() {
         "understatus {} — AI 코딩 CLI용 macOS statusline 애드온\n\
          \n\
          사용법:\n\
-         \x20 understatus [render] [옵션] stdin JSON을 읽어 statusline 한 줄을 출력(기본)\n\
+         \x20 understatus                 stdin JSON을 읽어 statusline 한 줄을 출력(기본 render)\n\
+         \x20 understatus render [옵션]   render 옵션과 함께 statusline 한 줄을 출력\n\
          \x20 understatus install [옵션]  기존 statusLine을 보존(체이닝)하며 비파괴 설치\n\
          \x20 understatus uninstall      원본 설정을 정확 복원하며 제거\n\
          \x20 understatus theme <name>   설치 후 테마 교체(config.toml만 수정)\n\
@@ -579,7 +580,7 @@ fn print_help() {
          \x20 understatus --help         이 도움말 출력\n\
          \x20 understatus --version      버전 출력\n\
          \n\
-         render 옵션:\n\
+         render 옵션(understatus render 뒤에 사용):\n\
          \x20 --source <s>     입력 소스(claude|lterm). 미지정 시 claude.\n\
          \x20 --oneline        chain 없이 코어 한 줄만 후행 개행 없이 출력(status row용).\n\
          \n\
@@ -679,6 +680,14 @@ mod tests {
     #[test]
     fn parse_render_args_rejects_unknown_flag() {
         assert!(parse_render_args(&render_argv(&["--bogus"])).is_err());
+    }
+
+    /// `--source`가 중복되면 마지막 값이 이긴다(last-wins 계약 고정).
+    #[test]
+    fn parse_render_args_duplicate_source_last_wins() {
+        let parsed = parse_render_args(&render_argv(&["--source", "claude", "--source", "lterm"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Lterm);
     }
 
     /// 인자 슬라이스를 만든다(args[0] == "install").
