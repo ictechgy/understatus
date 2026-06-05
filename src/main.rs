@@ -521,8 +521,10 @@ fn run_render_pipeline(source: Source, oneline: bool) {
     }
 
     // (7) 체인 자식 실행(있으면). 타임아웃/캐시로 렌더 무블록.
-    let chain_output = match cfg.chain.chain_command.as_deref() {
-        Some(command) if !command.is_empty() => {
+    //   단, `--source lterm`은 chain 기본 off(spec §6.3): lterm JSON이 Claude용 chain으로
+    //   전달되지 않도록 oneline 여부와 무관하게 chain을 미수행한다(정상 줄바꿈 출력은 유지).
+    let chain_output = match (source, cfg.chain.chain_command.as_deref()) {
+        (Source::Claude, Some(command)) if !command.is_empty() => {
             chain::run_chain(command, &raw_stdin, &cfg, &session_key)
         }
         _ => String::new(),
