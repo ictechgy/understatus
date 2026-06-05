@@ -83,6 +83,73 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
     }
 }
 
+/// lterm 합성 stdin JSON을 [`ClaudeInput`]으로 파싱한다([`parse_claude_input`]과 대칭, lenient).
+///
+/// # 인자
+/// - `raw`: lterm이 stdin으로 전달한 JSON 한 줄(빈 `{}`/누락/미상 필드 가능). 계약(spec §4.1):
+///   `source`/`version`/`session`/`pane`/`session_key`/`agent`/`cwd`/`cols`/`rows`.
+///
+/// # 반환
+/// 표시에 필요한 필드를 채운 [`ClaudeInput`]. JSON이 비었거나 깨졌으면 전부 `None`인
+/// 기본값으로 안전 저하한다(절대 패닉하지 않음, lenient — `parse_claude_input` 철학 동일).
+///
+/// # 주의
+/// - `cwd`는 **표시용으로만** 매핑한다(git 도출 안 함). `$PWD` 폴백은 추가하지 않는다(spec §4.1/§6.2).
+/// - `git_branch`는 항상 `None`으로 둔다 → 자연히 git 세그먼트 미표시(Phase 1 git 비활성).
+/// - `session_key`는 캐시/펄스 격리용 안정 키다. 없으면 `"<session>/<pane>"`로 합성한다
+///   (실제 경로 살균은 호출부 [`crate::chain::sanitize_session_key`]가 담당).
+/// - `version`은 `version` 필드로 읽되 Phase 1은 분기 없이 무시한다(forward-compat).
+pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
+    // LENIENT: 깨진/빈 JSON은 에러 대신 전부 None인 기본값으로 안전 저하한다.
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ClaudeInput::default();
+    }
+    let raw_input: RawLtermInput = match serde_json::from_str(trimmed) {
+        Ok(parsed) => parsed,
+        // 깨진 JSON → 패닉 금지, 전부 None.
+        Err(_) => return ClaudeInput::default(),
+    };
+
+    // session_key는 명시값을 우선하고, 없으면 "<session>/<pane>"로 합성한다(캐시/펄스 격리).
+    let session_key = raw_input
+        .session_key
+        .filter(|key| !key.is_empty())
+        .or_else(|| synthesize_session_key(&raw_input.session, &raw_input.pane));
+
+    ClaudeInput {
+        // 에이전트/모델 표시명: lterm payload의 `agent`를 모델 슬롯에 매핑(best-effort).
+        model_display_name: raw_input.agent,
+        context_used_percentage: None,
+        // cwd는 표시용으로만 사용한다(git 도출 안 함, $PWD 폴백 없음).
+        cwd: raw_input.cwd,
+        // git 세그먼트 비활성: branch를 절대 채우지 않는다(Phase 1).
+        git_branch: None,
+        cost_usd: None,
+        session_id: session_key,
+    }
+}
+
+/// `session`/`pane`으로 안정 session_key를 합성한다(명시 `session_key` 부재 시).
+///
+/// # 인자
+/// - `session`: lterm 세션 이름(예: `"codex"`).
+/// - `pane`: lterm 페인 식별자(예: `"%3"`).
+///
+/// # 반환
+/// `"<session>/<pane>"` 합성 키. 둘 다 부재면 `None`(호출부가 빈 키 → "default"로 폴백).
+/// 한쪽만 있으면 있는 쪽만 사용한다(빈 세그먼트로 인한 무의미한 슬래시 방지).
+fn synthesize_session_key(session: &Option<String>, pane: &Option<String>) -> Option<String> {
+    let session = session.as_deref().filter(|value| !value.is_empty());
+    let pane = pane.as_deref().filter(|value| !value.is_empty());
+    match (session, pane) {
+        (Some(session), Some(pane)) => Some(format!("{session}/{pane}")),
+        (Some(session), None) => Some(session.to_string()),
+        (None, Some(pane)) => Some(pane.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// `workspace.git_worktree`(우선) 또는 `workspace.repo`에서 현재 git 브랜치를 파생한다.
 ///
 /// # 인자
@@ -217,6 +284,39 @@ struct RawCost {
 struct RawContextWindow {
     #[serde(default)]
     used_percentage: Option<f64>,
+}
+
+/// lterm 합성 stdin JSON(평탄 구조)을 그대로 받는 내부 역직렬화 타입(spec §4.1 계약).
+///
+/// `#[serde(default)]`로 누락/미상 필드를 안전 처리하고, 빈 `{}`에도 견딘다([`RawClaudeInput`]과
+/// 동일 철학). [`parse_lterm_input`]이 이 타입을 [`ClaudeInput`]으로 매핑한다.
+#[derive(Debug, Deserialize, Default)]
+struct RawLtermInput {
+    // 스키마 완전성을 위해 역직렬화하지만 라인 렌더에는 쓰지 않는다(`source`는 호출부 분기로 결정됨).
+    #[serde(default)]
+    #[allow(dead_code)]
+    source: Option<String>,
+    // 버전 협상용. Phase 1은 읽되 분기 없이 무시한다(forward-compat, spec §4.1).
+    #[serde(default)]
+    #[allow(dead_code)]
+    version: Option<u32>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    pane: Option<String>,
+    #[serde(default)]
+    session_key: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    // 폭 맞춤 힌트. 최종 폭 권위는 lterm이므로 understatus는 참고만 한다(현재 미소비).
+    #[serde(default)]
+    #[allow(dead_code)]
+    cols: Option<u32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    rows: Option<u32>,
 }
 
 #[cfg(test)]
@@ -361,5 +461,120 @@ mod tests {
         let raw = r#"{ "workspace": { "git_worktree": "/etc" } }"#;
         let input = parse_claude_input(raw);
         assert_eq!(input.git_branch, None);
+    }
+
+    // === parse_lterm_input (spec §6.2, §10) ===
+
+    /// 정상 lterm JSON: 표시 필드가 정확히 매핑되고 git은 비활성이어야 한다.
+    #[test]
+    fn lterm_parses_normal_input() {
+        let raw = r#"{
+            "source": "lterm",
+            "version": 1,
+            "session": "codex",
+            "pane": "%3",
+            "session_key": "codex/%3",
+            "agent": "codex",
+            "cwd": "/Users/me/dev/app",
+            "cols": 120,
+            "rows": 40
+        }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.cwd.as_deref(), Some("/Users/me/dev/app"));
+        assert_eq!(input.model_display_name.as_deref(), Some("codex"));
+        assert_eq!(input.session_id.as_deref(), Some("codex/%3"));
+        // git 세그먼트 비활성: branch는 항상 None.
+        assert_eq!(input.git_branch, None);
+        // lterm 계약엔 컨텍스트/비용이 없으므로 None.
+        assert_eq!(input.context_used_percentage, None);
+        assert_eq!(input.cost_usd, None);
+    }
+
+    /// 빈 객체는 전부 None인 기본값을 반환해야 한다(무패닉).
+    #[test]
+    fn lterm_empty_object_is_all_none() {
+        let input = parse_lterm_input("{}");
+        assert_eq!(input, ClaudeInput::default());
+    }
+
+    /// 미상/추가 필드가 섞여도 무시하고 정상 매핑해야 한다(lenient, 무패닉).
+    #[test]
+    fn lterm_unknown_fields_ignored() {
+        let raw = r#"{
+            "source": "lterm",
+            "session": "s",
+            "pane": "%1",
+            "cwd": "/tmp/x",
+            "future_field": { "nested": [1, 2, 3] },
+            "another": "ignored"
+        }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.cwd.as_deref(), Some("/tmp/x"));
+        assert_eq!(input.session_id.as_deref(), Some("s/%1"));
+        assert_eq!(input.git_branch, None);
+    }
+
+    /// 필드 누락: 부재 필드는 전부 None(또는 합성)으로 안전 저하해야 한다(무패닉).
+    #[test]
+    fn lterm_missing_fields_default_to_none() {
+        let raw = r#"{ "source": "lterm", "cwd": "/only/cwd" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.cwd.as_deref(), Some("/only/cwd"));
+        assert_eq!(input.model_display_name, None);
+        // session/pane 둘 다 부재 → session_key 합성 불가 → None.
+        assert_eq!(input.session_id, None);
+        assert_eq!(input.git_branch, None);
+        assert_eq!(input.context_used_percentage, None);
+        assert_eq!(input.cost_usd, None);
+    }
+
+    /// session_key 부재 시 "<session>/<pane>"로 합성해야 한다.
+    #[test]
+    fn lterm_synthesizes_session_key_from_session_and_pane() {
+        let raw = r#"{ "session": "codex", "pane": "%7" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.session_id.as_deref(), Some("codex/%7"));
+    }
+
+    /// 명시 session_key가 있으면 합성하지 않고 그 값을 그대로 쓴다.
+    #[test]
+    fn lterm_explicit_session_key_takes_precedence() {
+        let raw = r#"{ "session": "codex", "pane": "%7", "session_key": "stable-key" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.session_id.as_deref(), Some("stable-key"));
+    }
+
+    /// session_key 합성 시 한쪽만 있으면 있는 쪽만 사용해 무의미한 슬래시를 만들지 않는다.
+    #[test]
+    fn lterm_session_key_synthesis_partial() {
+        let only_session = parse_lterm_input(r#"{ "session": "codex" }"#);
+        assert_eq!(only_session.session_id.as_deref(), Some("codex"));
+        let only_pane = parse_lterm_input(r#"{ "pane": "%2" }"#);
+        assert_eq!(only_pane.session_id.as_deref(), Some("%2"));
+    }
+
+    /// 빈 session_key 문자열은 무시하고 session/pane으로 합성해야 한다.
+    #[test]
+    fn lterm_empty_session_key_falls_back_to_synthesis() {
+        let raw = r#"{ "session": "s", "pane": "%1", "session_key": "" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.session_id.as_deref(), Some("s/%1"));
+    }
+
+    /// 깨진 JSON은 패닉 없이 전부 None으로 저하해야 한다(LENIENT).
+    #[test]
+    fn lterm_broken_json_returns_default() {
+        for raw in ["", "   ", "not json", "{ \"session\": ", "[1,2,3]"] {
+            let input = parse_lterm_input(raw);
+            assert_eq!(input, ClaudeInput::default(), "입력: {raw:?}");
+        }
+    }
+
+    /// version은 읽되 분기 없이 무시한다(forward-compat): version 유무로 결과가 달라지지 않아야 한다.
+    #[test]
+    fn lterm_version_is_ignored() {
+        let with_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1", "version": 99 }"#);
+        let without_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1" }"#);
+        assert_eq!(with_version, without_version);
     }
 }

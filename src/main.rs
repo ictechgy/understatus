@@ -31,10 +31,17 @@ fn main() -> ExitCode {
     let subcommand = args.first().map(String::as_str);
 
     match subcommand {
-        None | Some("render") => {
-            run_render_pipeline();
-            ExitCode::SUCCESS
-        }
+        None | Some("render") => match parse_render_args(&args) {
+            Ok(render_args) => {
+                run_render_pipeline(render_args.source, render_args.oneline);
+                ExitCode::SUCCESS
+            }
+            // 미지 플래그/미지 source 값은 기존 `Some(other)` 관례와 동일하게 FAILURE.
+            Err(message) => {
+                eprintln!("understatus: {message}");
+                ExitCode::FAILURE
+            }
+        },
         Some("install") => run_install(&args),
         Some("uninstall") => match install::uninstall() {
             Ok(()) => ExitCode::SUCCESS,
@@ -66,8 +73,85 @@ fn main() -> ExitCode {
 
 /// 서브커맨드에 허용된 위치 인자(값 1개)를 초과했는지 판정한다.
 /// `args[0]`=서브커맨드, `args[1]`=값. len>2면 잉여 인자.
+///
+/// 주의: render 경로는 플래그(`--source`/`--oneline`)를 받으므로 이 판정을 쓰지 않고
+/// [`parse_render_args`]가 따로 검증한다(render 뒤 플래그를 잉여로 오판하지 않도록 분리).
 fn has_extra_args(args: &[String]) -> bool {
     args.len() > 2
+}
+
+/// 렌더 입력 소스(spec §6.1). `--source <claude|lterm>`로 선택하며 기본은 claude.
+///
+/// - `Claude`: 기존 동작(Claude Code stdin JSON 파싱 + chain 가능).
+/// - `Lterm`: lterm 합성 JSON 파싱(git 비활성, chain 기본 off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Claude Code stdin JSON(기본값).
+    Claude,
+    /// lterm 합성 JSON(`--source lterm`).
+    Lterm,
+}
+
+/// render 경로의 파싱된 플래그.
+struct RenderArgs {
+    /// `--source <claude|lterm>`. 미지정 시 [`Source::Claude`].
+    source: Source,
+    /// `--oneline`. true면 chain 미수행 + 후행 개행 없이 1행 출력(spec §6.3).
+    oneline: bool,
+}
+
+/// render 경로용 플래그를 파싱한다(순수 함수, clap 미사용 — 기존 수동 디스패치 스타일).
+///
+/// # 인자
+/// - `args`: 전체 인자 슬라이스. `args[0]`이 `"render"`이면 건너뛰고, 무인자(`render` 생략)도 허용한다.
+///
+/// # 반환
+/// 파싱된 [`RenderArgs`]. `--source`/`--oneline`은 순서 무관이며 둘 다 선택적이다.
+/// 미지 플래그/미지 source 값/`--source` 값 누락은 `Err(메시지)`(호출부가 `ExitCode::FAILURE`).
+///
+/// # 주의
+/// `--source` 중복 지정 시 마지막 값이 이긴다(수동 파서의 일반 관례). `--oneline` 중복은 무해(idempotent).
+fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
+    let mut source = Source::Claude;
+    let mut oneline = false;
+
+    // args[0]이 "render"면 건너뛴다(무인자 호출은 args가 비어 시작 인덱스 0).
+    let mut index = if args.first().map(String::as_str) == Some("render") {
+        1
+    } else {
+        0
+    };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--source 뒤에 값이 필요합니다(claude|lterm).".to_string())?;
+                source = parse_source(value)?;
+                index += 2;
+            }
+            "--oneline" => {
+                oneline = true;
+                index += 1;
+            }
+            other => {
+                return Err(format!("알 수 없는 render 옵션 '{other}'. --help 참조."));
+            }
+        }
+    }
+
+    Ok(RenderArgs { source, oneline })
+}
+
+/// `--source` 값 문자열을 [`Source`]로 해석한다(미지값은 에러).
+fn parse_source(value: &str) -> Result<Source, String> {
+    match value {
+        "claude" => Ok(Source::Claude),
+        "lterm" => Ok(Source::Lterm),
+        other => Err(format!(
+            "알 수 없는 source '{other}'. 사용 가능: claude|lterm."
+        )),
+    }
 }
 
 /// 설치 가능한 테마 기본값(미지정 + 비TTY/`--yes` 폴백).
@@ -386,14 +470,20 @@ fn print_themes() {
 
 /// 렌더 파이프라인을 실행하고 합성된 한 줄을 stdout에 출력한다.
 ///
-/// 계획서 §D-1의 8단계를 순서대로 호출한다. 각 단계의 스텁(`todo!()`)은
-/// 병렬 워커가 채운다. 본 함수는 실제 배선(stdin 읽기/단계 연결/출력)을 담당한다.
-fn run_render_pipeline() {
+/// 계획서 §D-1의 8단계를 순서대로 호출한다. 본 함수는 실제 배선(stdin 읽기/단계 연결/출력)을 담당한다.
+///
+/// # 인자
+/// - `source`: 입력 소스(claude=기존 동작, lterm=합성 JSON). lterm은 git 비활성·chain 기본 off.
+/// - `oneline`: true면 chain을 수행하지 않고 코어 `render()` 1행만 **후행 개행 없이** 출력한다(spec §6.3).
+fn run_render_pipeline(source: Source, oneline: bool) {
     // (1) stdin 원본 보존(체이닝을 위해 raw 그대로 자식에 전달).
     let raw_stdin = read_stdin();
 
-    // (2) Claude 세션 정보 파싱(누락/null/깨진 JSON 안전).
-    let claude_input = claude::parse_claude_input(&raw_stdin);
+    // (2) 소스별 세션 정보 파싱(누락/null/깨진 JSON 안전). lterm은 git 비활성.
+    let claude_input = match source {
+        Source::Claude => claude::parse_claude_input(&raw_stdin),
+        Source::Lterm => claude::parse_lterm_input(&raw_stdin),
+    };
 
     // 세션 캐시 격리 키를 한 곳에서 1회 살균한다(§11.3). session_id 부재/빈 값은 "default"로 폴백.
     let session_key = chain::sanitize_session_key(claude_input.session_id.as_deref().unwrap_or(""));
@@ -421,6 +511,14 @@ fn run_render_pipeline() {
 
     // (6) understatus 자체 세그먼트 렌더.
     let self_segment = render::render(&claude_input, &snapshot, &cfg, now_ms, pulse_on);
+
+    // (8') --oneline: chain 미수행, 코어 render() 1행만 후행 개행 없이 출력(spec §6.3).
+    //   status row(1행)용 경로로, 최종 폭 권위는 lterm이므로 cols 힌트로 강제 절단하지 않는다.
+    if oneline {
+        print!("{self_segment}");
+        let _ = std::io::stdout().flush();
+        return;
+    }
 
     // (7) 체인 자식 실행(있으면). 타임아웃/캐시로 렌더 무블록.
     let chain_output = match cfg.chain.chain_command.as_deref() {
@@ -470,7 +568,7 @@ fn print_help() {
         "understatus {} — AI 코딩 CLI용 macOS statusline 애드온\n\
          \n\
          사용법:\n\
-         \x20 understatus [render]       stdin JSON을 읽어 statusline 한 줄을 출력(기본)\n\
+         \x20 understatus [render] [옵션] stdin JSON을 읽어 statusline 한 줄을 출력(기본)\n\
          \x20 understatus install [옵션]  기존 statusLine을 보존(체이닝)하며 비파괴 설치\n\
          \x20 understatus uninstall      원본 설정을 정확 복원하며 제거\n\
          \x20 understatus theme <name>   설치 후 테마 교체(config.toml만 수정)\n\
@@ -478,6 +576,10 @@ fn print_help() {
          \x20 understatus pulse <style>  펄스 스타일 교체(calm|flash|hue|swap, config.toml만 수정)\n\
          \x20 understatus --help         이 도움말 출력\n\
          \x20 understatus --version      버전 출력\n\
+         \n\
+         render 옵션:\n\
+         \x20 --source <s>     입력 소스(claude|lterm). 미지정 시 claude.\n\
+         \x20 --oneline        chain 없이 코어 한 줄만 후행 개행 없이 출력(status row용).\n\
          \n\
          install 옵션:\n\
          \x20 --interval <N>   refreshInterval 초(정수 ≥ 1). 미지정 시 프롬프트/승계/기본 5.\n\
@@ -506,6 +608,75 @@ mod tests {
             "hue".to_string(),
             "typo".to_string()
         ]));
+    }
+
+    // --- parse_render_args (spec §6.1, §10) ---
+
+    /// 인자 슬라이스를 만든다(args[0] == "render").
+    fn render_argv(rest: &[&str]) -> Vec<String> {
+        let mut v = vec!["render".to_string()];
+        v.extend(rest.iter().map(|s| s.to_string()));
+        v
+    }
+
+    /// 무인자(render 생략)는 기본값(claude, oneline off)으로 성공해야 한다.
+    #[test]
+    fn parse_render_args_empty_is_default() {
+        let parsed = parse_render_args(&[]).expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Claude);
+        assert!(!parsed.oneline);
+    }
+
+    /// `render` 단독(플래그 없이)도 기본값으로 성공해야 한다(기존 동작 보존).
+    #[test]
+    fn parse_render_args_bare_render_is_default() {
+        let parsed = parse_render_args(&render_argv(&[])).expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Claude);
+        assert!(!parsed.oneline);
+    }
+
+    /// `render --source lterm --oneline` → lterm + oneline 성공 진입.
+    #[test]
+    fn parse_render_args_lterm_oneline() {
+        let parsed = parse_render_args(&render_argv(&["--source", "lterm", "--oneline"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Lterm);
+        assert!(parsed.oneline);
+    }
+
+    /// 플래그 순서는 무관해야 한다(--oneline --source lterm).
+    #[test]
+    fn parse_render_args_order_independent() {
+        let parsed = parse_render_args(&render_argv(&["--oneline", "--source", "lterm"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Lterm);
+        assert!(parsed.oneline);
+    }
+
+    /// `--source claude`는 기본과 동일하게 해석되어야 한다.
+    #[test]
+    fn parse_render_args_explicit_claude() {
+        let parsed = parse_render_args(&render_argv(&["--source", "claude"])).expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Claude);
+        assert!(!parsed.oneline);
+    }
+
+    /// 미지 source 값은 에러(ExitCode::FAILURE로 이어짐).
+    #[test]
+    fn parse_render_args_rejects_unknown_source() {
+        assert!(parse_render_args(&render_argv(&["--source", "bogus"])).is_err());
+    }
+
+    /// `--source` 값 누락은 에러여야 한다.
+    #[test]
+    fn parse_render_args_rejects_missing_source_value() {
+        assert!(parse_render_args(&render_argv(&["--source"])).is_err());
+    }
+
+    /// 미지 플래그는 에러여야 한다(기존 `Some(other)` 관례와 동일).
+    #[test]
+    fn parse_render_args_rejects_unknown_flag() {
+        assert!(parse_render_args(&render_argv(&["--bogus"])).is_err());
     }
 
     /// 인자 슬라이스를 만든다(args[0] == "install").
