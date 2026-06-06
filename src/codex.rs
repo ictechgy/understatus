@@ -601,11 +601,44 @@ fn file_mtime_ms(path: &Path) -> Option<u128> {
         .map(|d| d.as_millis())
 }
 
+/// 캐시 히트 시 해소된 파일의 mtime(epoch ms)이 여전히 freshness 이내인지 판정한다(spec §5/§8).
+///
+/// 캐시 신선도 게이트([`is_named_cache_fresh`])는 **캐시 기록 시각**(`written_ms`) 기준이라,
+/// 세션 종료 후 파일 mtime이 고정돼도 마지막 캐시 write로부터 freshness 동안 stale 세션을
+/// 계속 표시하는 결함이 있다. 이를 막기 위해 캐시 히트 재사용/재독 전에 **파일 자체의 mtime**이
+/// freshness 이내인지 [`find_codex_candidates`]의 선필터(`is_fresh`)와 동일 기준으로 재검증한다.
+/// 이미 `file_mtime_ms`로 stat한 결과를 그대로 받으므로 추가 syscall은 없다(핫패스 비용 불변).
+///
+/// # 인자
+/// - `mtime_ms`: 해소된 rollout 파일의 mtime(epoch ms).
+/// - `now`: 현재 시각(SystemTime). freshness 비교 기준.
+/// - `freshness_secs`: 신선도 상한(초).
+///
+/// # 반환
+/// 미래 mtime(now보다 나중, 동시 쓰기 등)은 fresh로 본다. `now`의 epoch 변환 실패 시 보수적
+/// 으로 `false`(캐시 무시 → 풀 재해소).
+fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool {
+    let now_ms = match now.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis(),
+        Err(_) => return false,
+    };
+    // 미래 mtime(now보다 나중): 동시 쓰기 등 → fresh로 본다(is_fresh와 동일 정책).
+    if mtime_ms >= now_ms {
+        return true;
+    }
+    let elapsed_secs = (now_ms - mtime_ms) / 1000;
+    elapsed_secs <= freshness_secs as u128
+}
+
 /// 세션 데이터를 디스크 캐시에서 조회/갱신해 [`CodexSession`]을 반환한다(spec §8 매 틱 로직).
 ///
-/// 1) 캐시 히트 & 경로 mtime 불변 & freshness 이내 → 재사용(스캔 0, stat 1회).
-/// 2) 캐시 히트 & mtime 변동 & freshness 이내 → 그 파일만 tail 재독 → 캐시 갱신.
-/// 3) 미스/경로 stale/없음 → 풀 후보스캔 재해소. **Ambiguous는 캐시하지 않는다**.
+/// 1) 캐시 히트 & 경로 mtime 불변 & **파일 mtime freshness 이내** → 재사용(스캔 0, stat 1회).
+/// 2) 캐시 히트 & mtime 변동 & **파일 mtime freshness 이내** → 그 파일만 tail 재독 → 캐시 갱신.
+/// 3) 미스/경로 stale/**파일 mtime stale**/없음 → 풀 후보스캔 재해소. **Ambiguous는 캐시하지 않는다**.
+///
+/// **파일 freshness 재검증(spec §5 일관성)**: 캐시 신선도는 기록 시각 기준이라, 캐시 히트 시
+/// 해소된 파일의 mtime이 여전히 freshness 이내인지([`is_mtime_fresh`]) 추가 검증한다. stale이면
+/// 캐시를 무시하고 (3) 풀 재해소로 떨어진다 — 종료된 세션은 freshness 경과 후 더는 표시되지 않는다.
 ///
 /// # 반환
 /// 단일 해소 시 `Some(session)`. 모호/없음 시 `None`(무변경 신호).
@@ -626,11 +659,14 @@ fn resolve_with_cache(
             if let Ok(entry) = serde_json::from_str::<CodexCacheEntry>(&payload) {
                 let cached_path = PathBuf::from(&entry.path);
                 match file_mtime_ms(&cached_path) {
-                    // (1) 경로 mtime 불변 → 재사용(stat 1회).
+                    // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
+                    // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
+                    Some(current_mtime) if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
+                    // (1) 경로 mtime 불변 & fresh → 재사용(stat 1회).
                     Some(current_mtime) if current_mtime == entry.mtime_ms => {
                         return Some(entry.session);
                     }
-                    // (2) mtime 변동(파일 존재) → 그 파일만 tail 재독 → 캐시 갱신.
+                    // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
                     Some(current_mtime) => {
                         if let Some(session) = extract_from_file(&cached_path) {
                             write_cache_entry(
@@ -991,6 +1027,30 @@ mod tests {
         assert_eq!(tc.model.as_deref(), Some("gpt-6"));
     }
 
+    /// is_mtime_fresh: 파일 mtime의 freshness 판정(과거 경과/미래/경계).
+    #[test]
+    fn is_mtime_fresh_judges_by_elapsed() {
+        let now = SystemTime::now();
+        let now_ms = now.duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let freshness_secs = 240 * 60; // 240분.
+                                       // 1분 전 mtime → fresh.
+        assert!(is_mtime_fresh(now_ms - 60_000, now, freshness_secs));
+        // 5시간 전 mtime → stale(240분 초과).
+        assert!(!is_mtime_fresh(
+            now_ms - 5 * 3600 * 1000,
+            now,
+            freshness_secs
+        ));
+        // 정확히 freshness 경계(240분) → 이내로 본다.
+        assert!(is_mtime_fresh(
+            now_ms - freshness_secs as u128 * 1000,
+            now,
+            freshness_secs
+        ));
+        // 미래 mtime(now보다 나중, 동시 쓰기 등) → fresh로 본다.
+        assert!(is_mtime_fresh(now_ms + 60_000, now, freshness_secs));
+    }
+
     /// cwd_matches: trailing slash 정규화(존재 경로는 canonicalize, 부재는 trim 비교).
     #[test]
     fn cwd_matches_normalizes_trailing_slash() {
@@ -1259,8 +1319,10 @@ mod tests {
 
     /// HOME/CODEX_HOME을 격리 주입해 maybe_enrich를 호출하는 테스트의 env 직렬화 락.
     ///
-    /// maybe_enrich는 codex_home()/캐시(HOME)에 의존하므로 process-global env를 만진다.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// maybe_enrich는 codex_home()/캐시(HOME)에 의존하므로 process-global env를 만진다. HOME swap은
+    /// 모듈 밖 HOME 의존 테스트(예: `system::net_delta_session_independent`)와도 겹치므로, codex 전용
+    /// 락이 아니라 **crate 공유 락**([`crate::chain::HOME_CACHE_TEST_LOCK`])을 잡아 교차 모듈 경합을 막는다.
+    use crate::chain::HOME_CACHE_TEST_LOCK as ENV_LOCK;
 
     /// agent≠codex → 무변경(IO 0).
     #[test]
@@ -1328,7 +1390,7 @@ mod tests {
         assert_eq!(extras.rate_weekly_percent, Some(21.0));
         assert_eq!(extras.plan.as_deref(), Some("pro"));
         assert_eq!(extras.effort.as_deref(), Some("xhigh"));
-        cleanup_real_cache("enrich-single-key");
+        // HOME이 temp로 격리되어 캐시도 temp(home) 하위에 들어가므로 실캐시 청소가 불필요하다.
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1361,8 +1423,7 @@ mod tests {
             maybe_enrich(&mut input, &Config::default());
         });
         assert_eq!(input, before, "모호는 무변경(model=codex 유지)");
-        // 모호는 캐시되지 않아야 한다(TTL 고착 차단). 혹시 남았으면 청소.
-        cleanup_real_cache("enrich-amb-key");
+        // 모호는 캐시되지 않아야 한다(TTL 고착 차단). HOME 격리로 캐시는 temp에만 존재한다.
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1416,23 +1477,98 @@ mod tests {
             Some("gpt-5.5"),
             "정상상태는 캐시 재사용(재스캔 없이 stat 1회)"
         );
-        cleanup_real_cache(key);
+        // HOME 격리로 캐시는 temp(home) 하위에만 존재하므로 실캐시 청소가 불필요하다.
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// M2: 캐시 히트라도 해소된 파일 mtime이 freshness를 넘기면 캐시를 무시하고 재해소한다.
+    ///
+    /// 캐시 신선도는 기록 시각 기준이라, 세션 종료 후 파일 mtime이 고정돼도 마지막 캐시 write로부터
+    /// freshness 동안 stale 세션을 계속 표시하는 결함을 박제한다(spec §5 "fresh 후보만" 일관성).
+    /// 1회차로 캐시를 채운 뒤 해소된 파일 mtime을 freshness보다 오래되게 만들고, 2회차는 매칭 불가
+    /// cwd로 호출한다. 캐시가 stale로 무시되면 풀 재해소가 0 후보 → None(model="codex" 유지)이어야 한다.
+    /// (이전 동작은 stale 캐시를 재사용해 enrich를 유지했으므로 이 단언이 회귀 가드 역할을 한다.)
+    #[test]
+    fn cache_ignored_when_resolved_file_is_stale() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = unique_tmp("cache-stale");
+        let home = unique_tmp("cache-stale-home");
+        let cwd = "/Users/me/projStaleCache";
+        let key = "cache-stale-key";
+        let rollout_path = write_rollout(
+            &base,
+            "cachestale",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        // 1회차: 캐시 채움(파일이 fresh이므로 enrich 성공).
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut first, &Config::default());
+        });
+        assert_eq!(
+            first.model_display_name.as_deref(),
+            Some("gpt-5.5"),
+            "1회차는 fresh 파일이라 enrich 성공"
+        );
+
+        // 해소된 파일의 mtime을 freshness(기본 240분)보다 한참 오래되게(5시간 전) 만든다.
+        let five_hours_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
+        set_file_mtime(&rollout_path, five_hours_ago);
+
+        // 2회차: 같은 캐시 키지만 매칭 불가 cwd. 캐시 히트하더라도 파일 mtime이 stale이므로
+        // 캐시를 무시하고 풀 재해소 → 0 후보 → None(무변경, model="codex" 유지)이어야 한다.
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some("/no/match/here".to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut second, &Config::default());
+        });
+        assert_eq!(
+            second, before,
+            "stale 캐시는 무시되어 종료된 세션이 더는 표시되지 않아야 함(model=codex 유지)"
+        );
+        assert_eq!(
+            second.model_display_name.as_deref(),
+            Some("codex"),
+            "stale 후 재해소 0 후보 → model 슬롯 미변경(bare codex)"
+        );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     // ===== env/캐시 테스트 헬퍼 =====
 
-    /// `CODEX_HOME`만 주입해 클로저를 실행하고 원복한다(ENV_LOCK 하에 호출).
+    /// `CODEX_HOME`과 `HOME`(캐시 루트)을 격리 temp로 주입해 클로저를 실행하고 원복한다.
     ///
-    /// 주의: `HOME`은 **만지지 않는다**. 캐시(`~/Library/Caches/understatus`)는 실제 HOME에
-    /// 쓰이지만, 호출자가 프로세스+시각 고유 session_key를 쓰고 [`cleanup_real_cache`]로 청소한다.
-    /// (HOME을 전역 swap하면 HOME 의존 다른 테스트와 경합해 위양성 실패를 유발하므로 회피한다.)
-    fn with_codex_env<F: FnOnce()>(codex_home: &Path, _cache_home: &Path, f: F) {
+    /// 캐시 경로는 `HOME` 기반(`$HOME/Library/Caches/understatus`, `chain.rs::cache_dir`)이므로,
+    /// `HOME`을 temp로 주입하면 캐시가 temp로 격리되어 **실제 사용자 캐시를 오염시키지 않고**
+    /// 병렬 `cargo test`에서도 충돌하지 않는다(E2E `run_with_codex_env`의 HOME 주입 패턴과 동일).
+    /// 그 결과 고정 session_key를 써도 안전하며 `cleanup_real_cache` 같은 실캐시 청소가 불필요하다.
+    ///
+    /// # 주의
+    /// process-global env를 만지므로 반드시 `ENV_LOCK` 하에 직렬화해 호출해야 한다.
+    fn with_codex_env<F: FnOnce()>(codex_home: &Path, cache_home: &Path, f: F) {
         let prev_codex = std::env::var_os("CODEX_HOME");
-        // SAFETY: ENV_LOCK으로 직렬화된 구간에서만 env를 변경한다(HOME 미변경).
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: ENV_LOCK으로 직렬화된 구간에서만 env를 변경한다.
         unsafe {
             std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("HOME", cache_home);
         }
         f();
         unsafe {
@@ -1440,19 +1576,10 @@ mod tests {
                 Some(v) => std::env::set_var("CODEX_HOME", v),
                 None => std::env::remove_var("CODEX_HOME"),
             }
-        }
-    }
-
-    /// 실제 HOME 하위의 codex 캐시 세션 디렉터리를 제거한다(테스트 청소).
-    fn cleanup_real_cache(session_key: &str) {
-        if let Some(home) = std::env::var_os("HOME") {
-            let dir = PathBuf::from(home)
-                .join("Library")
-                .join("Caches")
-                .join("understatus")
-                .join("sessions")
-                .join(session_key);
-            let _ = std::fs::remove_dir_all(dir);
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
         }
     }
 

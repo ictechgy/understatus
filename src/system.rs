@@ -907,6 +907,11 @@ mod tests {
     /// 충돌/오염 방지를 위해 프로세스 고유 키를 쓰고 끝나면 정리한다(HOME은 macOS 전용 보장).
     #[test]
     fn net_delta_session_independent() {
+        // HOME 기반 세션 캐시를 write→read 라운드트립하므로, HOME을 swap하는 다른 모듈 테스트
+        // (codex enrich)와 겹치면 베이스 경로가 교란된다. crate 공유 락으로 직렬화한다.
+        let _guard = crate::chain::HOME_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         const NET_CACHE_FILE: &str = "net_counters";
         let pid = std::process::id();
         let key_a = format!("netindep-A-{pid}");

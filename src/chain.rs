@@ -472,6 +472,15 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+/// HOME 기반 세션 캐시(`$HOME/Library/Caches/understatus`)를 만지는 테스트의 전역 직렬화 락.
+///
+/// 캐시 경로는 process-global `HOME`에 의존하므로([`cache_dir`]), `HOME`을 swap하는 테스트와
+/// `HOME` 기반 캐시를 read/write하는 테스트가 병렬로 겹치면 서로의 베이스 경로를 교란한다
+/// (예: 한 테스트가 `HOME`을 temp로 바꾼 사이 다른 테스트가 라운드트립을 읽으면 None).
+/// 모듈 경계를 넘어 공유해야 하므로(`codex`/`system` 테스트가 함께 잡음) `pub(crate)`로 노출한다.
+#[cfg(test)]
+pub(crate) static HOME_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
