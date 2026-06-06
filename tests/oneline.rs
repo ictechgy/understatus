@@ -8,10 +8,29 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// chain 실행 여부를 stdout으로 직접 관측하기 위한 센티널. chain_command가 도는 경우에만
 /// 자식 stdout에 합성되어 self 세그먼트와 함께 한 줄에 나타난다.
 const CHAIN_SENTINEL: &str = "CHAINSENTINEL";
+
+/// 병렬 테스트 스레드 간 임시 경로 충돌을 막는 프로세스 전역 단조 카운터.
+///
+/// pid+nanos만으로 임시 경로를 만들면 두 테스트 스레드가 같은 나노초 틱(부하 시 시계 해상도가
+/// 거칠어짐)에 진입할 때 경로가 충돌해, 한 테스트의 `fs::write`(truncate+write)가 다른 테스트의
+/// 읽기와 경합하며 torn read(부분 판독)를 유발한다(E2E flaky 근본 원인). 매 호출마다 증가하는
+/// 전역 카운터를 경로에 섞어 충돌을 원천 차단한다.
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 프로세스 내에서 절대 충돌하지 않는 고유 토큰(`<pid>-<nanos>-<counter>`)을 만든다.
+fn unique_token() -> String {
+    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{counter}", std::process::id())
+}
 
 /// 빌드된 understatus 바이너리에 stdin/인자를 주어 실행하고 stdout 바이트를 반환한다.
 ///
@@ -210,14 +229,8 @@ fn oneline_lterm_has_no_git_segment() {
 /// codex enabled 기본은 true이고 chain_command는 미설정(chain 없음)이다. 폭 권위는 lterm이지만
 /// `render()`는 여전히 `display.max_width`를 적용하므로, 6개 세그먼트가 모두 보이도록 넓힌다.
 fn write_wide_config() -> String {
-    let path = std::env::temp_dir().join(format!(
-        "understatus-codex-e2e-cfg-{}-{:?}.toml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let path =
+        std::env::temp_dir().join(format!("understatus-codex-e2e-cfg-{}.toml", unique_token()));
     std::fs::write(&path, "[display]\nmax_width = 200\n").expect("임시 config 작성 실패");
     path.to_string_lossy().into_owned()
 }
@@ -264,14 +277,7 @@ fn run_with_codex_env(
 /// # 반환
 /// `(codex_home, cache_home)` 임시 디렉터리 경로. 호출자가 정리한다.
 fn write_synthetic_codex_session(cwd: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let unique = format!(
-        "{}-{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+    let unique = unique_token();
     let codex_home = std::env::temp_dir().join(format!("understatus-e2e-codex-{unique}"));
     let cache_home = std::env::temp_dir().join(format!("understatus-e2e-home-{unique}"));
     let day_dir = codex_home

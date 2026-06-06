@@ -153,7 +153,29 @@ pub fn write_named_cache(name: &str, now_ms: u128, payload: &str) {
 /// # 반환
 /// `(기록 시각 epoch ms, payload)`. `HOME` 미설정/파일 부재/포맷 불량 시 `None`.
 pub fn read_session_named_cache(session_key: &str, name: &str) -> Option<(u128, String)> {
-    let path = session_cache_file(session_key, name)?;
+    let base = cache_dir()?;
+    read_session_named_cache_in(&base, session_key, name)
+}
+
+/// 주입된 base 디렉터리 기준으로 세션별 단기 TTL 캐시 항목을 읽는다(테스트 hermetic 주입용).
+///
+/// [`read_session_named_cache`]가 process-global `HOME`(`cache_dir()`)에 의존하는 것과 달리,
+/// base를 직접 받아 전역 env 무변경으로 캐시를 읽을 수 있게 한다(codex in-process 통합 테스트가
+/// `HOME` 스왑 없이 격리 tempdir을 주입). 경로 조립 직전 [`session_cache_file_in`]이 항상 재살균한다.
+///
+/// # 인자
+/// - `base`: 캐시 루트(런타임은 `cache_dir()`, 테스트는 tempdir 주입).
+/// - `session_key`: 세션 캐시 격리 키(미살균 가능 — 내부에서 항상 재살균).
+/// - `name`: 캐시 파일명(예: `net_counters`).
+///
+/// # 반환
+/// `(기록 시각 epoch ms, payload)`. 파일 부재/포맷 불량 시 `None`.
+pub(crate) fn read_session_named_cache_in(
+    base: &Path,
+    session_key: &str,
+    name: &str,
+) -> Option<(u128, String)> {
+    let path = session_cache_file_in(base, session_key, name);
     read_cache_entry(&path)
 }
 
@@ -167,9 +189,34 @@ pub fn read_session_named_cache(session_key: &str, name: &str) -> Option<(u128, 
 ///
 /// 쓰기 실패는 조용히 무시한다(패닉 금지). [`read_session_named_cache`]와 짝을 이룬다.
 pub fn write_session_named_cache(session_key: &str, name: &str, now_ms: u128, payload: &str) {
-    if let Some(path) = session_cache_file(session_key, name) {
-        write_cache_entry(&path, now_ms, payload);
+    if let Some(base) = cache_dir() {
+        write_session_named_cache_in(&base, session_key, name, now_ms, payload);
     }
+}
+
+/// 주입된 base 디렉터리 기준으로 세션별 단기 TTL 캐시 항목을 기록한다(테스트 hermetic 주입용).
+///
+/// [`write_session_named_cache`]가 process-global `HOME`(`cache_dir()`)에 의존하는 것과 달리,
+/// base를 직접 받아 전역 env 무변경으로 캐시를 기록할 수 있게 한다(codex in-process 통합 테스트가
+/// `HOME` 스왑 없이 격리 tempdir을 주입). [`read_session_named_cache_in`]과 짝을 이룬다.
+///
+/// # 인자
+/// - `base`: 캐시 루트(런타임은 `cache_dir()`, 테스트는 tempdir 주입).
+/// - `session_key`: 세션 캐시 격리 키(미살균 가능 — 내부에서 항상 재살균).
+/// - `name`: 캐시 파일명(예: `net_counters`).
+/// - `now_ms`: 기록 시각(epoch ms).
+/// - `payload`: 저장할 본문.
+///
+/// 쓰기 실패는 조용히 무시한다(패닉 금지).
+pub(crate) fn write_session_named_cache_in(
+    base: &Path,
+    session_key: &str,
+    name: &str,
+    now_ms: u128,
+    payload: &str,
+) {
+    let path = session_cache_file_in(base, session_key, name);
+    write_cache_entry(&path, now_ms, payload);
 }
 
 /// 현재 시각을 UNIX epoch 기준 밀리초(ms)로 반환한다(외부 모듈의 캐시 타임스탬프용).
@@ -218,7 +265,10 @@ fn is_cache_fresh(written_ms: u128, now_ms: u128, ttl_seconds: u64) -> bool {
 ///
 /// # 반환
 /// 캐시 디렉터리 경로. `HOME` 미설정 시 `None`(호출부에서 빈 문자열/false로 저하).
-fn cache_dir() -> Option<PathBuf> {
+///
+/// codex 통합(`maybe_enrich`)이 캐시 base를 직접 주입해 hermetic 테스트를 돌릴 수 있도록
+/// `pub(crate)`로 노출한다. 프로덕션 경로는 이 함수가 반환하는 동일 base를 그대로 쓴다(동작 불변).
+pub(crate) fn cache_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join("Library").join("Caches").join("understatus"))
 }
@@ -471,15 +521,6 @@ fn now_millis() -> u128 {
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0)
 }
-
-/// HOME 기반 세션 캐시(`$HOME/Library/Caches/understatus`)를 만지는 테스트의 전역 직렬화 락.
-///
-/// 캐시 경로는 process-global `HOME`에 의존하므로([`cache_dir`]), `HOME`을 swap하는 테스트와
-/// `HOME` 기반 캐시를 read/write하는 테스트가 병렬로 겹치면 서로의 베이스 경로를 교란한다
-/// (예: 한 테스트가 `HOME`을 temp로 바꾼 사이 다른 테스트가 라운드트립을 읽으면 None).
-/// 모듈 경계를 넘어 공유해야 하므로(`codex`/`system` 테스트가 함께 잡음) `pub(crate)`로 노출한다.
-#[cfg(test)]
-pub(crate) static HOME_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

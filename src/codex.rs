@@ -13,7 +13,8 @@
 //! 5. 모든 필드 lenient(Option): 부재/타입 드리프트/cli_version 변동 시 무패닉 → 세그먼트 생략.
 
 use crate::chain::{
-    cache_now_millis, is_named_cache_fresh, read_session_named_cache, write_session_named_cache,
+    cache_now_millis, is_named_cache_fresh, read_session_named_cache_in,
+    write_session_named_cache_in,
 };
 use crate::claude::ClaudeInput;
 use crate::config::Config;
@@ -342,12 +343,19 @@ fn read_head_tail(path: &Path) -> Option<(String, String)> {
 ///
 /// `read_exact`는 EOF에서 에러를 내지만, 동시 쓰기로 파일이 줄어든 경우에도 읽은 만큼은
 /// 보존해야 하므로 루프로 채우고 더 못 읽으면 버퍼를 그만큼 잘라 반환한다(무패닉).
+///
+/// `ErrorKind::Interrupted`(EINTR)는 시그널(예: 자식 프로세스 종료로 인한 SIGCHLD)에 의한
+/// 일시 중단이라 **데이터 손실이 아니다**. 이를 fatal `None`으로 취급하면 시스템 부하가 높을 때
+/// rollout 읽기가 간헐적으로 실패할 수 있으므로, `Interrupted`는 재시도하고 그 외 진짜 I/O
+/// 에러만 `None`으로 안전 저하한다(fail-safe 일관성).
 fn read_exact_lossy(file: &mut File, buf: &mut Vec<u8>) -> Option<()> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match file.read(&mut buf[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
+            // EINTR: 시그널에 의한 일시 중단 → 데이터 손실 아님, 재시도.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return None,
         }
     }
@@ -644,6 +652,7 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
 /// 단일 해소 시 `Some(session)`. 모호/없음 시 `None`(무변경 신호).
 fn resolve_with_cache(
     base: &Path,
+    cache_base: &Path,
     session_key: &str,
     cwd: &str,
     now: SystemTime,
@@ -654,7 +663,9 @@ fn resolve_with_cache(
     let freshness_secs = freshness.saturating_mul(60);
 
     // 캐시 조회.
-    if let Some((written_ms, payload)) = read_session_named_cache(session_key, CODEX_CACHE_FILE) {
+    if let Some((written_ms, payload)) =
+        read_session_named_cache_in(cache_base, session_key, CODEX_CACHE_FILE)
+    {
         if is_named_cache_fresh(written_ms, now_ms, freshness_secs) {
             if let Ok(entry) = serde_json::from_str::<CodexCacheEntry>(&payload) {
                 let cached_path = PathBuf::from(&entry.path);
@@ -670,6 +681,7 @@ fn resolve_with_cache(
                     Some(current_mtime) => {
                         if let Some(session) = extract_from_file(&cached_path) {
                             write_cache_entry(
+                                cache_base,
                                 session_key,
                                 &cached_path,
                                 current_mtime,
@@ -691,7 +703,7 @@ fn resolve_with_cache(
         Resolution::Single(session, path) => {
             // 단일 해소만 캐시한다(모호는 비캐시 — TTL 고착 차단).
             if let Some(mtime) = file_mtime_ms(&path) {
-                write_cache_entry(session_key, &path, mtime, &session, now_ms);
+                write_cache_entry(cache_base, session_key, &path, mtime, &session, now_ms);
             }
             Some(session)
         }
@@ -701,7 +713,11 @@ fn resolve_with_cache(
 }
 
 /// 해소 결과를 디스크 캐시에 1라인 직렬화로 기록한다(best-effort, 실패 무시).
+///
+/// `cache_base`는 캐시 루트(런타임은 `chain::cache_dir()`, 테스트는 주입 tempdir)로,
+/// process-global `HOME` 비의존 hermetic 기록을 위해 [`write_session_named_cache_in`]에 위임한다.
 fn write_cache_entry(
+    cache_base: &Path,
     session_key: &str,
     path: &Path,
     mtime_ms: u128,
@@ -714,7 +730,7 @@ fn write_cache_entry(
         session: session.clone(),
     };
     if let Ok(payload) = serde_json::to_string(&entry) {
-        write_session_named_cache(session_key, CODEX_CACHE_FILE, now_ms, &payload);
+        write_session_named_cache_in(cache_base, session_key, CODEX_CACHE_FILE, now_ms, &payload);
     }
 }
 
@@ -753,6 +769,31 @@ fn is_codex_model(model: &str) -> bool {
 /// - `input`: enrich 대상(이미 parse_lterm_input으로 채워진 상태).
 /// - `cfg`: `[codex]` 토글/freshness/scan_days.
 pub fn maybe_enrich(input: &mut ClaudeInput, cfg: &Config) {
+    // 프로덕션 경로: codex base/cache base override를 주입하지 않는다(None → 런타임 기본).
+    // None일 때 동작은 리팩터 이전과 100% 동일하다(codex base=codex_home(), cache base=cache_dir()).
+    maybe_enrich_in(input, cfg, None, None);
+}
+
+/// [`maybe_enrich`]의 base 주입 변형(프로덕션 호출은 None override, 테스트는 tempdir 주입).
+///
+/// process-global `HOME`/`CODEX_HOME` env를 만지지 않고 codex sessions base와 캐시 base를 직접
+/// 주입할 수 있게 해, in-process 통합 테스트가 hermetic하게(전역 env 무변경, 락 불필요) 돌게 한다.
+/// 코드베이스의 기존 주입 패턴([`find_codex_candidates`]의 base, [`crate::chain::write_session_named_cache_in`])과 일관된다.
+///
+/// # 인자
+/// - `input`/`cfg`: [`maybe_enrich`]와 동일.
+/// - `codex_base_override`: codex sessions 루트. `None`이면 런타임 [`codex_home`].
+/// - `cache_base_override`: 캐시 루트. `None`이면 런타임 [`crate::chain::cache_dir`].
+///
+/// # 동작 불변
+/// 두 override가 모두 `None`이면 게이팅·캐시 위치·스캔이 리팩터 이전과 100% 동일하다.
+/// 캐시 base 부재(`HOME` 미설정)는 enrich 생략으로 안전 저하한다(이전엔 캐시 read/write가 no-op).
+fn maybe_enrich_in(
+    input: &mut ClaudeInput,
+    cfg: &Config,
+    codex_base_override: Option<&Path>,
+    cache_base_override: Option<&Path>,
+) {
     // 게이팅 1: opt-out.
     if !cfg.codex.enabled {
         return;
@@ -771,26 +812,46 @@ pub fn maybe_enrich(input: &mut ClaudeInput, cfg: &Config) {
         Some(cwd) if !cwd.is_empty() => cwd.to_string(),
         _ => return,
     };
-    // 게이팅 4: CODEX_HOME 존재.
-    let base = match codex_home() {
+    // 게이팅 4: CODEX_HOME(또는 주입 base) 존재.
+    let base = match codex_base_override.map(PathBuf::from).or_else(codex_home) {
         Some(base) if base.exists() => base,
         _ => {
             debug_log("codex_home 부재 — enrich 생략");
             return;
         }
     };
-
     // session_key는 캐시 격리용(lterm payload 유래). 부재 시 cwd 기반으로 안정화한다.
     let session_key = input.session_id.clone().unwrap_or_else(|| cwd.clone());
 
-    let resolved = resolve_with_cache(
-        &base,
-        &session_key,
-        &cwd,
-        SystemTime::now(),
-        cfg.codex.freshness_minutes,
-        cfg.codex.scan_days,
-    );
+    // 캐시 base 결정(주입 우선, 없으면 런타임 cache_dir).
+    let cache_base = cache_base_override
+        .map(PathBuf::from)
+        .or_else(crate::chain::cache_dir);
+
+    let resolved = match cache_base {
+        // 캐시 base 존재 → 정상 경로(캐시 read/write 경유).
+        Some(cache_base) => resolve_with_cache(
+            &base,
+            &cache_base,
+            &session_key,
+            &cwd,
+            SystemTime::now(),
+            cfg.codex.freshness_minutes,
+            cfg.codex.scan_days,
+        ),
+        // 캐시 base 부재(HOME 미설정 등): 캐시 없이 직접 해소한다. 리팩터 이전에도 cache_dir이
+        // None이면 캐시 read/write가 no-op이라 캐시 없이 해소했으므로 동작이 100% 동일하다.
+        None => match read_codex_session(
+            &base,
+            &cwd,
+            SystemTime::now(),
+            cfg.codex.freshness_minutes,
+            cfg.codex.scan_days,
+        ) {
+            Resolution::Single(session, _path) => Some(session),
+            Resolution::Ambiguous | Resolution::None => None,
+        },
+    };
 
     match resolved {
         Some(session) => {
@@ -1316,18 +1377,14 @@ mod tests {
     }
 
     // ============== Integration: maybe_enrich / 캐시(AC1/AC-X6) ==============
-
-    /// HOME/CODEX_HOME을 격리 주입해 maybe_enrich를 호출하는 테스트의 env 직렬화 락.
-    ///
-    /// maybe_enrich는 codex_home()/캐시(HOME)에 의존하므로 process-global env를 만진다. HOME swap은
-    /// 모듈 밖 HOME 의존 테스트(예: `system::net_delta_session_independent`)와도 겹치므로, codex 전용
-    /// 락이 아니라 **crate 공유 락**([`crate::chain::HOME_CACHE_TEST_LOCK`])을 잡아 교차 모듈 경합을 막는다.
-    use crate::chain::HOME_CACHE_TEST_LOCK as ENV_LOCK;
+    //
+    // 통합 테스트는 process-global `HOME`/`CODEX_HOME` env를 만지지 않는다(hermetic).
+    // codex sessions base와 캐시 base를 [`maybe_enrich_in`]에 고유 temp dir로 직접 주입하므로
+    // 전역 상태 경합이 없어 직렬화 락이 불필요하다(이전 `with_codex_env`/`ENV_LOCK` 제거).
 
     /// agent≠codex → 무변경(IO 0).
     #[test]
     fn enrich_non_codex_no_change() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut input = ClaudeInput {
             model_display_name: Some("claude".to_string()),
             cwd: Some("/tmp/x".to_string()),
@@ -1342,7 +1399,6 @@ mod tests {
     /// enabled=false → 무변경(IO 0).
     #[test]
     fn enrich_disabled_no_change() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut input = ClaudeInput {
             model_display_name: Some("codex".to_string()),
             cwd: Some("/tmp/x".to_string()),
@@ -1356,12 +1412,11 @@ mod tests {
         assert_eq!(input, before, "disabled는 무변경");
     }
 
-    /// 단일 후보 → model/ctx/codex 설정(AC1). CODEX_HOME/HOME 주입으로 격리.
+    /// 단일 후보 → model/ctx/codex 설정(AC1). codex/cache base를 temp 주입으로 격리(env 무변경).
     #[test]
     fn enrich_single_candidate_sets_fields() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let base = unique_tmp("enrich-single");
-        let home = unique_tmp("enrich-single-home");
+        let cache_base = unique_tmp("enrich-single-cache");
         let cwd = "/Users/me/projEnrich";
         write_rollout(
             &base,
@@ -1378,9 +1433,12 @@ mod tests {
             session_id: Some("enrich-single-key".to_string()),
             ..Default::default()
         };
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut input, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut input,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         // 단일 해소: model=실모델, ctx=27.5%, extras 채워짐.
         assert_eq!(input.model_display_name.as_deref(), Some("gpt-5.5"));
         let ctx = input.context_used_percentage.expect("ctx%");
@@ -1390,17 +1448,16 @@ mod tests {
         assert_eq!(extras.rate_weekly_percent, Some(21.0));
         assert_eq!(extras.plan.as_deref(), Some("pro"));
         assert_eq!(extras.effort.as_deref(), Some("xhigh"));
-        // HOME이 temp로 격리되어 캐시도 temp(home) 하위에 들어가므로 실캐시 청소가 불필요하다.
+        // 캐시도 temp(cache_base) 하위에 격리되어 실캐시 오염이 없다.
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cache_base);
     }
 
     /// 모호(≥2) → 무변경(model="codex" 유지, AC2/AC-X1).
     #[test]
     fn enrich_ambiguous_no_change() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let base = unique_tmp("enrich-amb");
-        let home = unique_tmp("enrich-amb-home");
+        let cache_base = unique_tmp("enrich-amb-cache");
         let cwd = "/Users/me/projAmb";
         for tag in ["a1", "a2"] {
             write_rollout(
@@ -1419,13 +1476,16 @@ mod tests {
             ..Default::default()
         };
         let before = input.clone();
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut input, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut input,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         assert_eq!(input, before, "모호는 무변경(model=codex 유지)");
-        // 모호는 캐시되지 않아야 한다(TTL 고착 차단). HOME 격리로 캐시는 temp에만 존재한다.
+        // 모호는 캐시되지 않아야 한다(TTL 고착 차단). cache_base 격리로 캐시는 temp에만 존재한다.
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cache_base);
     }
 
     /// AC-X6: 캐시 정상상태 — 2회차는 경로 mtime 불변이면 재해소 없이 캐시를 재사용한다.
@@ -1434,9 +1494,8 @@ mod tests {
     /// 캐시 히트 → 경로 mtime 불변 → 재사용되어 여전히 enrich가 성공해야 한다(풀 재해소면 실패).
     #[test]
     fn cache_steady_state_reuses_without_rescan() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let base = unique_tmp("cache-steady");
-        let home = unique_tmp("cache-steady-home");
+        let cache_base = unique_tmp("cache-steady-cache");
         let cwd = "/Users/me/projCache";
         let key = "cache-steady-key";
         write_rollout(
@@ -1456,9 +1515,12 @@ mod tests {
             session_id: Some(key.to_string()),
             ..Default::default()
         };
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut first, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
 
         // 2회차: 같은 캐시 키지만 매칭 불가 cwd. 풀스캔이면 0 발견이지만 캐시 히트 →
@@ -1469,17 +1531,20 @@ mod tests {
             session_id: Some(key.to_string()),
             ..Default::default()
         };
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut second, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         assert_eq!(
             second.model_display_name.as_deref(),
             Some("gpt-5.5"),
             "정상상태는 캐시 재사용(재스캔 없이 stat 1회)"
         );
-        // HOME 격리로 캐시는 temp(home) 하위에만 존재하므로 실캐시 청소가 불필요하다.
+        // cache_base 격리로 캐시는 temp 하위에만 존재하므로 실캐시 청소가 불필요하다.
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cache_base);
     }
 
     /// M2: 캐시 히트라도 해소된 파일 mtime이 freshness를 넘기면 캐시를 무시하고 재해소한다.
@@ -1491,9 +1556,8 @@ mod tests {
     /// (이전 동작은 stale 캐시를 재사용해 enrich를 유지했으므로 이 단언이 회귀 가드 역할을 한다.)
     #[test]
     fn cache_ignored_when_resolved_file_is_stale() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let base = unique_tmp("cache-stale");
-        let home = unique_tmp("cache-stale-home");
+        let cache_base = unique_tmp("cache-stale-cache");
         let cwd = "/Users/me/projStaleCache";
         let key = "cache-stale-key";
         let rollout_path = write_rollout(
@@ -1513,9 +1577,12 @@ mod tests {
             session_id: Some(key.to_string()),
             ..Default::default()
         };
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut first, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         assert_eq!(
             first.model_display_name.as_deref(),
             Some("gpt-5.5"),
@@ -1535,9 +1602,12 @@ mod tests {
             ..Default::default()
         };
         let before = second.clone();
-        with_codex_env(&base, &home, || {
-            maybe_enrich(&mut second, &Config::default());
-        });
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
         assert_eq!(
             second, before,
             "stale 캐시는 무시되어 종료된 세션이 더는 표시되지 않아야 함(model=codex 유지)"
@@ -1548,40 +1618,10 @@ mod tests {
             "stale 후 재해소 0 후보 → model 슬롯 미변경(bare codex)"
         );
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cache_base);
     }
 
-    // ===== env/캐시 테스트 헬퍼 =====
-
-    /// `CODEX_HOME`과 `HOME`(캐시 루트)을 격리 temp로 주입해 클로저를 실행하고 원복한다.
-    ///
-    /// 캐시 경로는 `HOME` 기반(`$HOME/Library/Caches/understatus`, `chain.rs::cache_dir`)이므로,
-    /// `HOME`을 temp로 주입하면 캐시가 temp로 격리되어 **실제 사용자 캐시를 오염시키지 않고**
-    /// 병렬 `cargo test`에서도 충돌하지 않는다(E2E `run_with_codex_env`의 HOME 주입 패턴과 동일).
-    /// 그 결과 고정 session_key를 써도 안전하며 `cleanup_real_cache` 같은 실캐시 청소가 불필요하다.
-    ///
-    /// # 주의
-    /// process-global env를 만지므로 반드시 `ENV_LOCK` 하에 직렬화해 호출해야 한다.
-    fn with_codex_env<F: FnOnce()>(codex_home: &Path, cache_home: &Path, f: F) {
-        let prev_codex = std::env::var_os("CODEX_HOME");
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: ENV_LOCK으로 직렬화된 구간에서만 env를 변경한다.
-        unsafe {
-            std::env::set_var("CODEX_HOME", codex_home);
-            std::env::set_var("HOME", cache_home);
-        }
-        f();
-        unsafe {
-            match prev_codex {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    // ===== 캐시 테스트 헬퍼 =====
 
     /// 파일 mtime을 지정 시각으로 설정한다(stale 테스트용, libc utimes).
     fn set_file_mtime(path: &Path, time: SystemTime) {
