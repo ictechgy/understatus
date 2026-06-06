@@ -4,6 +4,7 @@
 //! 모든 필드는 `Option`이며 파싱 자체가 실패해도 절대 패닉하지 않고
 //! 전부 `None`인 빈 `ClaudeInput`으로 안전 저하한다(lenient).
 
+use crate::codex::CodexExtras;
 use serde::Deserialize;
 
 /// understatus이 라인 렌더에 사용하는 Claude 세션 정보의 평탄화된 뷰.
@@ -29,6 +30,9 @@ pub struct ClaudeInput {
     pub cost_usd: Option<f64>,
     /// 세션 식별자 (`session_id`).
     pub session_id: Option<String>,
+    /// Codex 세션 심층판독으로 enrich된 추가 필드(5h/주간 한도·plan·effort). lterm/codex 소스 전용.
+    /// Claude 경로는 항상 `None`(비트 동일 보장, spec §6). `crate::codex::maybe_enrich`가 채운다.
+    pub codex: Option<CodexExtras>,
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -80,6 +84,8 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
         git_branch,
         cost_usd,
         session_id: raw_input.session_id,
+        // Claude 경로는 Codex enrich 대상이 아니다(비트 동일 보장, spec §6).
+        codex: None,
     }
 }
 
@@ -127,6 +133,8 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         git_branch: None,
         cost_usd: None,
         session_id: session_key,
+        // codex enrich는 호출부(main.rs)에서 Source::Lterm 한정으로 별도 수행한다(초기 None).
+        codex: None,
     }
 }
 

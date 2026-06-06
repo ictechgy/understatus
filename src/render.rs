@@ -161,6 +161,44 @@ fn collect_segments(
         }
     }
 
+    // Codex 한도/요금제/effort(lterm+codex 소스 전용, spec §6). input.codex가 Some일 때만,
+    // 그 안의 각 Option이 Some일 때만 추가한다(기존 None-skip 패턴 동형). Claude 경로는
+    // codex=None이라 신규 세그먼트 0 → 기존 출력/바이트 보존.
+    if let Some(codex) = input.codex.as_ref() {
+        // 5h 한도%(priority 48): 라벨 "5h" dim + 값 색 없음.
+        if let Some(rate_5h) = codex.rate_5h_percent {
+            segments.push(label_value_segment(
+                "5h",
+                &format!("{rate_5h:.0}%"),
+                48,
+                cfg,
+                color_on,
+            ));
+        }
+        // 주간 한도%(priority 46): 라벨 "wk" dim + 값 색 없음.
+        if let Some(rate_weekly) = codex.rate_weekly_percent {
+            segments.push(label_value_segment(
+                "wk",
+                &format!("{rate_weekly:.0}%"),
+                46,
+                cfg,
+                color_on,
+            ));
+        }
+        // plan(priority 26): bare value(라벨 없음, 예 "pro").
+        if let Some(plan) = codex.plan.as_deref() {
+            if !plan.is_empty() {
+                segments.push(value_segment(plan, 26));
+            }
+        }
+        // effort(priority 24): bare value(라벨 없음, 예 "xhigh").
+        if let Some(effort) = codex.effort.as_deref() {
+            if !effort.is_empty() {
+                segments.push(value_segment(effort, 24));
+            }
+        }
+    }
+
     // cwd/git 브랜치: git_branch 우선. git 마커 ⎇ dim + 브랜치명 값 색 없음.
     if cfg.display.show_git {
         if let Some(branch) = input.git_branch.as_deref() {
@@ -540,6 +578,7 @@ mod tests {
             git_branch: Some("main".to_string()),
             cost_usd: Some(1.23),
             session_id: Some("sess-1".to_string()),
+            codex: None,
         }
     }
 
