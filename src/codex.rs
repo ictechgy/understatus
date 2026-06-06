@@ -25,6 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// head(앞부분) 읽기 상한. 첫 줄 session_meta + 첫 turn_context(baseline model/effort)용(spec §8.1).
 const HEAD_READ_BYTES: u64 = 16 * 1024;
+/// 첫 줄(session_meta) 읽기 상한(매칭 선필터용). spec §8.1은 16KB로 가정했으나 **실측상 실제
+/// session_meta 첫 줄은 inline `base_instructions` 때문에 ~33KB**에 달한다(16KB 가정은 실데이터와
+/// 충돌). cwd/originator 매칭에 첫 줄 전체가 필요하므로 head 상한과 별도로 넉넉히 둔다.
+const FIRST_LINE_READ_BYTES: u64 = 128 * 1024;
 /// tail(뒷부분) 읽기 상한. 마지막 token_count + 최신 turn_context용(실측 gap max 14KB,
 /// 단일 라인 max 132KB → 256KB 안전마진, spec §8.1).
 const TAIL_READ_BYTES: u64 = 256 * 1024;
@@ -524,17 +528,23 @@ fn is_fresh(path: &Path, now: SystemTime, freshness_secs: u64) -> bool {
     }
 }
 
-/// rollout 파일의 첫 줄만 읽어 session_meta를 파싱한다(매칭 선필터용, 전체 읽기 금지).
+/// rollout 파일의 첫 줄(session_meta)만 읽어 cwd/originator를 파싱한다(매칭 선필터용).
 ///
-/// 첫 줄은 항상 session_meta이고 보통 작지 않을 수 있으나(base_instructions 포함), head 상한
-/// 안에서 첫 개행까지만 취하면 충분하다. 읽기/파싱 실패 시 `None`(무패닉).
+/// 첫 줄은 inline `base_instructions` 때문에 실측 ~33KB에 달하므로([`FIRST_LINE_READ_BYTES`]
+/// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. 개행 미발견(상한 내
+/// 첫 줄 미완결)이면 부분 JSON을 파싱하지 않고 `None`(무패닉, 보수적 제외). 읽기/파싱 실패도 `None`.
 fn read_first_line_meta(path: &Path) -> Option<SessionMeta> {
     let mut file = File::open(path).ok()?;
-    // 첫 줄(session_meta)은 base_instructions로 커질 수 있으므로 head 상한까지 읽는다.
-    let mut buf = vec![0u8; HEAD_READ_BYTES as usize];
+    // 첫 줄은 base_instructions로 커지므로(실측 ~33KB) 별도의 넉넉한 상한까지 읽는다.
+    let mut buf = vec![0u8; FIRST_LINE_READ_BYTES as usize];
     read_exact_lossy(&mut file, &mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    let first_line = text.lines().next()?;
+    // 개행으로 완결된 첫 줄만 신뢰한다(부분 라인 파싱 금지). 파일 전체가 한 줄(개행 부재)이고
+    // 상한 미만이면 그 전체를 첫 줄로 본다(작은 파일 안전 처리).
+    let first_line = match text.split_once('\n') {
+        Some((line, _)) => line,
+        None => text.as_ref(),
+    };
     parse_session_meta(first_line)
 }
 
@@ -768,5 +778,704 @@ pub fn maybe_enrich(input: &mut ClaudeInput, cfg: &Config) {
 fn debug_log(message: &str) {
     if std::env::var_os("LTERM_STATUS_DEBUG").is_some() {
         eprintln!("understatus[codex]: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    // ===== 픽스처 헬퍼: 실측 jsonl 포맷(spec §4 검증본)과 동일 구조 =====
+
+    /// session_meta 첫 줄(cwd/originator) 픽스처.
+    fn session_meta_line(cwd: &str, originator: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-06-05T11:41:50.379Z","type":"session_meta","payload":{{"id":"abc","cwd":"{cwd}","originator":"{originator}","cli_version":"0.137.0"}}}}"#
+        )
+    }
+
+    /// 실데이터 회귀용: inline base_instructions로 16KB를 넘는 거대 session_meta 첫 줄 픽스처.
+    ///
+    /// 실측상 실제 첫 줄은 ~33KB라 16KB head 상한으로는 매칭에 실패했다(회귀 차단).
+    fn big_session_meta_line(cwd: &str, originator: &str) -> String {
+        // 32KB짜리 base_instructions 본문(첫 줄을 head 16KB 한참 너머로 키운다).
+        let big_instructions = "A".repeat(32 * 1024);
+        format!(
+            r#"{{"timestamp":"2026-06-05T11:41:50.379Z","type":"session_meta","payload":{{"id":"abc","cwd":"{cwd}","originator":"{originator}","cli_version":"0.137.0","base_instructions":{{"text":"{big_instructions}"}}}}}}"#
+        )
+    }
+
+    /// turn_context 라인(model/effort) 픽스처.
+    fn turn_context_line(model: &str, effort: &str) -> String {
+        format!(
+            r#"{{"type":"turn_context","payload":{{"turn_id":"t1","model":"{model}","effort":"{effort}","summary":"auto"}}}}"#
+        )
+    }
+
+    /// 표준 token_count 이벤트(info 중첩 + rate_limits named 객체) 픽스처.
+    fn token_count_line(
+        last_total: u64,
+        window: u64,
+        total_cumulative: u64,
+        rate_5h: f64,
+        rate_weekly: f64,
+        plan: &str,
+    ) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":{total_cumulative}}},"last_token_usage":{{"input_tokens":1,"total_tokens":{last_total}}},"model_context_window":{window}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{rate_5h},"window_minutes":300,"resets_at":1}},"secondary":{{"used_percent":{rate_weekly},"window_minutes":10080,"resets_at":2}},"plan_type":"{plan}"}}}}}}"#
+        )
+    }
+
+    /// 고유 임시 디렉터리를 만든다(테스트별 격리, 호출자가 정리).
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "understatus-codex-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("임시 디렉터리 생성 실패");
+        dir
+    }
+
+    /// `<base>/sessions/2026/06/05/rollout-<tag>.jsonl`에 주어진 라인들을 기록한다.
+    fn write_rollout(base: &Path, tag: &str, lines: &[String]) -> PathBuf {
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).expect("일자 디렉터리 생성 실패");
+        let path = day_dir.join(format!("rollout-2026-06-05T20-40-45-{tag}.jsonl"));
+        let mut file = std::fs::File::create(&path).expect("rollout 파일 생성 실패");
+        for line in lines {
+            writeln!(file, "{line}").expect("rollout 라인 쓰기 실패");
+        }
+        path
+    }
+
+    // ============== Unit: 순수 파서(AC-X2/X3/X4/X7) ==============
+
+    /// AC-X3: last_token_usage.total_tokens(info 중첩) / model_context_window 정확 파싱.
+    /// 11000/40000 = 27.5%.
+    #[test]
+    fn parse_token_count_nested_info_27_5_percent() {
+        let line = token_count_line(11_000, 40_000, 9_999_999, 3.0, 21.0, "pro");
+        let snap = parse_token_count(&line).expect("token_count 파싱");
+        assert_eq!(snap.last_total_tokens, Some(11_000));
+        assert_eq!(snap.context_window, Some(40_000));
+        let ctx = compute_context_percentage(11_000, 40_000).expect("ctx%");
+        assert!((ctx - 27.5).abs() < 1e-9, "ctx%는 27.5여야 함: {ctx}");
+    }
+
+    /// AC-X2: total_token_usage(누적값)는 절대 사용하지 않는다(210% fixture 회귀).
+    /// total_token_usage=84000/window=40000=210%지만 last_token_usage=11000=27.5%만 써야 한다.
+    #[test]
+    fn parse_token_count_ignores_total_token_usage() {
+        let line = token_count_line(11_000, 40_000, 84_000, 3.0, 21.0, "pro");
+        let snap = parse_token_count(&line).expect("token_count 파싱");
+        // 누적값(84000)이 아니라 last_total(11000)만 읽혀야 한다.
+        assert_eq!(snap.last_total_tokens, Some(11_000));
+        assert_ne!(
+            snap.last_total_tokens,
+            Some(84_000),
+            "total_token_usage(누적) 오용 금지"
+        );
+        let ctx = compute_context_percentage(snap.last_total_tokens.unwrap(), 40_000).unwrap();
+        assert!(ctx < 100.0, "100% 초과 불가(누적값 미사용): {ctx}");
+    }
+
+    /// AC-X4: rate_limits의 window_minutes로 5h(300)/주간(10080)을 식별한다(primary=5h 단정 금지).
+    #[test]
+    fn parse_token_count_identifies_rate_windows_by_minutes() {
+        let line = token_count_line(100, 1000, 0, 3.0, 21.0, "pro");
+        let snap = parse_token_count(&line).expect("token_count 파싱");
+        assert_eq!(snap.rate_5h_percent, Some(3.0));
+        assert_eq!(snap.rate_weekly_percent, Some(21.0));
+        assert_eq!(snap.plan.as_deref(), Some("pro"));
+    }
+
+    /// rate_limits에서 primary/secondary의 window_minutes가 뒤바뀌어도 minutes로 정확히 식별한다.
+    /// (primary가 주간, secondary가 5h여도 300→5h/10080→주간으로 배정되어야 함.)
+    #[test]
+    fn parse_token_count_window_swap_still_identified() {
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":5},"model_context_window":100},"rate_limits":{"primary":{"used_percent":55.0,"window_minutes":10080},"secondary":{"used_percent":7.0,"window_minutes":300}}}}"#;
+        let snap = parse_token_count(line).expect("token_count 파싱");
+        // primary가 주간이어도 window_minutes로 식별 → 5h=7.0, 주간=55.0.
+        assert_eq!(snap.rate_5h_percent, Some(7.0));
+        assert_eq!(snap.rate_weekly_percent, Some(55.0));
+    }
+
+    /// rate_limits 부재 → rate/plan 모두 None(부분 추출, 무패닉).
+    #[test]
+    fn parse_token_count_missing_rate_limits_is_none() {
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":5},"model_context_window":100}}}"#;
+        let snap = parse_token_count(line).expect("token_count 파싱");
+        assert_eq!(snap.rate_5h_percent, None);
+        assert_eq!(snap.rate_weekly_percent, None);
+        assert_eq!(snap.plan, None);
+        assert_eq!(snap.last_total_tokens, Some(5));
+    }
+
+    /// event_msg가 아니거나 payload.type!=token_count면 None(게이팅).
+    #[test]
+    fn parse_token_count_gating_rejects_non_token_count() {
+        // type이 event_msg가 아님.
+        assert!(parse_token_count(&turn_context_line("gpt-5.5", "high")).is_none());
+        // event_msg지만 payload.type이 다름.
+        let other = r#"{"type":"event_msg","payload":{"type":"agent_message","text":"hi"}}"#;
+        assert!(parse_token_count(other).is_none());
+    }
+
+    /// compute_context_percentage: window==0 → None(0 나눗셈 가드).
+    #[test]
+    fn compute_context_percentage_window_zero_is_none() {
+        assert_eq!(compute_context_percentage(100, 0), None);
+        assert_eq!(compute_context_percentage(0, 100), Some(0.0));
+        let half = compute_context_percentage(50, 100).unwrap();
+        assert!((half - 50.0).abs() < 1e-9);
+    }
+
+    /// parse_session_meta: cwd/originator 추출 + type 게이팅.
+    #[test]
+    fn parse_session_meta_extracts_cwd_and_originator() {
+        let line = session_meta_line("/Users/me/proj", "codex-tui");
+        let meta = parse_session_meta(&line).expect("session_meta 파싱");
+        assert_eq!(meta.cwd.as_deref(), Some("/Users/me/proj"));
+        assert_eq!(meta.originator.as_deref(), Some("codex-tui"));
+        // type이 session_meta가 아니면 None.
+        assert!(parse_session_meta(&turn_context_line("m", "e")).is_none());
+    }
+
+    /// parse_turn_context: model/effort 추출 + 부분 누락 안전.
+    #[test]
+    fn parse_turn_context_extracts_model_effort() {
+        let full = parse_turn_context(&turn_context_line("gpt-5.5", "xhigh")).expect("파싱");
+        assert_eq!(full.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(full.effort.as_deref(), Some("xhigh"));
+        // effort 누락도 안전(model만).
+        let partial =
+            parse_turn_context(r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#)
+                .expect("부분 파싱");
+        assert_eq!(partial.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(partial.effort, None);
+    }
+
+    /// is_interactive_originator: codex-tui prefix만 통과, exec 등 제외.
+    #[test]
+    fn interactive_originator_whitelist() {
+        assert!(is_interactive_originator(Some("codex-tui")));
+        assert!(is_interactive_originator(Some("codex-tui-0.137")));
+        assert!(!is_interactive_originator(Some("codex_exec")));
+        assert!(!is_interactive_originator(Some("codex-exec")));
+        assert!(!is_interactive_originator(None));
+    }
+
+    /// AC-X7: 깨진/미상 cli_version 변형/타입 드리프트 → None, 무패닉.
+    #[test]
+    fn drifted_or_broken_lines_no_panic() {
+        // 완전히 깨진 JSON.
+        assert!(parse_token_count("{not json").is_none());
+        assert!(parse_session_meta("garbage").is_none());
+        assert!(parse_turn_context("[1,2,3]").is_none());
+        // 빈 줄.
+        assert!(parse_token_count("").is_none());
+        // 타입 드리프트: total_tokens가 문자열이면 as_u64 실패 → None(전체 무패닉).
+        let drift = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":"oops"},"model_context_window":"big"}}}"#;
+        let snap = parse_token_count(drift).expect("게이팅은 통과");
+        assert_eq!(snap.last_total_tokens, None);
+        assert_eq!(snap.context_window, None);
+        // 미상 cli_version/추가 필드는 무시되고 정상 필드는 보존된다.
+        let versioned = r#"{"type":"turn_context","payload":{"model":"gpt-6","effort":"max","new_field_v999":{"x":1}}}"#;
+        let tc = parse_turn_context(versioned).expect("드리프트 무패닉");
+        assert_eq!(tc.model.as_deref(), Some("gpt-6"));
+    }
+
+    /// cwd_matches: trailing slash 정규화(존재 경로는 canonicalize, 부재는 trim 비교).
+    #[test]
+    fn cwd_matches_normalizes_trailing_slash() {
+        // 부재 경로는 trim 문자열 비교로 폴백.
+        assert!(cwd_matches("/no/such/dir", "/no/such/dir/"));
+        assert!(cwd_matches("/no/such/dir/", "/no/such/dir"));
+        assert!(!cwd_matches("/no/such/dir", "/other/dir"));
+    }
+
+    // ============== Unit(IO): find/extract(AC-X1/X5) ==============
+
+    /// 단일 정상 후보 → 1개 발견.
+    #[test]
+    fn find_candidates_single_match() {
+        let base = unique_tmp("find-single");
+        let cwd = "/Users/me/projA";
+        write_rollout(
+            &base,
+            "single",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(found.len(), 1, "단일 후보여야 함");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 회귀: 거대(>16KB) session_meta 첫 줄도 매칭에 성공해야 한다(실데이터 ~33KB 첫 줄).
+    ///
+    /// 실데이터의 첫 줄은 inline base_instructions로 ~33KB라, 16KB head 상한으로 첫 줄을
+    /// 잘라 파싱하면 매칭이 항상 실패한다(피처 무력화). FIRST_LINE_READ_BYTES로 첫 줄 전체를
+    /// 읽어 cwd/originator를 정확히 추출함을 박제한다.
+    #[test]
+    fn find_candidates_with_huge_first_line() {
+        let base = unique_tmp("bigmeta");
+        let cwd = "/Users/me/projBigMeta";
+        write_rollout(
+            &base,
+            "bigmeta",
+            &[
+                big_session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(found.len(), 1, "거대 첫 줄도 cwd/originator 매칭 성공");
+        // 전체 추출도 무패닉.
+        let session = extract_from_file(&found[0]).expect("추출");
+        assert_eq!(session.extras.rate_5h_percent, Some(3.0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// AC-X1: 동일 cwd·fresh 후보 2개 → Ambiguous → enrich 생략(ctx/rate 미표시).
+    #[test]
+    fn ambiguous_two_same_cwd_candidates() {
+        let base = unique_tmp("ambiguous");
+        let cwd = "/Users/me/projDup";
+        for tag in ["dup1", "dup2"] {
+            write_rollout(
+                &base,
+                tag,
+                &[
+                    session_meta_line(cwd, "codex-tui"),
+                    turn_context_line("gpt-5.5", "high"),
+                    token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+                ],
+            );
+        }
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(found.len(), 2, "동일 cwd 2 후보");
+        // read_codex_session은 Ambiguous를 반환해야 한다(fail-wrong→fail-safe).
+        let resolution = read_codex_session(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(resolution, Resolution::Ambiguous);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// stale(freshness 초과 mtime) 후보는 제외된다.
+    #[test]
+    fn stale_candidate_excluded() {
+        let base = unique_tmp("stale");
+        let cwd = "/Users/me/projStale";
+        let path = write_rollout(
+            &base,
+            "stale",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        // mtime을 2시간 전으로 설정하고 freshness=60분 → stale.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
+        set_file_mtime(&path, two_hours_ago);
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 60, 3);
+        assert_eq!(found.len(), 0, "stale 후보는 제외");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// scan_days 밖 일자 디렉터리는 스캔되지 않는다.
+    #[test]
+    fn scan_days_limits_directories() {
+        let base = unique_tmp("scandays");
+        let cwd = "/Users/me/projScan";
+        // 06/05(최신)와 06/01(오래됨) 두 일자에 각각 후보를 둔다.
+        let new_day = base.join("sessions").join("2026").join("06").join("05");
+        let old_day = base.join("sessions").join("2026").join("06").join("01");
+        std::fs::create_dir_all(&new_day).unwrap();
+        std::fs::create_dir_all(&old_day).unwrap();
+        let lines = [
+            session_meta_line(cwd, "codex-tui"),
+            token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+        ];
+        for (dir, tag) in [(&new_day, "new"), (&old_day, "old")] {
+            let path = dir.join(format!("rollout-2026-06-05T20-40-45-{tag}.jsonl"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            for line in &lines {
+                writeln!(file, "{line}").unwrap();
+            }
+        }
+        // scan_days=1 → 최신 일자(06/05)만 스캔 → old(06/01) 미발견.
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 1);
+        assert_eq!(found.len(), 1, "scan_days=1은 최신 일자만 스캔");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// AC-X5: codex_exec(비대화형 originator)는 제외된다.
+    #[test]
+    fn exec_originator_excluded() {
+        let base = unique_tmp("exec");
+        let cwd = "/Users/me/projExec";
+        write_rollout(
+            &base,
+            "exec",
+            &[
+                session_meta_line(cwd, "codex_exec"),
+                turn_context_line("gpt-5.5", "high"),
+            ],
+        );
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(found.len(), 0, "exec originator는 제외");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// cwd 정규화: trailing slash가 달라도 매칭된다(존재하는 임시 디렉터리로 canonicalize 경로).
+    #[test]
+    fn cwd_normalization_trailing_slash_matches() {
+        let base = unique_tmp("cwdnorm");
+        // 실제 존재하는 cwd 디렉터리를 만들어 canonicalize 경로로도 일치하게 한다.
+        let real_cwd = base.join("realcwd");
+        std::fs::create_dir_all(&real_cwd).unwrap();
+        let cwd_str = real_cwd.to_string_lossy().into_owned();
+        write_rollout(
+            &base,
+            "cwdnorm",
+            &[
+                session_meta_line(&cwd_str, "codex-tui"),
+                token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        // target에 trailing slash를 붙여도 매칭되어야 한다.
+        let target = format!("{cwd_str}/");
+        let found = find_codex_candidates(&base, &target, SystemTime::now(), 240, 3);
+        assert_eq!(found.len(), 1, "trailing slash 정규화 매칭");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// extract_from_file: head(baseline) + tail(최신) 결합. tail의 더 최신 turn_context/token_count 우선.
+    #[test]
+    fn extract_combines_head_and_tail() {
+        let base = unique_tmp("extract");
+        let cwd = "/Users/me/projExtract";
+        let path = write_rollout(
+            &base,
+            "extract",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "low"), // baseline
+                token_count_line(50, 1000, 0, 1.0, 5.0, "pro"),
+                turn_context_line("gpt-5.5", "xhigh"), // 더 최신 effort
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"), // 최신 → 27.5%
+            ],
+        );
+        let session = extract_from_file(&path).expect("추출");
+        assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+        let ctx = session.context_percentage.expect("ctx%");
+        assert!((ctx - 27.5).abs() < 1e-9, "최신 token_count 우선: {ctx}");
+        assert_eq!(session.extras.effort.as_deref(), Some("xhigh"));
+        assert_eq!(session.extras.rate_5h_percent, Some(3.0));
+        assert_eq!(session.extras.rate_weekly_percent, Some(21.0));
+        assert_eq!(session.extras.plan.as_deref(), Some("pro"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 거대 레코드(132KB 단일 라인) 상한 안전: tail 256KB 안에서 무패닉 처리.
+    #[test]
+    fn extract_huge_record_within_bounds() {
+        let base = unique_tmp("huge");
+        let cwd = "/Users/me/projHuge";
+        // 132KB짜리 거대 turn_context 라인(spec §8.1 상한 검증).
+        let big_summary = "x".repeat(132 * 1024);
+        let huge_line = format!(
+            r#"{{"type":"turn_context","payload":{{"model":"gpt-5.5","effort":"high","blob":"{big_summary}"}}}}"#
+        );
+        let path = write_rollout(
+            &base,
+            "huge",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                huge_line,
+                token_count_line(100, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        // 무패닉으로 추출되어야 한다(최신 token_count는 tail 256KB 안에 있음).
+        let session = extract_from_file(&path).expect("거대 레코드 무패닉 추출");
+        assert_eq!(session.extras.rate_5h_percent, Some(3.0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 비-UTF8 바이트가 섞여도 from_utf8_lossy로 무패닉 처리한다.
+    #[test]
+    fn extract_non_utf8_lossy() {
+        let base = unique_tmp("nonutf8");
+        let cwd = "/Users/me/projUtf";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-05T20-40-45-utf.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{}", session_meta_line(cwd, "codex-tui")).unwrap();
+        // 깨진 UTF-8 바이트(0xFF)를 한 줄에 섞는다.
+        file.write_all(&[0xFF, 0xFE, b'\n']).unwrap();
+        writeln!(file, "{}", token_count_line(100, 1000, 0, 3.0, 21.0, "pro")).unwrap();
+        // 무패닉으로 추출(깨진 라인은 개별 무시).
+        let session = extract_from_file(&path).expect("비-UTF8 무패닉");
+        assert_eq!(session.extras.rate_5h_percent, Some(3.0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// token_count 전무(신생 세션) → ctx/rate None(부분/생략, AC-X5 변형).
+    #[test]
+    fn extract_no_token_count_partial() {
+        let base = unique_tmp("notoken");
+        let cwd = "/Users/me/projNew";
+        let path = write_rollout(
+            &base,
+            "notoken",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+            ],
+        );
+        let session = extract_from_file(&path).expect("추출");
+        assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            session.context_percentage, None,
+            "token_count 전무 → ctx None"
+        );
+        assert_eq!(session.extras.rate_5h_percent, None);
+        assert_eq!(session.extras.effort.as_deref(), Some("high"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ============== Integration: maybe_enrich / 캐시(AC1/AC-X6) ==============
+
+    /// HOME/CODEX_HOME을 격리 주입해 maybe_enrich를 호출하는 테스트의 env 직렬화 락.
+    ///
+    /// maybe_enrich는 codex_home()/캐시(HOME)에 의존하므로 process-global env를 만진다.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// agent≠codex → 무변경(IO 0).
+    #[test]
+    fn enrich_non_codex_no_change() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut input = ClaudeInput {
+            model_display_name: Some("claude".to_string()),
+            cwd: Some("/tmp/x".to_string()),
+            session_id: Some("k1".to_string()),
+            ..Default::default()
+        };
+        let before = input.clone();
+        maybe_enrich(&mut input, &Config::default());
+        assert_eq!(input, before, "non-codex는 무변경");
+    }
+
+    /// enabled=false → 무변경(IO 0).
+    #[test]
+    fn enrich_disabled_no_change() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut input = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some("/tmp/x".to_string()),
+            session_id: Some("k2".to_string()),
+            ..Default::default()
+        };
+        let mut cfg = Config::default();
+        cfg.codex.enabled = false;
+        let before = input.clone();
+        maybe_enrich(&mut input, &cfg);
+        assert_eq!(input, before, "disabled는 무변경");
+    }
+
+    /// 단일 후보 → model/ctx/codex 설정(AC1). CODEX_HOME/HOME 주입으로 격리.
+    #[test]
+    fn enrich_single_candidate_sets_fields() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = unique_tmp("enrich-single");
+        let home = unique_tmp("enrich-single-home");
+        let cwd = "/Users/me/projEnrich";
+        write_rollout(
+            &base,
+            "enrich",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "xhigh"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let mut input = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some("enrich-single-key".to_string()),
+            ..Default::default()
+        };
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut input, &Config::default());
+        });
+        // 단일 해소: model=실모델, ctx=27.5%, extras 채워짐.
+        assert_eq!(input.model_display_name.as_deref(), Some("gpt-5.5"));
+        let ctx = input.context_used_percentage.expect("ctx%");
+        assert!((ctx - 27.5).abs() < 1e-9, "ctx 27.5: {ctx}");
+        let extras = input.codex.expect("codex extras");
+        assert_eq!(extras.rate_5h_percent, Some(3.0));
+        assert_eq!(extras.rate_weekly_percent, Some(21.0));
+        assert_eq!(extras.plan.as_deref(), Some("pro"));
+        assert_eq!(extras.effort.as_deref(), Some("xhigh"));
+        cleanup_real_cache("enrich-single-key");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 모호(≥2) → 무변경(model="codex" 유지, AC2/AC-X1).
+    #[test]
+    fn enrich_ambiguous_no_change() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = unique_tmp("enrich-amb");
+        let home = unique_tmp("enrich-amb-home");
+        let cwd = "/Users/me/projAmb";
+        for tag in ["a1", "a2"] {
+            write_rollout(
+                &base,
+                tag,
+                &[
+                    session_meta_line(cwd, "codex-tui"),
+                    token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+                ],
+            );
+        }
+        let mut input = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some("enrich-amb-key".to_string()),
+            ..Default::default()
+        };
+        let before = input.clone();
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut input, &Config::default());
+        });
+        assert_eq!(input, before, "모호는 무변경(model=codex 유지)");
+        // 모호는 캐시되지 않아야 한다(TTL 고착 차단). 혹시 남았으면 청소.
+        cleanup_real_cache("enrich-amb-key");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC-X6: 캐시 정상상태 — 2회차는 경로 mtime 불변이면 재해소 없이 캐시를 재사용한다.
+    ///
+    /// 1회차에 캐시를 채운 뒤, 2회차는 매칭 불가 cwd로 호출한다. 캐시 재사용이면 같은 키로
+    /// 캐시 히트 → 경로 mtime 불변 → 재사용되어 여전히 enrich가 성공해야 한다(풀 재해소면 실패).
+    #[test]
+    fn cache_steady_state_reuses_without_rescan() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = unique_tmp("cache-steady");
+        let home = unique_tmp("cache-steady-home");
+        let cwd = "/Users/me/projCache";
+        let key = "cache-steady-key";
+        write_rollout(
+            &base,
+            "cache",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        // 1회차: 캐시 채움.
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut first, &Config::default());
+        });
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        // 2회차: 같은 캐시 키지만 매칭 불가 cwd. 풀스캔이면 0 발견이지만 캐시 히트 →
+        // 경로 mtime 불변 → 재사용되어 여전히 성공해야 한다(정상상태 stat 1회).
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some("/no/match/here".to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        with_codex_env(&base, &home, || {
+            maybe_enrich(&mut second, &Config::default());
+        });
+        assert_eq!(
+            second.model_display_name.as_deref(),
+            Some("gpt-5.5"),
+            "정상상태는 캐시 재사용(재스캔 없이 stat 1회)"
+        );
+        cleanup_real_cache(key);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ===== env/캐시 테스트 헬퍼 =====
+
+    /// `CODEX_HOME`만 주입해 클로저를 실행하고 원복한다(ENV_LOCK 하에 호출).
+    ///
+    /// 주의: `HOME`은 **만지지 않는다**. 캐시(`~/Library/Caches/understatus`)는 실제 HOME에
+    /// 쓰이지만, 호출자가 프로세스+시각 고유 session_key를 쓰고 [`cleanup_real_cache`]로 청소한다.
+    /// (HOME을 전역 swap하면 HOME 의존 다른 테스트와 경합해 위양성 실패를 유발하므로 회피한다.)
+    fn with_codex_env<F: FnOnce()>(codex_home: &Path, _cache_home: &Path, f: F) {
+        let prev_codex = std::env::var_os("CODEX_HOME");
+        // SAFETY: ENV_LOCK으로 직렬화된 구간에서만 env를 변경한다(HOME 미변경).
+        unsafe {
+            std::env::set_var("CODEX_HOME", codex_home);
+        }
+        f();
+        unsafe {
+            match prev_codex {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
+    /// 실제 HOME 하위의 codex 캐시 세션 디렉터리를 제거한다(테스트 청소).
+    fn cleanup_real_cache(session_key: &str) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("understatus")
+                .join("sessions")
+                .join(session_key);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// 파일 mtime을 지정 시각으로 설정한다(stale 테스트용, libc utimes).
+    fn set_file_mtime(path: &Path, time: SystemTime) {
+        let secs = time
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        let times = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: 유효한 경로/timeval 포인터로 utimes 호출(실패해도 무패닉).
+        unsafe {
+            libc::utimes(c_path.as_ptr(), times.as_ptr());
+        }
     }
 }

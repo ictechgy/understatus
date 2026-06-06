@@ -202,3 +202,193 @@ fn oneline_lterm_has_no_git_segment() {
         "lterm 소스는 git 세그먼트(⎇)가 없어야 함: {text:?}"
     );
 }
+
+// ===== E2E: Codex 세션 심층판독(spec §11 E2E, AC1/AC2) =====
+
+/// 넓은 max_width(codex 풀 프로필이 폭 트림으로 잘리지 않게)를 가진 임시 config를 만든다.
+///
+/// codex enabled 기본은 true이고 chain_command는 미설정(chain 없음)이다. 폭 권위는 lterm이지만
+/// `render()`는 여전히 `display.max_width`를 적용하므로, 6개 세그먼트가 모두 보이도록 넓힌다.
+fn write_wide_config() -> String {
+    let path = std::env::temp_dir().join(format!(
+        "understatus-codex-e2e-cfg-{}-{:?}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&path, "[display]\nmax_width = 200\n").expect("임시 config 작성 실패");
+    path.to_string_lossy().into_owned()
+}
+
+/// CODEX_HOME/HOME을 주입해 understatus를 실행하고 stdout 바이트를 반환한다.
+///
+/// codex enrich는 `CODEX_HOME`(세션 경로)와 `HOME`(캐시 루트)에 의존하므로, 합성 세션을
+/// 격리 디렉터리에 두고 두 env를 주입한다. `config_path`로 표시 폭 등을 주입한다.
+fn run_with_codex_env(
+    args: &[&str],
+    stdin: &str,
+    codex_home: &str,
+    home: &str,
+    config_path: &str,
+) -> Vec<u8> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_understatus"))
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("UNDERSTATUS_CONFIG", config_path)
+        .env("CODEX_HOME", codex_home)
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("understatus 바이너리 실행 실패");
+    child
+        .stdin
+        .take()
+        .expect("stdin 핸들 없음")
+        .write_all(stdin.as_bytes())
+        .expect("stdin 쓰기 실패");
+    let output = child.wait_with_output().expect("자식 종료 대기 실패");
+    assert!(
+        output.status.success(),
+        "종료 코드 비정상: {:?}",
+        output.status
+    );
+    output.stdout
+}
+
+/// 합성 Codex 세션(session_meta + turn_context + token_count)을 임시 CODEX_HOME에 작성한다.
+///
+/// # 반환
+/// `(codex_home, cache_home)` 임시 디렉터리 경로. 호출자가 정리한다.
+fn write_synthetic_codex_session(cwd: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let unique = format!(
+        "{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let codex_home = std::env::temp_dir().join(format!("understatus-e2e-codex-{unique}"));
+    let cache_home = std::env::temp_dir().join(format!("understatus-e2e-home-{unique}"));
+    let day_dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("06")
+        .join("05");
+    std::fs::create_dir_all(&day_dir).expect("일자 디렉터리 생성 실패");
+    std::fs::create_dir_all(&cache_home).expect("캐시 홈 생성 실패");
+
+    // 275/1000 = 27.5% ctx, 5h=3%, wk=21%, plan=pro, effort=xhigh, model=gpt-5.5.
+    let session_meta = format!(
+        r#"{{"timestamp":"2026-06-05T11:41:50.379Z","type":"session_meta","payload":{{"id":"abc","cwd":"{cwd}","originator":"codex-tui","cli_version":"0.137.0"}}}}"#
+    );
+    let turn_context = r#"{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"xhigh","summary":"auto"}}"#;
+    let token_count = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":9999999},"last_token_usage":{"total_tokens":275},"model_context_window":1000},"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0,"window_minutes":300},"secondary":{"used_percent":21.0,"window_minutes":10080},"plan_type":"pro"}}}"#;
+
+    let path = day_dir.join("rollout-2026-06-05T20-40-45-e2e.jsonl");
+    let body = format!("{session_meta}\n{turn_context}\n{token_count}\n");
+    std::fs::write(&path, body).expect("합성 세션 쓰기 실패");
+    (codex_home, cache_home)
+}
+
+/// AC1 E2E: 합성 단일 Codex 세션 → 1행에 풀 프로필(model·ctx·5h·wk·plan·effort).
+#[test]
+fn e2e_codex_single_session_full_profile() {
+    let cwd = "/Users/me/e2e-codex-proj";
+    let (codex_home, cache_home) = write_synthetic_codex_session(cwd);
+    let config = write_wide_config();
+    let stdin = format!(
+        r#"{{"source":"lterm","session":"codex","pane":"%9","cwd":"{cwd}","agent":"codex"}}"#
+    );
+    let stdout = run_with_codex_env(
+        &["render", "--source", "lterm", "--oneline"],
+        &stdin,
+        &codex_home.to_string_lossy(),
+        &cache_home.to_string_lossy(),
+        &config,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+
+    // 정확히 1행(개행 0).
+    assert_eq!(
+        text.matches('\n').count(),
+        0,
+        "정확히 1행이어야 함: {text:?}"
+    );
+    // 풀 프로필: 실모델 + ctx% + 5h% + wk% + plan + effort.
+    assert!(text.contains("gpt-5.5"), "실모델 표시: {text:?}");
+    assert!(
+        text.contains("ctx 28%") || text.contains("ctx 27%"),
+        "ctx% 표시: {text:?}"
+    );
+    assert!(text.contains("5h 3%"), "5h 한도 표시: {text:?}");
+    assert!(text.contains("wk 21%"), "주간 한도 표시: {text:?}");
+    assert!(text.contains("pro"), "plan(bare value) 표시: {text:?}");
+    assert!(text.contains("xhigh"), "effort(bare value) 표시: {text:?}");
+    // 저하 시 보이는 bare "codex"가 실모델로 대체되었어야 한다.
+    assert!(
+        !text.contains(" codex "),
+        "model 슬롯이 실모델로 enrich되어야 함: {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&codex_home);
+    let _ = std::fs::remove_dir_all(&cache_home);
+    let _ = std::fs::remove_file(&config);
+}
+
+/// AC2 E2E: 미매칭(cwd 불일치) → enrich 생략 → 기존 lterm 출력으로 정직하게 저하.
+///
+/// 합성 세션의 cwd와 다른 cwd로 호출하면 후보 0개 → enrich 없음. codex 한도 세그먼트가
+/// 일절 없고 model 슬롯이 bare "codex"로 남아 기존 lterm 출력과 동형이어야 한다.
+///
+/// 주의: 두 라이브 프로세스 stdout의 정확한 바이트 동일 비교는 CPU/mem 등 라이브 샘플이
+/// 매 실행마다 달라 비결정적이다. 따라서 "enrich 미발동(codex 세그먼트 부재 + bare codex
+/// 유지)"이라는 관측 가능한 저하 계약으로 검증한다(세그먼트 단위 byte 동일은 단위 테스트가 담당).
+#[test]
+fn e2e_codex_unmatched_degrades_to_bare_lterm() {
+    let session_cwd = "/Users/me/e2e-codex-has-session";
+    let (codex_home, cache_home) = write_synthetic_codex_session(session_cwd);
+    let config = write_wide_config();
+    // 세션과 다른 cwd → 후보 0 → enrich 생략.
+    let stdin = r#"{"source":"lterm","session":"codex","pane":"%8","cwd":"/Users/me/e2e-no-match","agent":"codex"}"#;
+
+    let stdout = run_with_codex_env(
+        &["render", "--source", "lterm", "--oneline"],
+        stdin,
+        &codex_home.to_string_lossy(),
+        &cache_home.to_string_lossy(),
+        &config,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+
+    // 정확히 1행.
+    assert_eq!(
+        text.matches('\n').count(),
+        0,
+        "정확히 1행이어야 함: {text:?}"
+    );
+    // enrich 미발동: codex 한도/실모델/ctx 세그먼트가 없어야 한다.
+    assert!(!text.contains("5h "), "미매칭은 5h 세그먼트 없음: {text:?}");
+    assert!(!text.contains("wk "), "미매칭은 wk 세그먼트 없음: {text:?}");
+    assert!(
+        !text.contains("gpt-5.5"),
+        "미매칭은 실모델 enrich 없음: {text:?}"
+    );
+    assert!(
+        !text.contains("ctx "),
+        "미매칭은 ctx 세그먼트 없음: {text:?}"
+    );
+    // model 슬롯은 bare "codex"로 남는다(기존 lterm 저하).
+    assert!(
+        text.contains("codex"),
+        "미매칭은 bare codex로 정직하게 저하해야 함: {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&codex_home);
+    let _ = std::fs::remove_dir_all(&cache_home);
+    let _ = std::fs::remove_file(&config);
+}
