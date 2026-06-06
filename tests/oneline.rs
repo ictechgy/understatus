@@ -222,6 +222,25 @@ fn oneline_lterm_has_no_git_segment() {
     );
 }
 
+/// lterm 출력에 세션/페인 라벨("session/pane")이 cwd 앞에 표시되어야 한다(--source lterm).
+#[test]
+fn oneline_lterm_shows_session_pane_label() {
+    let stdout = run_understatus(
+        &["render", "--source", "lterm", "--oneline"],
+        r#"{"source":"lterm","session":"codex","pane":"%3","agent":"codex","cwd":"/x/ios_cleaner"}"#,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+    // 세션/페인 라벨 + cwd basename이 함께 표시되어야 한다.
+    assert!(
+        text.contains("codex/%3"),
+        "lterm 출력에 session/pane 라벨이 있어야 함: {text:?}"
+    );
+    assert!(
+        text.contains("codex/%3 · ios_cleaner"),
+        "session/pane은 cwd 바로 앞에 표시되어야 함: {text:?}"
+    );
+}
+
 // ===== E2E: Codex 세션 심층판독(spec §11 E2E, AC1/AC2) =====
 
 /// 넓은 max_width(codex 풀 프로필이 폭 트림으로 잘리지 않게)를 가진 임시 config를 만든다.

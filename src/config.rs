@@ -106,6 +106,8 @@ pub struct DisplayConfig {
     pub show_context: bool,
     /// git 브랜치(workspace.git_worktree/repo 파생) 노출.
     pub show_git: bool,
+    /// lterm 세션/페인 라벨(예 "codex/%3") 노출. lterm 소스 전용(Claude 경로는 미표시).
+    pub show_session: bool,
     /// 배터리(P2, IOKit + TTL 캐시) 노출.
     pub show_battery: bool,
     /// 디스크 사용률(P2, statfs("/")) 노출.
@@ -211,6 +213,7 @@ impl Default for DisplayConfig {
             show_cost: true,
             show_context: true,
             show_git: true,
+            show_session: true,
             show_battery: true,
             show_disk: true,
             show_network: true,
@@ -481,6 +484,7 @@ mod tests {
         assert_eq!(config.chain.chain_cache_ttl_seconds, 10);
         assert_eq!(config.chain.chain_timeout_ms, 500);
         assert_eq!(config.display.max_width, 80);
+        assert!(config.display.show_session);
         assert!(config.display.show_disk);
         assert!(config.display.show_network);
         assert!(config.display.show_battery);

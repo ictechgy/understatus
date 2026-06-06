@@ -207,6 +207,15 @@ fn collect_segments(
             }
         }
     }
+    // lterm 세션/페인 라벨(예 "codex/%3"): cwd 바로 앞 배치. bare value(cwd와 동일 스타일).
+    // priority 35 = cwd 30 위, git 40 아래. Claude 경로는 session_label=None이라 미표시.
+    if cfg.display.show_session {
+        if let Some(label) = input.session_label.as_deref() {
+            if !label.is_empty() {
+                segments.push(value_segment(label, 35));
+            }
+        }
+    }
     if let Some(cwd) = input.cwd.as_deref() {
         if let Some(dir) = cwd.rsplit('/').find(|part| !part.is_empty()) {
             segments.push(value_segment(dir, 30));
@@ -578,6 +587,7 @@ mod tests {
             git_branch: Some("main".to_string()),
             cost_usd: Some(1.23),
             session_id: Some("sess-1".to_string()),
+            session_label: None,
             codex: None,
         }
     }
@@ -831,6 +841,47 @@ mod tests {
         );
         // 핵심 CPU 세그먼트는 유지.
         assert!(line.contains("10%"), "핵심 CPU 세그먼트는 유지: {line:?}");
+    }
+
+    #[test]
+    fn render_shows_session_label_when_some() {
+        // session_label=Some("codex/%3")면 출력에 "codex/%3"가 cwd("proj") 앞에 표시된다.
+        let mut input = sample_input();
+        input.session_label = Some("codex/%3".to_string());
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let line = render(&input, &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            line.contains("codex/%3"),
+            "session_label이 있으면 표시되어야 함: {line:?}"
+        );
+    }
+
+    #[test]
+    fn render_omits_session_label_when_none() {
+        // session_label=None(Claude 경로 등)이면 표시되지 않는다(기존 출력 보존).
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let line = render(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            !line.contains('/'),
+            "session_label None이면 세션 세그먼트 없음(cwd는 basename만): {line:?}"
+        );
+    }
+
+    #[test]
+    fn render_omits_session_label_when_toggle_off() {
+        // show_session=false면 session_label이 있어도 표시하지 않는다.
+        let mut input = sample_input();
+        input.session_label = Some("codex/%3".to_string());
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        cfg.display.show_session = false;
+        let line = render(&input, &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            !line.contains("codex/%3"),
+            "show_session=false면 라벨이 있어도 생략: {line:?}"
+        );
     }
 
     #[test]
