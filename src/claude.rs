@@ -197,6 +197,14 @@ pub fn resolve_context_percent(
     fallback: Option<f64>,
     held_native: Option<f64>,
 ) -> ContextResolution {
+    // fallback을 함수 진입 시 1회 정규화해 hold 해제 판정(2)과 표시(3)가 같은 값을 쓰게 한다.
+    // 비유한/음수(직접 호출자의 잘못된 입력)는 제거해 hold를 잘못 깨지 않도록 하고, 범위는 0..=100으로
+    // 클램프한다. 0%는 cold-start 빈 컨텍스트의 정당한 값이라 보존한다(실제 파이프라인의 fallback은
+    // 항상 0..=100 양수라 무영향, 본 정규화는 pub-API 방어용).
+    let fallback = fallback
+        .filter(|p| p.is_finite() && *p >= 0.0)
+        .map(clamp_percent);
+
     // 1) 양수 native 우선(권위값) — 표시 + 영속화. NaN/음수/0은 native로 인정하지 않는다.
     //    표시·영속 전 0..=100 클램프로 fallback과 일관성을 맞추고 비정상값의 캐시 전파를 막는다.
     if let Some(positive) = native.filter(|p| p.is_finite() && *p > 0.0) {
@@ -208,14 +216,13 @@ pub fn resolve_context_percent(
     }
     // 2) native 부재/0 → TTL 내 직전 native 유지(상승 방향 분모 노이즈 차단). 재영속화하지 않아
     //    TTL 시계는 마지막 실제 native 시점부터 흐른다(누락이 TTL을 넘기면 자연히 fallback로 저하).
-    //    단, fallback이 held보다 충분히 낮으면(실제 감소) 유지를 깨고 3)으로 떨어뜨린다.
+    //    단, 정규화된 fallback이 held보다 충분히 낮으면(실제 감소) 유지를 깨고 3)으로 떨어뜨린다.
     //    held는 변조 가능한 캐시 출처일 수 있으므로 유한·양수만 인정하고 0..=100으로 클램프한다.
     if let Some(held) = held_native
         .filter(|p| p.is_finite() && *p > 0.0)
         .map(clamp_percent)
     {
-        let real_drop =
-            fallback.is_some_and(|fb| fb.is_finite() && fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
+        let real_drop = fallback.is_some_and(|fb| fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
         if !real_drop {
             return ContextResolution {
                 display: Some(held),
@@ -223,13 +230,10 @@ pub fn resolve_context_percent(
             };
         }
     }
-    // 3) cold-start 또는 실제 감소 감지: 토큰 fallback(유한·클램프), 없으면 유한한 raw native(0 등,
-    //    클램프), 끝으로 생략. fallback도 비유한/범위초과 방어를 위해 유한 필터 + 클램프한다.
+    // 3) cold-start 또는 실제 감소 감지: 정규화된 토큰 fallback, 없으면 유한한 raw native(0 등,
+    //    클램프), 끝으로 생략.
     ContextResolution {
-        display: fallback
-            .filter(|p| p.is_finite())
-            .map(clamp_percent)
-            .or_else(|| native.filter(|p| p.is_finite()).map(clamp_percent)),
+        display: fallback.or_else(|| native.filter(|p| p.is_finite()).map(clamp_percent)),
         persist_native: None,
     }
 }
@@ -841,6 +845,36 @@ mod tests {
     fn resolve_clamps_out_of_range_fallback() {
         let r = resolve_context_percent(None, Some(150.0), None);
         assert_eq!(r.display, Some(100.0));
+    }
+
+    /// 음수/비유한 fallback(직접 호출자의 잘못된 입력)은 정규화로 제거되어 유효한 hold를 깨지 못한다.
+    #[test]
+    fn resolve_normalized_fallback_does_not_break_hold() {
+        // fallback -5(잘못된 입력)는 정규화로 None이 되어 held 86을 깨지 않는다(폴리시: real_drop 전 정규화).
+        let r = resolve_context_percent(None, Some(-5.0), Some(86.0));
+        assert_eq!(r.display, Some(86.0), "음수 fallback은 hold를 깨지 못함");
+        assert_eq!(r.persist_native, None);
+        // 비유한 fallback도 동일.
+        assert_eq!(
+            resolve_context_percent(None, Some(f64::NAN), Some(86.0)).display,
+            Some(86.0)
+        );
+    }
+
+    /// 하강 가드는 *클램프된* held를 기준으로 비교한다(clamp-before-compare 순서 고정).
+    #[test]
+    fn resolve_drop_guard_uses_clamped_held() {
+        // held 150 → 클램프 100. 임계는 100-12=88: fallback 89는 유지(100 표시), 87은 깸(87 표시).
+        assert_eq!(
+            resolve_context_percent(None, Some(89.0), Some(150.0)).display,
+            Some(100.0),
+            "89 > 88 → 클램프된 held(100) 유지",
+        );
+        assert_eq!(
+            resolve_context_percent(None, Some(87.0), Some(150.0)).display,
+            Some(87.0),
+            "87 <= 88 → 유지를 깨고 fallback 표시",
+        );
     }
 
     // === 타입 드리프트 leniency(신규 토큰 필드가 statusline 전체를 무력화하지 않음) ===
