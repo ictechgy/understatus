@@ -526,14 +526,20 @@ fn read_held_native_ctx(session_key: &str, now_ms: u128) -> Option<f64> {
 /// 세션 캐시 읽기 결과 `(written_ms, payload)`를 직전 native ctx%로 해석한다(순수, I/O 없음).
 ///
 /// `read_held_native_ctx`의 판정 로직을 분리해 tempdir/HOME 스왑 없이 TTL 경계·`f64` 라운드트립
-/// (`format!("{native}")` ↔ `parse::<f64>()`)·비유한 방어를 테스트 가능하게 한다.
+/// (`format!("{native}")` ↔ `parse::<f64>()`)·범위 방어를 테스트 가능하게 한다.
+///
+/// 캐시 payload는 우리가 기록한 양수·클램프 native지만(`resolve_context_percent` persist), 파일은
+/// 사용자/외부가 변조할 수 있는 신뢰 경계다. 따라서 `held_native`의 계약(양수 0..=100)을 읽기 경계에서
+/// 강제한다: 유한·`0 < v <= 100`을 벗어난 payload(예: `-5`, `0`, `150`, `1e24`)는 `None`으로 거부해
+/// hold 대신 토큰 fallback으로 저하시킨다(손상 캐시가 그대로 표시되지 않도록).
 ///
 /// # 인자
 /// - `entry`: 캐시 읽기 결과. `None`이면 항목 부재.
 /// - `now_ms`: 현재 시각(epoch ms). TTL 판정 기준.
 ///
 /// # 반환
-/// TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내이고 유한한 `f64`로 파싱되면 `Some(percent)`, 아니면 `None`.
+/// TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내이고 `0 < v <= 100`인 유한 `f64`로 파싱되면 `Some(percent)`,
+/// 아니면 `None`.
 fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Option<f64> {
     let (written_ms, payload) = entry?;
     if !chain::is_named_cache_fresh(written_ms, now_ms, CONTEXT_HOLD_TTL_SECONDS) {
@@ -543,7 +549,7 @@ fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Opt
         .trim()
         .parse::<f64>()
         .ok()
-        .filter(|percent| percent.is_finite())
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
 }
 
 /// 렌더 파이프라인을 실행하고 합성된 한 줄을 stdout에 출력한다.
@@ -1013,7 +1019,8 @@ mod tests {
     #[test]
     fn interpret_held_roundtrips_writer_format() {
         // resolve_claude_context가 쓰는 직렬화(`format!("{native}")`)와 동일 경로를 검증.
-        for value in [86.0_f64, 33.7, 100.0, 0.0, 12.5] {
+        // 영속화되는 값은 항상 양수·0..=100 클램프(persist_native)이므로 그 범위만 라운드트립한다.
+        for value in [86.0_f64, 33.7, 100.0, 12.5, 0.5] {
             let payload = format!("{value}");
             assert_eq!(
                 interpret_held_native_ctx(Some((1_000, payload)), 1_000),
@@ -1053,5 +1060,62 @@ mod tests {
                 "payload {bad:?}는 None이어야 함",
             );
         }
+    }
+
+    /// 변조/손상으로 범위(0 < v <= 100)를 벗어난 캐시 payload는 거부해 토큰 fallback으로 저하시킨다.
+    #[test]
+    fn interpret_held_rejects_out_of_range() {
+        for bad in ["150", "101", "0", "-5", "1e24"] {
+            assert_eq!(
+                interpret_held_native_ctx(Some((1_000, bad.to_string())), 1_000),
+                None,
+                "범위 밖 payload {bad:?}는 None이어야 함(손상 캐시 → fallback 저하)",
+            );
+        }
+        // 경계: 100은 유효, 양의 소수도 유효.
+        assert_eq!(
+            interpret_held_native_ctx(Some((1_000, "100".to_string())), 1_000),
+            Some(100.0)
+        );
+        assert_eq!(
+            interpret_held_native_ctx(Some((1_000, "0.5".to_string())), 1_000),
+            Some(0.5)
+        );
+    }
+
+    /// 캐시 글루 라운드트립: resolve_claude_context가 쓰는 직렬화·캐시명·세션격리를 실제 세션 캐시
+    /// 경로(chain `*_in` 주입)로 검증한다. 양수 native를 기록 → 동일 키로 읽어 interpret이 복원.
+    #[test]
+    fn held_native_cache_roundtrip_through_session_cache() {
+        let base =
+            std::env::temp_dir().join(format!("understatus-ctxnative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let session_key = "ctx-roundtrip-session";
+        let now_ms: u128 = 1_000_000;
+
+        // 기록: resolve_claude_context와 동일한 직렬화(format!("{native}"))·캐시명을 사용.
+        let native = 86.4_f64;
+        chain::write_session_named_cache_in(
+            &base,
+            session_key,
+            CONTEXT_NATIVE_CACHE,
+            now_ms,
+            &format!("{native}"),
+        );
+
+        // 읽기 + 해석: TTL 내이므로 기록값이 그대로 복원되어야 한다.
+        let entry = chain::read_session_named_cache_in(&base, session_key, CONTEXT_NATIVE_CACHE);
+        assert_eq!(
+            interpret_held_native_ctx(entry, now_ms),
+            Some(native),
+            "세션 캐시 라운드트립으로 직전 native가 복원되어야 함",
+        );
+
+        // 다른 세션 키로는 보이지 않는다(세션 격리 확인).
+        let other =
+            chain::read_session_named_cache_in(&base, "other-session", CONTEXT_NATIVE_CACHE);
+        assert_eq!(interpret_held_native_ctx(other, now_ms), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

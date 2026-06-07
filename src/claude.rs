@@ -188,6 +188,10 @@ pub struct ContextResolution {
 /// - `native`: 이번 프레임의 `used_percentage`(부재/0/NaN 가능).
 /// - `fallback`: 이번 프레임의 토큰 기반 추정치([`compute_context_fallback`], 부재/양수).
 /// - `held_native`: TTL 내 직전 양수 native(호출부가 세션 캐시에서 읽어 주입; 없으면 `None`).
+///
+/// 입력 방어: 본 함수는 `pub`이라 직접 호출자도 임의값을 넘길 수 있고, `held_native`는 변조 가능한
+/// 캐시에서 올 수 있다. 따라서 세 입력 모두 표시/유지 전에 유한·`0..=100` 경계로 정규화한다
+/// (native·held는 양수만 인정, 비유한·범위초과는 그 경로를 건너뛴다).
 pub fn resolve_context_percent(
     native: Option<f64>,
     fallback: Option<f64>,
@@ -205,8 +209,13 @@ pub fn resolve_context_percent(
     // 2) native 부재/0 → TTL 내 직전 native 유지(상승 방향 분모 노이즈 차단). 재영속화하지 않아
     //    TTL 시계는 마지막 실제 native 시점부터 흐른다(누락이 TTL을 넘기면 자연히 fallback로 저하).
     //    단, fallback이 held보다 충분히 낮으면(실제 감소) 유지를 깨고 3)으로 떨어뜨린다.
-    if let Some(held) = held_native {
-        let real_drop = fallback.is_some_and(|fb| fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
+    //    held는 변조 가능한 캐시 출처일 수 있으므로 유한·양수만 인정하고 0..=100으로 클램프한다.
+    if let Some(held) = held_native
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map(clamp_percent)
+    {
+        let real_drop =
+            fallback.is_some_and(|fb| fb.is_finite() && fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
         if !real_drop {
             return ContextResolution {
                 display: Some(held),
@@ -214,9 +223,13 @@ pub fn resolve_context_percent(
             };
         }
     }
-    // 3) cold-start 또는 실제 감소 감지: 토큰 fallback, 없으면 유한한 raw native(0 등, 클램프), 끝으로 생략.
+    // 3) cold-start 또는 실제 감소 감지: 토큰 fallback(유한·클램프), 없으면 유한한 raw native(0 등,
+    //    클램프), 끝으로 생략. fallback도 비유한/범위초과 방어를 위해 유한 필터 + 클램프한다.
     ContextResolution {
-        display: fallback.or_else(|| native.filter(|p| p.is_finite()).map(clamp_percent)),
+        display: fallback
+            .filter(|p| p.is_finite())
+            .map(clamp_percent)
+            .or_else(|| native.filter(|p| p.is_finite()).map(clamp_percent)),
         persist_native: None,
     }
 }
@@ -775,6 +788,61 @@ mod tests {
         assert_eq!(r.persist_native, Some(100.0), "클램프된 값만 영속화");
     }
 
+    /// 음수 raw native(분기 3 마지막 수단)는 0%로 클램프되어 표시된다(하한 클램프 불변식 고정).
+    #[test]
+    fn resolve_clamps_negative_native_to_zero() {
+        let r = resolve_context_percent(Some(-5.0), None, None);
+        assert_eq!(r.display, Some(0.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    // === 입력 방어: held/fallback 정규화(pub 함수·변조 가능 캐시 대비, quad-review 합의) ===
+
+    /// held가 범위를 벗어나면(>100) 표시 전에 0..=100으로 클램프한다.
+    #[test]
+    fn resolve_clamps_out_of_range_held() {
+        let r = resolve_context_percent(None, None, Some(150.0));
+        assert_eq!(r.display, Some(100.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// held가 비양수(≤0)/비유한이면 유지하지 않고 토큰 fallback으로 저하한다.
+    #[test]
+    fn resolve_rejects_nonpositive_or_nonfinite_held() {
+        // held -5(손상 캐시) → 유지 안 함, fallback 45 표시.
+        assert_eq!(
+            resolve_context_percent(None, Some(45.0), Some(-5.0)).display,
+            Some(45.0)
+        );
+        // held 0 → 유지 안 함, fallback도 없으면 None.
+        assert_eq!(resolve_context_percent(None, None, Some(0.0)).display, None);
+        // held NaN → 유지 안 함, fallback 30 표시.
+        assert_eq!(
+            resolve_context_percent(None, Some(30.0), Some(f64::NAN)).display,
+            Some(30.0)
+        );
+    }
+
+    /// fallback이 비유한이면(NaN/inf) 표시 후보에서 제외한다(분기 3 방어).
+    #[test]
+    fn resolve_rejects_nonfinite_fallback() {
+        assert_eq!(
+            resolve_context_percent(None, Some(f64::NAN), None).display,
+            None
+        );
+        assert_eq!(
+            resolve_context_percent(None, Some(f64::INFINITY), None).display,
+            None
+        );
+    }
+
+    /// fallback이 범위를 벗어나면(>100) 0..=100으로 클램프한다(직접 호출자 방어).
+    #[test]
+    fn resolve_clamps_out_of_range_fallback() {
+        let r = resolve_context_percent(None, Some(150.0), None);
+        assert_eq!(r.display, Some(100.0));
+    }
+
     // === 타입 드리프트 leniency(신규 토큰 필드가 statusline 전체를 무력화하지 않음) ===
 
     /// 신규 토큰 필드가 문자열로 와도(타입 드리프트) 파싱이 통째로 깨지지 않고, 무관 필드는 보존된다.
@@ -825,6 +893,41 @@ mod tests {
         assert_eq!(input.model_display_name.as_deref(), Some("Opus"));
         // current_usage는 흡수(None), total_input_tokens fallback이 살아 45% 산출.
         assert_eq!(input.context_fallback_percentage, Some(45.0));
+    }
+
+    /// 권위 필드 used_percentage가 문자열로 드리프트해도 native만 None이 되고 무관 필드·fallback은 보존된다.
+    #[test]
+    fn used_percentage_drift_preserves_fallback_and_model() {
+        let raw = r#"{
+            "model": { "display_name": "Opus" },
+            "context_window": { "used_percentage": "oops", "context_window_size": 1000000, "total_input_tokens": 450000 }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(
+            input.model_display_name.as_deref(),
+            Some("Opus"),
+            "model 보존"
+        );
+        assert_eq!(input.context_used_percentage, None, "문자열 native → None");
+        assert_eq!(
+            input.context_fallback_percentage,
+            Some(45.0),
+            "토큰 fallback 생존"
+        );
+    }
+
+    /// 분모 context_window_size가 문자열로 드리프트하면 native는 보존되고 fallback은 분모 부재로 None.
+    #[test]
+    fn window_size_drift_preserves_native() {
+        let raw = r#"{
+            "context_window": { "used_percentage": 80.0, "context_window_size": "oops", "current_usage": { "input_tokens": 500000 } }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_used_percentage, Some(80.0), "native 보존");
+        assert_eq!(
+            input.context_fallback_percentage, None,
+            "분모 드리프트 → fallback 불가"
+        );
     }
 
     /// 필드 누락: 부재 필드는 전부 None이어야 한다(에러/패닉 없음).
