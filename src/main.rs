@@ -538,6 +538,14 @@ fn run_render_pipeline(source: Source, oneline: bool) {
         _ => String::new(),
     };
 
+    // (7b) 체인 출력의 ctx 표시 제거(strip_chain_ctx, 기본 on). understatus가 ctx를 권위있게
+    //   표시하므로 체인 HUD가 같은/발명된 ctx를 중복 표시해 값이 튀는 것을 막는다(빈 출력엔 무영향).
+    let chain_output = if cfg.chain.strip_chain_ctx {
+        chain::strip_chained_context(&chain_output)
+    } else {
+        chain_output
+    };
+
     // (8) self + chain 합성 후 한 줄 출력. 체인이 있으면 dim HUD seam("│")으로 소유권 경계 표시.
     let color_on = std::env::var_os("NO_COLOR").is_none() && cfg.color.mode != "none";
     let line = render::compose_with_seam(

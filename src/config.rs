@@ -90,6 +90,14 @@ pub struct ChainConfig {
     pub chain_cache_ttl_seconds: u64,
     /// 체인 자식 스폰 타임아웃(ms). 초과 시 캐시/빈 문자열로 저하(CRITICAL-1).
     pub chain_timeout_ms: u64,
+    /// 체인 자식(예: omc HUD) 출력에서 ctx 표시(인라인 `ctx:NN%`/`CRITICAL`/`COMPRESS?`
+    /// 토큰과 `[!] ctx … run /compact` 경고줄)를 제거한다. 기본 true.
+    ///
+    /// 동기: understatus는 Claude payload의 `used_percentage`를 그대로 표시(권위)하지만,
+    /// 체인 HUD는 그 값이 누락된 프레임에서 토큰비율로 ctx를 **자체 계산**해 같은 상태에서도
+    /// 값이 튀고(예 86↔98) self ctx와 중복된다. self ctx가 꺼져 있어도 무조건 제거한다
+    /// — 표시하지 않는 편이 발명된 값보다 정직하기 때문이다.
+    pub strip_chain_ctx: bool,
 }
 
 /// `[display]` 섹션. 한 줄 폭 제한 + 세그먼트 표시 토글.
@@ -201,6 +209,7 @@ impl Default for ChainConfig {
             order: "self_first".to_string(),
             chain_cache_ttl_seconds: 10,
             chain_timeout_ms: 500,
+            strip_chain_ctx: true,
         }
     }
 }
