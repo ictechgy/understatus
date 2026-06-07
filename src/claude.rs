@@ -22,6 +22,11 @@ pub struct ClaudeInput {
     /// 컨텍스트 사용률 % (`context_window.used_percentage`).
     /// 첫 API 호출 전 / `/compact` 직후 `null` → `None`이면 세그먼트 생략.
     pub context_used_percentage: Option<f64>,
+    /// 토큰 기반 컨텍스트 사용률% fallback(`current_usage` 토큰합/`context_window_size`,
+    /// 없으면 `total_input_tokens`/size). Claude Code가 `used_percentage`를 일시적으로 누락하는
+    /// 프레임에서도 ctx가 사라지지 않도록 두는 대체값이다. native(`used_percentage`)가 항상 우선하며,
+    /// 실제 표시값 해석은 [`resolve_context_percent`]가 담당한다. lterm/codex 경로는 `None`.
+    pub context_fallback_percentage: Option<f64>,
     /// 현재 작업 디렉터리 (`cwd` 또는 `workspace.current_dir`).
     pub cwd: Option<String>,
     /// `workspace.git_worktree`/`workspace.repo`에서 파생한 git 브랜치명.
@@ -64,9 +69,13 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
 
     // 중첩 객체를 평탄화한다. 각 단계는 Option을 그대로 흘려보내 부재/null에 견딘다.
     let model_display_name = raw_input.model.and_then(|model| model.display_name);
-    let context_used_percentage = raw_input
-        .context_window
-        .and_then(|window| window.used_percentage);
+    // context_window에서 native(used_percentage)와 토큰 기반 fallback을 함께 도출한다.
+    // Claude Code가 used_percentage를 간헐적으로 누락하는 프레임에서도 ctx를 추정할 수 있도록
+    // fallback을 준비한다(표시 우선순위는 resolve_context_percent가 결정).
+    let (context_used_percentage, context_fallback_percentage) = match raw_input.context_window {
+        Some(window) => (window.used_percentage, compute_context_fallback(&window)),
+        None => (None, None),
+    };
     let cost_usd = raw_input.cost.and_then(|cost| cost.total_cost_usd);
 
     // cwd는 최상위 `cwd`를 우선하고, 없으면 workspace.current_dir로 폴백한다.
@@ -82,6 +91,7 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
     ClaudeInput {
         model_display_name,
         context_used_percentage,
+        context_fallback_percentage,
         cwd: raw_input.cwd.or(cwd_from_workspace),
         git_branch,
         cost_usd,
@@ -90,6 +100,124 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
         session_label: None,
         // Claude 경로는 Codex enrich 대상이 아니다(비트 동일 보장, spec §6).
         codex: None,
+    }
+}
+
+/// `context_window`의 토큰 정보로 컨텍스트 사용률% fallback을 계산한다(순수, 부재 안전).
+///
+/// Claude Code가 `used_percentage`를 일시적으로 누락하는 프레임에서도 ctx를 추정하기 위해,
+/// omc HUD와 동일한 우선순위로 토큰 기반 비율을 산출한다:
+///   1) `current_usage` 토큰합 / `context_window_size`
+///   2) `total_input_tokens` / `context_window_size`
+///
+/// # 반환
+/// 분모(창 크기)와 분자(토큰)가 모두 양수일 때만 `Some(0..=100)`. 크기 부재/0, 토큰 0/부재면
+/// `None`을 반환해 호출부가 ctx 세그먼트를 생략(또는 직전 native 유지)하게 한다.
+fn compute_context_fallback(window: &RawContextWindow) -> Option<f64> {
+    let size = window.context_window_size?;
+    if size <= 0.0 {
+        return None;
+    }
+    // 1) current_usage 토큰합(입력 + 캐시 생성 + 캐시 읽기) 기준.
+    let current_tokens = window
+        .current_usage
+        .as_ref()
+        .map(RawCurrentUsage::total_tokens)
+        .unwrap_or(0.0);
+    if current_tokens > 0.0 {
+        return Some(percent_of(current_tokens, size));
+    }
+    // 2) total_input_tokens 기준(네이티브 사용률을 0으로 보고하는 호환 프로바이더 대비).
+    let total_input = window.total_input_tokens.unwrap_or(0.0);
+    if total_input > 0.0 {
+        return Some(percent_of(total_input, size));
+    }
+    None
+}
+
+/// 토큰 수를 창 크기 대비 백분율(0..=100, 정수 반올림)로 환산한다(순수).
+///
+/// `size`는 호출부에서 이미 양수임을 보장한다(0 분모 진입 불가). 결과는 표시 안정성을 위해
+/// 정수로 반올림하고 0..=100으로 클램프한다(omc HUD `Math.min(100, Math.round(...))`와 동형).
+fn percent_of(tokens: f64, size: f64) -> f64 {
+    ((tokens / size) * 100.0).round().clamp(0.0, 100.0)
+}
+
+/// 표시·영속용 백분율을 0..=100으로 클램프한다(순수).
+///
+/// native(`used_percentage`)는 상류 값이라 이론상 0..100을 벗어날 수 있다. 토큰 fallback
+/// ([`percent_of`])과 동일하게 클램프해 표시 일관성을 맞추고, 비정상 상한값(예: 120)이 세션
+/// 캐시로 영속·전파되는 것을 막는다. 비유한 입력은 호출부에서 미리 차단한다.
+fn clamp_percent(percent: f64) -> f64 {
+    percent.clamp(0.0, 100.0)
+}
+
+/// 직전 native 유지(hold)를 깨고 토큰 fallback으로 전환하는 하강 임계치(%포인트).
+///
+/// 토큰 fallback은 native 대비 체계적 과대추정이라(분모 차이로 86↔98) 상승 방향 노이즈는 유지로
+/// 막는다. 그러나 fallback이 직전 native보다 이만큼 이상 *낮으면* 노이즈가 아니라 실제 컨텍스트
+/// 감소(예: `/compact`)로 보고 유지를 깬다. 관측된 분모 노이즈 폭(~12%p)을 흡수하되 실제 급감
+/// (통상 수십%p)은 즉시 반영하도록 그 경계값으로 둔다.
+const CONTEXT_HOLD_DROP_TOLERANCE: f64 = 12.0;
+
+/// 컨텍스트 사용률% 해석 결과: 이번 프레임에 표시할 값과, 양수 native를 본 경우 영속화할 값.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextResolution {
+    /// ctx 세그먼트로 표시할 값. `None`이면 세그먼트를 생략한다.
+    pub display: Option<f64>,
+    /// 양수 native(`used_percentage` > 0)를 본 경우 세션 캐시에 기록할 값. `None`이면 기록하지 않는다.
+    pub persist_native: Option<f64>,
+}
+
+/// native·토큰 fallback·직전 native(hold)로부터 표시할 ctx%를 해석한다(순수, I/O 없음).
+///
+/// Claude Code는 `used_percentage`를 간헐적으로 누락하는데, 그 프레임에서 토큰 기반 fallback으로
+/// 곧바로 전환하면 분모가 달라 값이 튄다(관측된 예: 86 ↔ 98). 이 튐은 실제 컨텍스트 증가가 아니라
+/// 분모 불일치로 인한 체계적 노이즈이므로, native가 일시 누락된 동안에는 직전 native를 유지한다:
+///   1) 양수 native가 있으면 그것을 표시하고 영속화한다(권위값, 0..=100 클램프).
+///   2) native가 없고 TTL 내 직전 native(`held_native`)가 있으면 그 값을 유지한다(상승 노이즈 차단).
+///      단, 토큰 fallback이 직전 native보다 [`CONTEXT_HOLD_DROP_TOLERANCE`] 이상 *낮으면*
+///      실제 감소(예: `/compact`)로 보고 유지를 깨 아래 3)에서 fallback을 반영한다.
+///   3) 유지 안 함 → 토큰 fallback, 없으면 유한한 raw native(예: 0), 끝으로 `None`(생략).
+///
+/// 비대칭 가드 주의: omc HUD는 대칭 tolerance(`|fallback-native| > 3`)로 전환해 86↔98 *상승*
+/// 노이즈에도 튀었다. 여기선 하강 방향만 통과시켜(토큰 fallback이 native 대비 과대추정이므로
+/// fallback이 held보다 낮다는 건 노이즈가 아니라 실제 감소 신호) 그 회귀를 피하면서 급감은 따라간다.
+///
+/// # 인자
+/// - `native`: 이번 프레임의 `used_percentage`(부재/0/NaN 가능).
+/// - `fallback`: 이번 프레임의 토큰 기반 추정치([`compute_context_fallback`], 부재/양수).
+/// - `held_native`: TTL 내 직전 양수 native(호출부가 세션 캐시에서 읽어 주입; 없으면 `None`).
+pub fn resolve_context_percent(
+    native: Option<f64>,
+    fallback: Option<f64>,
+    held_native: Option<f64>,
+) -> ContextResolution {
+    // 1) 양수 native 우선(권위값) — 표시 + 영속화. NaN/음수/0은 native로 인정하지 않는다.
+    //    표시·영속 전 0..=100 클램프로 fallback과 일관성을 맞추고 비정상값의 캐시 전파를 막는다.
+    if let Some(positive) = native.filter(|p| p.is_finite() && *p > 0.0) {
+        let clamped = clamp_percent(positive);
+        return ContextResolution {
+            display: Some(clamped),
+            persist_native: Some(clamped),
+        };
+    }
+    // 2) native 부재/0 → TTL 내 직전 native 유지(상승 방향 분모 노이즈 차단). 재영속화하지 않아
+    //    TTL 시계는 마지막 실제 native 시점부터 흐른다(누락이 TTL을 넘기면 자연히 fallback로 저하).
+    //    단, fallback이 held보다 충분히 낮으면(실제 감소) 유지를 깨고 3)으로 떨어뜨린다.
+    if let Some(held) = held_native {
+        let real_drop = fallback.is_some_and(|fb| fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
+        if !real_drop {
+            return ContextResolution {
+                display: Some(held),
+                persist_native: None,
+            };
+        }
+    }
+    // 3) cold-start 또는 실제 감소 감지: 토큰 fallback, 없으면 유한한 raw native(0 등, 클램프), 끝으로 생략.
+    ContextResolution {
+        display: fallback.or_else(|| native.filter(|p| p.is_finite()).map(clamp_percent)),
+        persist_native: None,
     }
 }
 
@@ -135,6 +263,8 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         // 에이전트/모델 표시명: lterm payload의 `agent`를 모델 슬롯에 매핑(best-effort).
         model_display_name: raw_input.agent,
         context_used_percentage: None,
+        // lterm 경로는 Claude context_window가 없다(ctx는 codex enrich 등 별도 경로).
+        context_fallback_percentage: None,
         // cwd는 표시용으로만 사용한다(git 도출 안 함, $PWD 폴백 없음).
         cwd: raw_input.cwd,
         // git 세그먼트 비활성: branch를 절대 채우지 않는다(Phase 1).
@@ -297,11 +427,72 @@ struct RawCost {
     total_cost_usd: Option<f64>,
 }
 
+/// 숫자 자리에 문자열 등 다른 타입이 와도 전체 파싱을 깨지 않고 `None`으로 흡수하는 lenient f64
+/// 역직렬화기(serde `deserialize_with`용).
+///
+/// [`parse_claude_input`]은 serde 에러 시 전체를 빈 `ClaudeInput`으로 저하하므로, 한 필드의 타입
+/// 드리프트(예: 토큰 수가 문자열로 옴)가 model/cwd/cost 등 무관 세그먼트까지 함께 날리는 것을
+/// 막는다. 어떤 JSON 값이든 [`serde_json::Value`]로 받아 숫자일 때만 `f64`를 추출한다
+/// (문자열/배열/객체/불리언/null → `None`). lterm 경로의 forward-compat `Value` 수용과 같은 정신.
+fn deserialize_lenient_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?.and_then(|value| value.as_f64()))
+}
+
+/// `current_usage` 객체가 통째로 다른 타입(예: 문자열)으로 와도 전체 파싱을 깨지 않게 흡수하는
+/// lenient 역직렬화기. 객체면 [`RawCurrentUsage`]로 best-effort 변환하고, 아니면 `None`.
+fn deserialize_lenient_current_usage<'de, D>(
+    deserializer: D,
+) -> Result<Option<RawCurrentUsage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
+
 /// `context_window` 중첩 객체. `used_percentage`는 `null` 가능.
+///
+/// `used_percentage`가 권위값이지만 Claude Code가 간헐적으로 누락하므로, 토큰 기반 fallback
+/// 산출에 필요한 `context_window_size`/`total_input_tokens`/`current_usage`도 함께 받는다
+/// (전부 부재/`null` 안전, lenient). 모든 수치 필드는 [`deserialize_lenient_f64`]로 받아, 한 필드의
+/// 타입 드리프트가 statusline 전체를 무력화하지 않게 격리한다(`parse_claude_input`의 전부-None 저하
+/// 차단). 토큰 수는 float 인코딩도 견디도록 `f64`로 받는다.
 #[derive(Debug, Deserialize, Default)]
 struct RawContextWindow {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
     used_percentage: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    context_window_size: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    total_input_tokens: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_current_usage")]
+    current_usage: Option<RawCurrentUsage>,
+}
+
+/// `context_window.current_usage` 토큰 분해(입력 + 캐시 생성 + 캐시 읽기).
+///
+/// 컨텍스트를 점유하는 토큰합을 토큰 기반 ctx fallback 분자로 쓴다(omc HUD와 동형). 모든 필드는
+/// 부재/`null`/타입 드리프트 안전([`deserialize_lenient_f64`])하며, 누락 필드는 0으로 본다.
+#[derive(Debug, Deserialize, Default)]
+struct RawCurrentUsage {
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    input_tokens: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    cache_creation_input_tokens: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    cache_read_input_tokens: Option<f64>,
+}
+
+impl RawCurrentUsage {
+    /// 컨텍스트 점유 토큰합(입력 + 캐시 생성 + 캐시 읽기). 부재 필드는 0으로 본다.
+    fn total_tokens(&self) -> f64 {
+        self.input_tokens.unwrap_or(0.0)
+            + self.cache_creation_input_tokens.unwrap_or(0.0)
+            + self.cache_read_input_tokens.unwrap_or(0.0)
+    }
 }
 
 /// lterm 합성 stdin JSON(평탄 구조)을 그대로 받는 내부 역직렬화 타입(spec §4.1 계약).
@@ -381,6 +572,259 @@ mod tests {
         let raw = r#"{ "context_window": { "used_percentage": null } }"#;
         let input = parse_claude_input(raw);
         assert_eq!(input.context_used_percentage, None);
+    }
+
+    // === 토큰 기반 ctx fallback(compute_context_fallback via parse_claude_input) ===
+
+    /// used_percentage 누락 + current_usage/size 존재 → 토큰합 비율 fallback을 산출한다.
+    /// (입력 100k + 캐시생성 20k + 캐시읽기 320k = 440k) / 1,000,000 = 44%.
+    #[test]
+    fn fallback_from_current_usage_when_native_absent() {
+        let raw = r#"{ "context_window": {
+            "context_window_size": 1000000,
+            "current_usage": { "input_tokens": 100000, "cache_creation_input_tokens": 20000, "cache_read_input_tokens": 320000 }
+        } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(
+            input.context_used_percentage, None,
+            "native 누락 → context_used_percentage None"
+        );
+        assert_eq!(input.context_fallback_percentage, Some(44.0));
+    }
+
+    /// current_usage 부재/0 → total_input_tokens/size로 fallback. 450k/1,000,000 = 45%.
+    #[test]
+    fn fallback_from_total_input_when_current_usage_zero() {
+        let raw = r#"{ "context_window": {
+            "context_window_size": 1000000,
+            "total_input_tokens": 450000,
+            "current_usage": { "input_tokens": 0 }
+        } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_fallback_percentage, Some(45.0));
+    }
+
+    /// context_window_size 부재 → 분모를 모르므로 fallback None(분자만으로는 비율 불가).
+    #[test]
+    fn fallback_none_without_window_size() {
+        let raw = r#"{ "context_window": { "current_usage": { "input_tokens": 500000 } } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_fallback_percentage, None);
+    }
+
+    /// context_window_size 0/음수 → 0 분모 진입 차단, fallback None.
+    #[test]
+    fn fallback_none_with_nonpositive_size() {
+        let zero = parse_claude_input(
+            r#"{ "context_window": { "context_window_size": 0, "total_input_tokens": 100 } }"#,
+        );
+        assert_eq!(zero.context_fallback_percentage, None);
+        let negative = parse_claude_input(
+            r#"{ "context_window": { "context_window_size": -5, "total_input_tokens": 100 } }"#,
+        );
+        assert_eq!(negative.context_fallback_percentage, None);
+    }
+
+    /// 토큰이 전부 0/부재면 fallback None(0%는 표시하지 않고 생략/유지에 맡긴다).
+    #[test]
+    fn fallback_none_with_zero_tokens() {
+        let raw = r#"{ "context_window": { "context_window_size": 1000000 } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_fallback_percentage, None);
+    }
+
+    /// native와 fallback이 공존하면 둘 다 채워진다(표시 우선순위는 resolve_context_percent가 결정).
+    #[test]
+    fn native_and_fallback_both_populated() {
+        let raw = r#"{ "context_window": {
+            "used_percentage": 86.0,
+            "context_window_size": 1000000,
+            "current_usage": { "input_tokens": 980000 }
+        } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_used_percentage, Some(86.0));
+        assert_eq!(input.context_fallback_percentage, Some(98.0));
+    }
+
+    /// 토큰합이 창 크기를 초과해도 100%로 클램프한다.
+    #[test]
+    fn fallback_clamps_to_100() {
+        let raw = r#"{ "context_window": {
+            "context_window_size": 1000,
+            "current_usage": { "input_tokens": 5000 }
+        } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_fallback_percentage, Some(100.0));
+    }
+
+    /// percent_of: 반올림(33.4%→33, 33.6%→34)과 0..=100 클램프를 보장한다.
+    #[test]
+    fn percent_of_rounds_and_clamps() {
+        assert_eq!(percent_of(334.0, 1000.0), 33.0);
+        assert_eq!(percent_of(336.0, 1000.0), 34.0);
+        assert_eq!(percent_of(2.0, 1.0), 100.0);
+        assert_eq!(percent_of(0.0, 1000.0), 0.0);
+    }
+
+    // === ctx 표시값 해석(resolve_context_percent) ===
+
+    /// 양수 native가 있으면 그것을 표시하고 영속화 신호를 낸다(권위값 우선).
+    #[test]
+    fn resolve_prefers_positive_native_and_persists() {
+        let r = resolve_context_percent(Some(86.0), Some(98.0), Some(50.0));
+        assert_eq!(r.display, Some(86.0));
+        assert_eq!(r.persist_native, Some(86.0));
+    }
+
+    /// native 부재 + TTL 내 직전 native(hold) → 유지하고 영속화하지 않는다(튐 차단의 핵심).
+    #[test]
+    fn resolve_holds_previous_native_on_transient_gap() {
+        // 토큰 fallback이 98로 갈렸어도 직전 native 86을 유지해야 한다.
+        let r = resolve_context_percent(None, Some(98.0), Some(86.0));
+        assert_eq!(r.display, Some(86.0), "직전 native 유지로 86↔98 튐 차단");
+        assert_eq!(r.persist_native, None, "유지 프레임은 재영속화하지 않음");
+    }
+
+    /// native·hold 모두 없으면 토큰 fallback을 표시한다(cold-start/비-native 프로바이더).
+    #[test]
+    fn resolve_uses_fallback_when_no_native_and_no_hold() {
+        let r = resolve_context_percent(None, Some(45.0), None);
+        assert_eq!(r.display, Some(45.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// 표시할 근거가 전혀 없으면 None(세그먼트 생략, AC2 보존).
+    #[test]
+    fn resolve_yields_none_when_nothing_available() {
+        let r = resolve_context_percent(None, None, None);
+        assert_eq!(r.display, None);
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// native 0은 양수가 아니므로 hold 없을 때 토큰 fallback이 우선한다(스푸리어스 0% 회피).
+    #[test]
+    fn resolve_zero_native_defers_to_fallback() {
+        let r = resolve_context_percent(Some(0.0), Some(45.0), None);
+        assert_eq!(r.display, Some(45.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// native 0 + fallback/hold 모두 없으면 마지막 수단으로 raw native(0%)를 표시한다.
+    #[test]
+    fn resolve_zero_native_shown_as_last_resort() {
+        let r = resolve_context_percent(Some(0.0), None, None);
+        assert_eq!(r.display, Some(0.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// NaN native는 양수로 인정하지 않으며, 표시 후보에서도 제외한다(비유한 방어).
+    #[test]
+    fn resolve_rejects_nonfinite_native() {
+        let r = resolve_context_percent(Some(f64::NAN), None, Some(70.0));
+        assert_eq!(r.display, Some(70.0), "NaN native 무시 → hold 사용");
+        assert_eq!(r.persist_native, None);
+        let cold = resolve_context_percent(Some(f64::NAN), None, None);
+        assert_eq!(cold.display, None, "NaN은 raw native 표시 후보에서도 제외");
+    }
+
+    /// 실제 급감(/compact): fallback이 held보다 tolerance 이상 낮으면 hold를 깨고 fallback 반영.
+    #[test]
+    fn resolve_breaks_hold_on_real_drop() {
+        // held 86, /compact 후 토큰 fallback 20 → 86-12=74 이하이므로 유지를 깨고 20을 표시.
+        let r = resolve_context_percent(None, Some(20.0), Some(86.0));
+        assert_eq!(r.display, Some(20.0), "급감은 즉시 반영(stale-high 방지)");
+        assert_eq!(r.persist_native, None, "토큰 fallback은 영속화하지 않음");
+    }
+
+    /// 작은 하강(tolerance 이내)은 노이즈로 보고 직전 native를 유지한다.
+    #[test]
+    fn resolve_holds_on_small_dip_within_tolerance() {
+        // held 86, fallback 78 → 86-78=8 < 12 → 유지(상승 노이즈와 동급의 미세 하강은 흡수).
+        let r = resolve_context_percent(None, Some(78.0), Some(86.0));
+        assert_eq!(r.display, Some(86.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// 하강 가드 경계: 정확히 held-tolerance면 깨고, 그보다 한 단계 위면 유지한다.
+    #[test]
+    fn resolve_drop_guard_boundary() {
+        // 86-12=74: fallback 74는 '이하'라 깸, 75는 유지.
+        assert_eq!(
+            resolve_context_percent(None, Some(74.0), Some(86.0)).display,
+            Some(74.0)
+        );
+        assert_eq!(
+            resolve_context_percent(None, Some(75.0), Some(86.0)).display,
+            Some(86.0)
+        );
+    }
+
+    /// 토큰 fallback이 없으면(급감 판정 불가) 직전 native를 유지한다.
+    #[test]
+    fn resolve_holds_when_no_fallback_to_compare() {
+        let r = resolve_context_percent(None, None, Some(86.0));
+        assert_eq!(r.display, Some(86.0));
+        assert_eq!(r.persist_native, None);
+    }
+
+    /// 비정상 상한 native(>100)는 표시·영속 전에 0..=100으로 클램프한다(캐시 전파 차단).
+    #[test]
+    fn resolve_clamps_out_of_range_native() {
+        let r = resolve_context_percent(Some(150.0), None, None);
+        assert_eq!(r.display, Some(100.0));
+        assert_eq!(r.persist_native, Some(100.0), "클램프된 값만 영속화");
+    }
+
+    // === 타입 드리프트 leniency(신규 토큰 필드가 statusline 전체를 무력화하지 않음) ===
+
+    /// 신규 토큰 필드가 문자열로 와도(타입 드리프트) 파싱이 통째로 깨지지 않고, 무관 필드는 보존된다.
+    #[test]
+    fn token_field_type_drift_preserves_other_fields() {
+        let raw = r#"{
+            "model": { "display_name": "Opus" },
+            "context_window": { "context_window_size": 1000000, "used_percentage": 86.0, "total_input_tokens": "oops" }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(
+            input.model_display_name.as_deref(),
+            Some("Opus"),
+            "model 보존"
+        );
+        assert_eq!(
+            input.context_used_percentage,
+            Some(86.0),
+            "used_percentage 보존"
+        );
+        // total_input_tokens가 문자열이라 fallback 분자로 못 쓰지만 패닉/전체 None 저하는 없다.
+        assert_eq!(input.context_fallback_percentage, None);
+    }
+
+    /// current_usage 내부 토큰이 문자열이어도 흡수하고, 유효한 used_percentage는 보존한다.
+    #[test]
+    fn current_usage_token_drift_is_absorbed() {
+        let raw = r#"{
+            "model": { "display_name": "Opus" },
+            "context_window": { "context_window_size": 1000000, "current_usage": { "input_tokens": "big" } }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(
+            input.context_fallback_percentage, None,
+            "문자열 토큰은 0 취급 → fallback 없음"
+        );
+    }
+
+    /// current_usage 객체 자체가 다른 타입(문자열)으로 와도 전체 파싱이 깨지지 않는다.
+    #[test]
+    fn current_usage_wrong_object_type_is_absorbed() {
+        let raw = r#"{
+            "model": { "display_name": "Opus" },
+            "context_window": { "context_window_size": 1000000, "total_input_tokens": 450000, "current_usage": "nope" }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.model_display_name.as_deref(), Some("Opus"));
+        // current_usage는 흡수(None), total_input_tokens fallback이 살아 45% 산출.
+        assert_eq!(input.context_fallback_percentage, Some(45.0));
     }
 
     /// 필드 누락: 부재 필드는 전부 None이어야 한다(에러/패닉 없음).

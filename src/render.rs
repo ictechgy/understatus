@@ -583,6 +583,7 @@ mod tests {
         ClaudeInput {
             model_display_name: Some("Opus".to_string()),
             context_used_percentage: Some(42.0),
+            context_fallback_percentage: None,
             cwd: Some("/Users/dev/proj".to_string()),
             git_branch: Some("main".to_string()),
             cost_usd: Some(1.23),
