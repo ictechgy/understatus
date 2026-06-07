@@ -907,6 +907,9 @@ mod tests {
     /// 충돌/오염 방지를 위해 프로세스 고유 키를 쓰고 끝나면 정리한다(HOME은 macOS 전용 보장).
     #[test]
     fn net_delta_session_independent() {
+        // HOME 기반 세션 캐시를 write→read 라운드트립하지만, 프로세스 고유 키(pid 접미사)만 쓰고
+        // 더는 어떤 테스트도 HOME을 swap하지 않으므로(codex 통합 테스트가 base 주입으로 전환됨)
+        // 베이스 경로 교란이 없어 직렬화 락이 불필요하다.
         const NET_CACHE_FILE: &str = "net_counters";
         let pid = std::process::id();
         let key_a = format!("netindep-A-{pid}");

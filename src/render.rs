@@ -161,11 +161,58 @@ fn collect_segments(
         }
     }
 
+    // Codex 한도/요금제/effort(lterm+codex 소스 전용, spec §6). input.codex가 Some일 때만,
+    // 그 안의 각 Option이 Some일 때만 추가한다(기존 None-skip 패턴 동형). Claude 경로는
+    // codex=None이라 신규 세그먼트 0 → 기존 출력/바이트 보존.
+    if let Some(codex) = input.codex.as_ref() {
+        // 5h 한도%(priority 48): 라벨 "5h" dim + 값 색 없음.
+        if let Some(rate_5h) = codex.rate_5h_percent {
+            segments.push(label_value_segment(
+                "5h",
+                &format!("{rate_5h:.0}%"),
+                48,
+                cfg,
+                color_on,
+            ));
+        }
+        // 주간 한도%(priority 46): 라벨 "wk" dim + 값 색 없음.
+        if let Some(rate_weekly) = codex.rate_weekly_percent {
+            segments.push(label_value_segment(
+                "wk",
+                &format!("{rate_weekly:.0}%"),
+                46,
+                cfg,
+                color_on,
+            ));
+        }
+        // plan(priority 26): bare value(라벨 없음, 예 "pro").
+        if let Some(plan) = codex.plan.as_deref() {
+            if !plan.is_empty() {
+                segments.push(value_segment(plan, 26));
+            }
+        }
+        // effort(priority 24): bare value(라벨 없음, 예 "xhigh").
+        if let Some(effort) = codex.effort.as_deref() {
+            if !effort.is_empty() {
+                segments.push(value_segment(effort, 24));
+            }
+        }
+    }
+
     // cwd/git 브랜치: git_branch 우선. git 마커 ⎇ dim + 브랜치명 값 색 없음.
     if cfg.display.show_git {
         if let Some(branch) = input.git_branch.as_deref() {
             if !branch.is_empty() {
                 segments.push(label_value_segment("⎇", branch, 40, cfg, color_on));
+            }
+        }
+    }
+    // lterm 세션/페인 라벨(예 "codex/%3"): cwd 바로 앞 배치. bare value(cwd와 동일 스타일).
+    // priority 35 = cwd 30 위, git 40 아래. Claude 경로는 session_label=None이라 미표시.
+    if cfg.display.show_session {
+        if let Some(label) = input.session_label.as_deref() {
+            if !label.is_empty() {
+                segments.push(value_segment(label, 35));
             }
         }
     }
@@ -540,6 +587,8 @@ mod tests {
             git_branch: Some("main".to_string()),
             cost_usd: Some(1.23),
             session_id: Some("sess-1".to_string()),
+            session_label: None,
+            codex: None,
         }
     }
 
@@ -792,6 +841,47 @@ mod tests {
         );
         // 핵심 CPU 세그먼트는 유지.
         assert!(line.contains("10%"), "핵심 CPU 세그먼트는 유지: {line:?}");
+    }
+
+    #[test]
+    fn render_shows_session_label_when_some() {
+        // session_label=Some("codex/%3")면 출력에 "codex/%3"가 cwd("proj") 앞에 표시된다.
+        let mut input = sample_input();
+        input.session_label = Some("codex/%3".to_string());
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let line = render(&input, &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            line.contains("codex/%3"),
+            "session_label이 있으면 표시되어야 함: {line:?}"
+        );
+    }
+
+    #[test]
+    fn render_omits_session_label_when_none() {
+        // session_label=None(Claude 경로 등)이면 표시되지 않는다(기존 출력 보존).
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let line = render(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            !line.contains('/'),
+            "session_label None이면 세션 세그먼트 없음(cwd는 basename만): {line:?}"
+        );
+    }
+
+    #[test]
+    fn render_omits_session_label_when_toggle_off() {
+        // show_session=false면 session_label이 있어도 표시하지 않는다.
+        let mut input = sample_input();
+        input.session_label = Some("codex/%3".to_string());
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        cfg.display.show_session = false;
+        let line = render(&input, &sample_snap(10.0), &cfg, 0, false);
+        assert!(
+            !line.contains("codex/%3"),
+            "show_session=false면 라벨이 있어도 생략: {line:?}"
+        );
     }
 
     #[test]

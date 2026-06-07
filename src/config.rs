@@ -31,6 +31,8 @@ pub struct Config {
     pub color: ColorConfig,
     /// `[refresh]`: settings.json refreshInterval 주입값.
     pub refresh: RefreshConfig,
+    /// `[codex]`: Codex 세션 심층판독(opt-out, freshness, 스캔 일수).
+    pub codex: CodexConfig,
 }
 
 /// `[cpu]` 섹션. 임계값은 진짜 순간 CPU%(0–100) 기준.
@@ -104,6 +106,8 @@ pub struct DisplayConfig {
     pub show_context: bool,
     /// git 브랜치(workspace.git_worktree/repo 파생) 노출.
     pub show_git: bool,
+    /// lterm 세션/페인 라벨(예 "codex/%3") 노출. lterm 소스 전용(Claude 경로는 미표시).
+    pub show_session: bool,
     /// 배터리(P2, IOKit + TTL 캐시) 노출.
     pub show_battery: bool,
     /// 디스크 사용률(P2, statfs("/")) 노출.
@@ -144,6 +148,21 @@ pub struct ColorConfig {
 pub struct RefreshConfig {
     /// 주입할 refreshInterval 초. 기본 1(부드러운 ~6–8초 펄스 출렁임).
     pub interval_seconds: u64,
+}
+
+/// `[codex]` 섹션. Codex 세션 심층판독(`render --source lterm` + agent=codex)의 토글/한도.
+///
+/// `enabled=false`면 `~/.codex`를 일절 읽지 않는다(프라이버시/성능 opt-out, spec §2.5).
+/// freshness/scan_days는 후보 스캔의 바운디드 비용 상한이다(spec §5/§8).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    /// Codex 세션 심층판독 활성 여부. 기본 true(opt-out). false면 `~/.codex` 무접촉.
+    pub enabled: bool,
+    /// 후보 rollout 파일의 mtime 신선도 상한(분). 기본 240(4시간). 초과 후보는 제외.
+    pub freshness_minutes: u64,
+    /// 스캔할 최근 일자 디렉터리 수. 기본 3(전체 4400+ 디렉터리 풀스캔 회피, spec §5).
+    pub scan_days: usize,
 }
 
 impl Default for CpuConfig {
@@ -194,6 +213,7 @@ impl Default for DisplayConfig {
             show_cost: true,
             show_context: true,
             show_git: true,
+            show_session: true,
             show_battery: true,
             show_disk: true,
             show_network: true,
@@ -231,6 +251,17 @@ impl Default for RefreshConfig {
     }
 }
 
+impl Default for CodexConfig {
+    /// 사용자 승인 기본값(spec §13): enabled=true(opt-out), freshness=240분, scan_days=3.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            freshness_minutes: 240,
+            scan_days: 3,
+        }
+    }
+}
+
 /// `theme` 필드의 serde 기본값("calm"). 키 부재 = calm = 현행 동일(하위호환).
 fn default_theme() -> String {
     "calm".to_string()
@@ -249,6 +280,7 @@ impl Default for Config {
             display: DisplayConfig::default(),
             color: ColorConfig::default(),
             refresh: RefreshConfig::default(),
+            codex: CodexConfig::default(),
         }
     }
 }
@@ -452,6 +484,7 @@ mod tests {
         assert_eq!(config.chain.chain_cache_ttl_seconds, 10);
         assert_eq!(config.chain.chain_timeout_ms, 500);
         assert_eq!(config.display.max_width, 80);
+        assert!(config.display.show_session);
         assert!(config.display.show_disk);
         assert!(config.display.show_network);
         assert!(config.display.show_battery);

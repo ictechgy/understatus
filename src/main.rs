@@ -11,6 +11,7 @@
 
 mod chain;
 mod claude;
+mod codex;
 mod config;
 mod install;
 mod render;
@@ -480,7 +481,7 @@ fn run_render_pipeline(source: Source, oneline: bool) {
     let raw_stdin = read_stdin();
 
     // (2) 소스별 세션 정보 파싱(누락/null/깨진 JSON 안전). lterm은 git 비활성.
-    let claude_input = match source {
+    let mut claude_input = match source {
         Source::Claude => claude::parse_claude_input(&raw_stdin),
         Source::Lterm => claude::parse_lterm_input(&raw_stdin),
     };
@@ -490,6 +491,13 @@ fn run_render_pipeline(source: Source, oneline: bool) {
 
     // (5) 설정 로드(부재/깨짐 시 기본값).
     let cfg = config::load_config();
+
+    // (5') Codex 세션 심층판독 enrich(spec §7). **Source::Lterm 한정**: Claude 경로에서 모델
+    //   별칭이 우연히 codex 계열이어도 ~/.codex를 읽지 않도록 여기서 게이팅한다(비트 동일 보존).
+    //   enrich는 session_id를 바꾸지 않으므로 위 session_key 도출/이후 파이프라인에 영향 없다.
+    if source == Source::Lterm {
+        codex::maybe_enrich(&mut claude_input, &cfg);
+    }
 
     // (3)(4) 시스템 스냅샷 수집(더블샘플 CPU + 메모리 + 배터리).
     let snapshot = system::sample_system(&cfg, &session_key);

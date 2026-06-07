@@ -4,6 +4,7 @@
 //! 모든 필드는 `Option`이며 파싱 자체가 실패해도 절대 패닉하지 않고
 //! 전부 `None`인 빈 `ClaudeInput`으로 안전 저하한다(lenient).
 
+use crate::codex::CodexExtras;
 use serde::Deserialize;
 
 /// understatus이 라인 렌더에 사용하는 Claude 세션 정보의 평탄화된 뷰.
@@ -29,6 +30,11 @@ pub struct ClaudeInput {
     pub cost_usd: Option<f64>,
     /// 세션 식별자 (`session_id`).
     pub session_id: Option<String>,
+    /// lterm 세션/페인 표시용(예 "codex/%3"). lterm 소스 전용, Claude 경로는 None.
+    pub session_label: Option<String>,
+    /// Codex 세션 심층판독으로 enrich된 추가 필드(5h/주간 한도·plan·effort). lterm/codex 소스 전용.
+    /// Claude 경로는 항상 `None`(비트 동일 보장, spec §6). `crate::codex::maybe_enrich`가 채운다.
+    pub codex: Option<CodexExtras>,
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -80,6 +86,10 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
         git_branch,
         cost_usd,
         session_id: raw_input.session_id,
+        // Claude 경로는 세션/페인 표시 라벨이 없다(lterm 소스 전용).
+        session_label: None,
+        // Claude 경로는 Codex enrich 대상이 아니다(비트 동일 보장, spec §6).
+        codex: None,
     }
 }
 
@@ -111,11 +121,15 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         Err(_) => return ClaudeInput::default(),
     };
 
-    // session_key는 명시값을 우선하고, 없으면 "<session>/<pane>"로 합성한다(캐시/펄스 격리).
+    // 세션/페인 표시 라벨("session/pane"/"session"/"pane"/None)을 미리 합성해 둔다.
+    // session_key 합성과 동일 규칙이므로 재사용해 synthesize_session_key 중복 호출을 없앤다.
+    let session_label = synthesize_session_key(&raw_input.session, &raw_input.pane);
+
+    // session_key는 명시값을 우선하고, 없으면 위에서 합성한 라벨을 재사용한다(캐시/펄스 격리).
     let session_key = raw_input
         .session_key
         .filter(|key| !key.is_empty())
-        .or_else(|| synthesize_session_key(&raw_input.session, &raw_input.pane));
+        .or_else(|| session_label.clone());
 
     ClaudeInput {
         // 에이전트/모델 표시명: lterm payload의 `agent`를 모델 슬롯에 매핑(best-effort).
@@ -127,6 +141,10 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         git_branch: None,
         cost_usd: None,
         session_id: session_key,
+        // lterm 세션/페인 표시 라벨(status row에 cwd 앞 표시용).
+        session_label,
+        // codex enrich는 호출부(main.rs)에서 Source::Lterm 한정으로 별도 수행한다(초기 None).
+        codex: None,
     }
 }
 
@@ -582,6 +600,42 @@ mod tests {
         let with_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1", "version": 99 }"#);
         let without_version = parse_lterm_input(r#"{ "session": "s", "pane": "%1" }"#);
         assert_eq!(with_version, without_version);
+    }
+
+    /// session_label은 session/pane으로 "session/pane" 형식으로 합성된다(표시용).
+    #[test]
+    fn lterm_session_label_synthesized_from_session_and_pane() {
+        let raw = r#"{ "session": "codex", "pane": "%3", "cwd": "/x/proj" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.session_label.as_deref(), Some("codex/%3"));
+    }
+
+    /// session_label 합성은 한쪽만 있으면 있는 쪽만 쓰고, 둘 다 없으면 None이다(session_key와 동일 규칙).
+    #[test]
+    fn lterm_session_label_partial_and_absent() {
+        let only_session = parse_lterm_input(r#"{ "session": "codex" }"#);
+        assert_eq!(only_session.session_label.as_deref(), Some("codex"));
+        let only_pane = parse_lterm_input(r#"{ "pane": "%2" }"#);
+        assert_eq!(only_pane.session_label.as_deref(), Some("%2"));
+        let neither = parse_lterm_input(r#"{ "cwd": "/x" }"#);
+        assert_eq!(neither.session_label, None);
+    }
+
+    /// 명시 session_key가 있어도 session_label은 session/pane 합성값을 따른다(별개 슬롯).
+    #[test]
+    fn lterm_session_label_independent_of_explicit_session_key() {
+        let raw = r#"{ "session": "codex", "pane": "%7", "session_key": "stable-key" }"#;
+        let input = parse_lterm_input(raw);
+        assert_eq!(input.session_id.as_deref(), Some("stable-key"));
+        assert_eq!(input.session_label.as_deref(), Some("codex/%7"));
+    }
+
+    /// 빈 lterm 객체와 Claude 입력은 session_label이 None이어야 한다(표시용 라벨 부재).
+    #[test]
+    fn session_label_none_for_empty_and_claude() {
+        assert_eq!(parse_lterm_input("{}").session_label, None);
+        let claude = parse_claude_input(r#"{ "session_id": "s", "cwd": "/x" }"#);
+        assert_eq!(claude.session_label, None);
     }
 
     /// 미소비/forward-compat 필드(version/cols/rows)가 타입 드리프트(문자열 등)해도
