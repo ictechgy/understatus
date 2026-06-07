@@ -469,6 +469,83 @@ fn print_themes() {
     }
 }
 
+/// ctx native hold 세션 캐시 파일명. used_percentage가 누락된 프레임에서 직전 양수 native를
+/// 유지해 토큰 fallback으로의 값 튐을 막는다(pulse_state/net_counters와 동일한 단기 TTL 캐시 예외).
+const CONTEXT_NATIVE_CACHE: &str = "ctx_native";
+
+/// 직전 native ctx를 유지하는 최대 시간(초). 이보다 오래 native가 누락되면 토큰 fallback으로 저하한다.
+///
+/// native 누락은 통상 첫 API 호출 전·`/compact` 직후의 소수 프레임 현상이므로, refreshInterval
+/// (통상 5s) 기준 그 수 배(≈6프레임)를 메우는 30초로 둔다. 실제 컨텍스트 급감은 hold 자체의 비대칭
+/// 하강 가드([`claude::resolve_context_percent`])가 즉시 반영하므로 stale-high 노출은 가드가 막고,
+/// 이 TTL은 가드가 닿지 못하는 장기 누락의 상한선 역할만 한다.
+const CONTEXT_HOLD_TTL_SECONDS: u64 = 30;
+
+/// Claude 소스의 ctx 사용률%를 해석해 `claude_input.context_used_percentage`에 확정한다.
+///
+/// [`claude::resolve_context_percent`]로 native·토큰 fallback·직전 native(hold)를 종합한다.
+/// 양수 native를 본 프레임에서는 그 값을 세션 캐시에 기록해 이후 누락 프레임이 유지(hold)에
+/// 쓰도록 한다. 모든 캐시 I/O는 best-effort이며 실패해도 패닉하지 않는다.
+///
+/// # 인자
+/// - `claude_input`: 해석 결과를 반영할 입력(in-place 갱신).
+/// - `session_key`: 세션 캐시 격리 키(이미 살균됨).
+/// - `now_ms`: 현재 시각(epoch ms). TTL 판정·캐시 타임스탬프에 사용.
+fn resolve_claude_context(claude_input: &mut claude::ClaudeInput, session_key: &str, now_ms: u128) {
+    let held_native = read_held_native_ctx(session_key, now_ms);
+    let resolution = claude::resolve_context_percent(
+        claude_input.context_used_percentage,
+        claude_input.context_fallback_percentage,
+        held_native,
+    );
+    claude_input.context_used_percentage = resolution.display;
+    // 양수 native를 본 프레임만 영속화한다(유지 프레임은 재기록하지 않아 TTL이 마지막 실제
+    // native 시점부터 흐른다). f64 전체 정밀도로 저장하고 표시 시 반올림한다.
+    if let Some(native) = resolution.persist_native {
+        chain::write_session_named_cache(
+            session_key,
+            CONTEXT_NATIVE_CACHE,
+            now_ms,
+            &format!("{native}"),
+        );
+    }
+}
+
+/// 세션 캐시에서 TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내 직전 양수 native ctx%를 읽는다.
+///
+/// I/O(세션 캐시 읽기)는 여기서 하고, TTL·파싱·유한성 판정은 순수 [`interpret_held_native_ctx`]에
+/// 위임해 HOME 의존 없이 단위 테스트할 수 있게 한다.
+///
+/// # 반환
+/// 신선한 직전 native가 있으면 `Some(percent)`. 항목 부재/stale/파싱 실패/비유한이면 `None`.
+fn read_held_native_ctx(session_key: &str, now_ms: u128) -> Option<f64> {
+    let entry = chain::read_session_named_cache(session_key, CONTEXT_NATIVE_CACHE);
+    interpret_held_native_ctx(entry, now_ms)
+}
+
+/// 세션 캐시 읽기 결과 `(written_ms, payload)`를 직전 native ctx%로 해석한다(순수, I/O 없음).
+///
+/// `read_held_native_ctx`의 판정 로직을 분리해 tempdir/HOME 스왑 없이 TTL 경계·`f64` 라운드트립
+/// (`format!("{native}")` ↔ `parse::<f64>()`)·비유한 방어를 테스트 가능하게 한다.
+///
+/// # 인자
+/// - `entry`: 캐시 읽기 결과. `None`이면 항목 부재.
+/// - `now_ms`: 현재 시각(epoch ms). TTL 판정 기준.
+///
+/// # 반환
+/// TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내이고 유한한 `f64`로 파싱되면 `Some(percent)`, 아니면 `None`.
+fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Option<f64> {
+    let (written_ms, payload) = entry?;
+    if !chain::is_named_cache_fresh(written_ms, now_ms, CONTEXT_HOLD_TTL_SECONDS) {
+        return None;
+    }
+    payload
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|percent| percent.is_finite())
+}
+
 /// 렌더 파이프라인을 실행하고 합성된 한 줄을 stdout에 출력한다.
 ///
 /// 계획서 §D-1의 8단계를 순서대로 호출한다. 본 함수는 실제 배선(stdin 읽기/단계 연결/출력)을 담당한다.
@@ -516,6 +593,14 @@ fn run_render_pipeline(source: Source, oneline: bool) {
     let now_ms = now_millis();
     let pulse_on = theme::pulse_gate(snapshot.cpu_percent, prev_pulse_on, &cfg);
     chain::write_pulse_state(pulse_on, &session_key);
+
+    // (5'') ctx 해석(Claude 소스 한정): native(used_percentage) 우선, 일시 누락 시 TTL 내 직전
+    //   native 유지, cold-start만 토큰 fallback. Claude Code가 used_percentage를 간헐적으로 누락해도
+    //   ctx 세그먼트가 사라지지 않게 하고, native↔토큰 분모 차이로 인한 값 튐(예: 86↔98)을 막는다.
+    //   lterm/codex 경로는 context_window가 없어 자연 no-op이므로 Claude로 게이팅한다.
+    if source == Source::Claude {
+        resolve_claude_context(&mut claude_input, &session_key, now_ms);
+    }
 
     // (6) understatus 자체 세그먼트 렌더.
     let self_segment = render::render(&claude_input, &snapshot, &cfg, now_ms, pulse_on);
@@ -914,5 +999,59 @@ mod tests {
         let mut writer = Vec::new();
         let (interval, _) = resolve_install_params(&args, &mut reader, &mut writer, true, Some(10));
         assert_eq!(interval, 10);
+    }
+
+    // === ctx hold 캐시 해석(interpret_held_native_ctx, 순수) ===
+
+    /// 캐시 항목 부재면 None(유지값 없음).
+    #[test]
+    fn interpret_held_missing_entry_is_none() {
+        assert_eq!(interpret_held_native_ctx(None, 10_000), None);
+    }
+
+    /// TTL 내 정수/소수 payload는 그대로 복원된다(`format!`↔`parse` 라운드트립).
+    #[test]
+    fn interpret_held_roundtrips_writer_format() {
+        // resolve_claude_context가 쓰는 직렬화(`format!("{native}")`)와 동일 경로를 검증.
+        for value in [86.0_f64, 33.7, 100.0, 0.0, 12.5] {
+            let payload = format!("{value}");
+            assert_eq!(
+                interpret_held_native_ctx(Some((1_000, payload)), 1_000),
+                Some(value),
+                "값 {value} 라운드트립 실패",
+            );
+        }
+    }
+
+    /// TTL 경계: 정확히 TTL이면 신선(유지), 1ms 초과면 stale(None).
+    #[test]
+    fn interpret_held_respects_ttl_boundary() {
+        let ttl_ms = (CONTEXT_HOLD_TTL_SECONDS as u128) * 1_000;
+        let at_ttl = interpret_held_native_ctx(Some((1_000, "86".to_string())), 1_000 + ttl_ms);
+        assert_eq!(at_ttl, Some(86.0), "경계(정확히 TTL)는 유지");
+        let past_ttl =
+            interpret_held_native_ctx(Some((1_000, "86".to_string())), 1_000 + ttl_ms + 1);
+        assert_eq!(past_ttl, None, "TTL 초과는 stale → None");
+    }
+
+    /// 시계 역행(now < written)은 보수적으로 stale 처리한다.
+    #[test]
+    fn interpret_held_clock_skew_is_stale() {
+        assert_eq!(
+            interpret_held_native_ctx(Some((2_000, "86".to_string())), 1_000),
+            None
+        );
+    }
+
+    /// 손상/비숫자/비유한 payload는 안전하게 None으로 저하한다(패닉 없음).
+    #[test]
+    fn interpret_held_rejects_garbage_and_nonfinite() {
+        for bad in ["abc", "", "NaN", "inf", "-inf"] {
+            assert_eq!(
+                interpret_held_native_ctx(Some((1_000, bad.to_string())), 1_000),
+                None,
+                "payload {bad:?}는 None이어야 함",
+            );
+        }
     }
 }
