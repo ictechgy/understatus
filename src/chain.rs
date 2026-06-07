@@ -543,7 +543,7 @@ fn strip_ansi(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             chars.next(); // '[' 소비
-            // 종료 문자 'm'까지 소비(SGR).
+                          // 종료 문자 'm'까지 소비(SGR).
             for nc in chars.by_ref() {
                 if nc == 'm' {
                     break;
