@@ -511,6 +511,170 @@ fn trim_trailing_newline(value: &str) -> String {
         .to_string()
 }
 
+/// 체인 자식(예: omc HUD) 출력에서 ctx 표시를 제거한다.
+///
+/// understatus가 Claude payload의 `used_percentage`를 권위있게 표시하므로, 체인 HUD가 같은
+/// 값을(그리고 누락 프레임엔 토큰비율로 자체 계산한 다른 값을) 중복 표시해 ctx가 튀어 보이는
+/// 것을 막는다. 제거 대상:
+/// - 인라인 `ctx:NN%` 토큰(앞 ` | ` 구분자와 `CRITICAL`/`COMPRESS?` 접미, 둘러싼 ANSI 포함).
+/// - `[!] ctx … run /compact` 형태의 ctx 컴팩트 경고 줄(통째 제거).
+///
+/// 나머지 ANSI(SGR) 색은 보존하고 ctx 부분만 외과적으로 제거한다. ctx 토큰이 없으면 그대로 둔다.
+pub fn strip_chained_context(input: &str) -> String {
+    input
+        .split('\n')
+        .filter(|line| !is_ctx_advisory_line(line))
+        .map(strip_inline_ctx_segment)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 줄이 ctx 컴팩트 경고(`[!] ctx … /compact`)인지 판정한다(ANSI 제거·트림 후).
+fn is_ctx_advisory_line(line: &str) -> bool {
+    let trimmed = strip_ansi(line);
+    let trimmed = trimmed.trim();
+    trimmed.starts_with("[!") && trimmed.contains("ctx") && trimmed.contains("compact")
+}
+
+/// 문자열에서 ANSI SGR(`\x1b[…m`) 시퀀스를 제거한 가시 텍스트를 반환한다(경고줄 판정용).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // '[' 소비
+            // 종료 문자 'm'까지 소비(SGR).
+            for nc in chars.by_ref() {
+                if nc == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 한 줄에서 첫 인라인 `ctx:NN%` 토큰(+접미/구분자/ANSI)을 제거한다. 없으면 그대로 반환.
+fn strip_inline_ctx_segment(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let Some(idx) = find_ctx_label(bytes) else {
+        return line.to_string();
+    };
+
+    // "ctx:" 다음 ANSI* → (선택)bar `[…]` → 숫자+ → '%' 형태를 확인(아니면 안전하게 미변경).
+    let mut end = skip_ansi_forward(bytes, idx + 4);
+    // bar 모드(`ctx:[████░░]NN%`): '[' 이후 첫 ']'까지 건너뛴다. 블록 글리프(█/░)와 ANSI는
+    // 바이트 ']'(0x5d)를 포함하지 않으므로 첫 ']' 바이트가 곧 bar의 닫는 괄호다.
+    if end < bytes.len() && bytes[end] == b'[' {
+        end += 1;
+        while end < bytes.len() && bytes[end] != b']' {
+            end += 1;
+        }
+        if end < bytes.len() {
+            end += 1; // ']'
+        }
+        end = skip_ansi_forward(bytes, end);
+    }
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start || end >= bytes.len() || bytes[end] != b'%' {
+        return line.to_string();
+    }
+    end += 1; // '%'
+    end = skip_ansi_forward(bytes, end);
+    // 선택적 심각도 접미.
+    for suffix in [" CRITICAL", " COMPRESS?"] {
+        if line[end..].starts_with(suffix) {
+            end += suffix.len();
+            break;
+        }
+    }
+    end = skip_ansi_forward(bytes, end);
+
+    // 앞쪽: ctx 라벨 직전 ANSI + ` | ` 구분자 소비.
+    let mut start = skip_ansi_backward(bytes, idx);
+    start = consume_leading_separator(bytes, start);
+
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..start]);
+    out.push_str(&line[end..]);
+    out
+}
+
+/// 토큰 경계(앞 ANSI를 건너뛴 직전 문자가 영숫자가 아님)를 만족하는 첫 `ctx:` 인덱스를 찾는다.
+///
+/// 앞 ANSI를 건너뛰는 이유: omc는 dim 구분자 reset(`\x1b[0m`) 직후 `ctx:`를 출력하는데, 그
+/// reset의 끝 문자 `m`이 영숫자라 단순 경계 검사면 색칠된 ctx를 놓친다. ANSI를 건너뛰면 그 앞의
+/// 실제 구분자 공백/파이프를 보고 판정하므로 `subctx:` 같은 단어 내부는 여전히 배제된다.
+fn find_ctx_label(b: &[u8]) -> Option<usize> {
+    let needle = b"ctx:";
+    let mut i = 0;
+    while i + needle.len() <= b.len() {
+        if &b[i..i + needle.len()] == needle {
+            let prev = skip_ansi_backward(b, i);
+            if prev == 0 || !b[prev - 1].is_ascii_alphanumeric() {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `i`에서 시작하는 ANSI SGR 시퀀스를 0개 이상 건너뛴 끝 인덱스를 반환한다.
+fn skip_ansi_forward(b: &[u8], mut i: usize) -> usize {
+    while i + 1 < b.len() && b[i] == 0x1b && b[i + 1] == b'[' {
+        let mut j = i + 2;
+        while j < b.len() && (b[j].is_ascii_digit() || b[j] == b';') {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'm' {
+            i = j + 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// `i` 바로 앞에 끝나는 ANSI SGR 시퀀스를 0개 이상 건너뛴 시작 인덱스를 반환한다.
+/// "session:0m"처럼 ANSI가 아닌 끝-`m`은 `\x1b[` 시작이 없으므로 건너뛰지 않는다.
+fn skip_ansi_backward(b: &[u8], mut i: usize) -> usize {
+    while i > 0 && b[i - 1] == b'm' {
+        let mut k = i - 1; // 'm' 위치
+        while k > 0 && (b[k - 1].is_ascii_digit() || b[k - 1] == b';') {
+            k -= 1;
+        }
+        if k >= 2 && b[k - 1] == b'[' && b[k - 2] == 0x1b {
+            i = k - 2;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// `start` 바로 앞의 ` | ` 구분자(둘러싼 공백/ANSI 포함)를 소비한 새 시작 인덱스를 반환한다.
+/// 구분자가 없으면 `start`를 그대로 반환한다.
+fn consume_leading_separator(b: &[u8], start: usize) -> usize {
+    let mut k = start;
+    while k > 0 && b[k - 1] == b' ' {
+        k -= 1;
+    }
+    if k == 0 || b[k - 1] != b'|' {
+        return start; // 파이프 구분자 없음 → 미소비.
+    }
+    k -= 1; // '|' 소비
+    while k > 0 && b[k - 1] == b' ' {
+        k -= 1;
+    }
+    skip_ansi_backward(b, k) // '|' 앞 dim 시작 ANSI 소비.
+}
+
 /// 현재 시각을 UNIX epoch 기준 밀리초(ms)로 반환한다.
 ///
 /// # 반환
@@ -834,5 +998,116 @@ mod tests {
                 "battery가 sessions/로 들어감: {global_str}"
             );
         }
+    }
+
+    // === 체인 ctx 제거(strip_chained_context, omc HUD ctx 튐 차단) ===
+
+    /// 평문(무색) omc 라인: 인라인 ctx 토큰과 앞 ` | ` 구분자만 제거되고 나머지는 보존.
+    #[test]
+    fn strip_ctx_plain_inline_removed() {
+        let input = "[OMC#4.14.2] | Model: Opus 4.8 | 5h:3% wk:80% | session:0m | ctx:98% CRITICAL";
+        let expected = "[OMC#4.14.2] | Model: Opus 4.8 | 5h:3% wk:80% | session:0m";
+        assert_eq!(strip_chained_context(input), expected);
+    }
+
+    /// COMPRESS? 접미도 함께 제거된다.
+    #[test]
+    fn strip_ctx_compress_suffix_removed() {
+        assert_eq!(
+            strip_chained_context("a | session:0m | ctx:75% COMPRESS?"),
+            "a | session:0m"
+        );
+    }
+
+    /// 접미 없는 ctx(정상 범위)도 제거된다.
+    #[test]
+    fn strip_ctx_no_suffix_removed() {
+        assert_eq!(strip_chained_context("a | b | ctx:42%"), "a | b");
+    }
+
+    /// ANSI 색이 둘러싼 ctx 토큰과 dim 구분자가 제거되고, 다른 세그먼트의 색은 보존된다.
+    #[test]
+    fn strip_ctx_colored_inline_removed_keeps_other_ansi() {
+        // dim(" | ") = \x1b[2m | \x1b[0m, ctx 값은 RED + RESET, 접미 " CRITICAL".
+        let input = "\x1b[1m[OMC]\x1b[0m\x1b[2m | \x1b[0m\x1b[33mwk:80%\x1b[0m\x1b[2m | \x1b[0msession:0m\x1b[2m | \x1b[0mctx:\x1b[31m98% CRITICAL\x1b[0m";
+        let out = strip_chained_context(input);
+        assert!(!out.contains("ctx:"), "ctx 토큰이 남음: {out:?}");
+        assert!(!out.contains("98%"), "ctx 값이 남음: {out:?}");
+        assert!(!out.contains("CRITICAL"), "심각도 접미가 남음: {out:?}");
+        assert!(
+            out.contains("\x1b[33mwk:80%\x1b[0m"),
+            "다른 세그먼트 ANSI 손상: {out:?}"
+        );
+        assert!(out.contains("session:0m"), "session 세그먼트 유실: {out:?}");
+        assert!(
+            !out.trim_end().ends_with('|'),
+            "dangling 구분자 남음: {out:?}"
+        );
+    }
+
+    /// ctx 컴팩트 경고 줄([!]/[!!])은 통째로 제거된다.
+    #[test]
+    fn strip_ctx_advisory_line_removed() {
+        let input =
+            "[OMC] | session:0m | ctx:98% CRITICAL\n[!!] ctx 98% >= 80% threshold - run /compact";
+        assert_eq!(strip_chained_context(input), "[OMC] | session:0m");
+    }
+
+    /// ANSI가 둘러싼 경고 줄도 가시 텍스트 기준으로 제거된다.
+    #[test]
+    fn strip_ctx_advisory_line_with_ansi_removed() {
+        let input = "[OMC] | session:0m | ctx:50%\n\x1b[33m[!] ctx 50% >= 80% threshold - run /compact\x1b[0m";
+        assert_eq!(strip_chained_context(input), "[OMC] | session:0m");
+    }
+
+    /// ctx가 없으면 입력을 그대로 둔다(비트 동일).
+    #[test]
+    fn strip_ctx_no_ctx_unchanged() {
+        let input = "[OMC] | Model: Opus 4.8 | 5h:3% wk:80% | session:0m";
+        assert_eq!(strip_chained_context(input), input);
+    }
+
+    /// "session:0m"의 끝-`m`을 ANSI로 오인해 텍스트를 먹지 않는다.
+    #[test]
+    fn strip_ctx_does_not_eat_trailing_text_m() {
+        assert_eq!(
+            strip_chained_context("x | session:0m | ctx:90%"),
+            "x | session:0m"
+        );
+    }
+
+    /// `ctx:`가 `NN%` 형태가 아니면 안전하게 미변경한다.
+    #[test]
+    fn strip_ctx_non_percent_unchanged() {
+        let input = "a | ctx:unknown | b";
+        assert_eq!(strip_chained_context(input), input);
+    }
+
+    /// 빈 문자열(체인 미사용)은 그대로 빈 문자열.
+    #[test]
+    fn strip_ctx_empty_passthrough() {
+        assert_eq!(strip_chained_context(""), "");
+    }
+
+    /// bar 모드(`ctx:[████░░]NN%`)도 제거된다(블록 글리프/ANSI 포함 괄호 건너뛰기).
+    #[test]
+    fn strip_ctx_bar_mode_removed() {
+        let input = "x | ctx:[\x1b[31m████\x1b[2m░░\x1b[0m]\x1b[31m50%\x1b[0m";
+        let out = strip_chained_context(input);
+        assert_eq!(out, "x", "bar 모드 ctx 미제거: {out:?}");
+    }
+
+    /// ctx가 줄 중간일 때: 앞 구분자만 제거되고 뒤 구분자/세그먼트는 보존된다.
+    #[test]
+    fn strip_ctx_mid_position_keeps_trailing_separator() {
+        assert_eq!(strip_chained_context("a | ctx:50% | b"), "a | b");
+    }
+
+    /// `\r\n` 라인 종결은 보존된다(split('\n')+join이 `\r`를 유지).
+    #[test]
+    fn strip_ctx_crlf_preserved() {
+        let input = "[OMC] | session:0m | ctx:50%\r\n[!] ctx 50% >= 80% threshold - run /compact";
+        // 경고줄 제거 후 첫 줄만 남고 `\r`(첫 줄 끝)도 보존.
+        assert_eq!(strip_chained_context(input), "[OMC] | session:0m\r");
     }
 }
