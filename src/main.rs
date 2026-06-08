@@ -475,11 +475,18 @@ const CONTEXT_NATIVE_CACHE: &str = "ctx_native";
 
 /// 직전 native ctx를 유지하는 최대 시간(초). 이보다 오래 native가 누락되면 토큰 fallback으로 저하한다.
 ///
-/// native 누락은 통상 첫 API 호출 전·`/compact` 직후의 소수 프레임 현상이므로, refreshInterval
-/// (통상 5s) 기준 그 수 배(≈6프레임)를 메우는 30초로 둔다. 실제 컨텍스트 급감은 hold 자체의 비대칭
-/// 하강 가드([`claude::resolve_context_percent`])가 즉시 반영하므로 stale-high 노출은 가드가 막고,
-/// 이 TTL은 가드가 닿지 못하는 장기 누락의 상한선 역할만 한다.
-const CONTEXT_HOLD_TTL_SECONDS: u64 = 30;
+/// Claude Code는 긴 세션에서 `used_percentage`와 토큰(`current_usage`/`total_input_tokens`)을 **모두
+/// 0/null로 보내는 프레임**을 수십 초~수 분간 지속하는 경우가 있다(라이브 관측: 양수 native 직후
+/// ~98초간 0 지속, omc HUD도 같은 프레임에 `ctx:0%`). 그 구간엔 토큰 fallback도 분자가 0이라 불가
+/// 하므로, 직전 native를 충분히 길게(10분) 유지해야 ctx가 사라지지 않는다.
+///
+/// 갱신/안전 모델: hold 프레임은 TTL을 재시작하지 않으므로(양수 native를 본 프레임만 영속화) 이 시계는
+/// **마지막 실제 native 시점부터** 흐른다 — native가 주기적으로 오는 활성 세션에선 사실상 계속 갱신되어
+/// 만료되지 않고, "native가 10분 내내 한 번도 안 온" 장기 idle에서만 만료된다. 실제 컨텍스트 급감은
+/// 비대칭 하강 가드([`claude::resolve_context_percent`])가 토큰이 양수로 줄 때 즉시 반영하므로,
+/// 긴 TTL의 stale-high 노출 위험은 "native·토큰이 둘 다 0인 동안"으로 한정된다(그 구간엔 직전 값이
+/// 최선의 추정).
+const CONTEXT_HOLD_TTL_SECONDS: u64 = 600;
 
 /// Claude 소스의 ctx 사용률%를 해석해 `claude_input.context_used_percentage`에 확정한다.
 ///
