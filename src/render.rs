@@ -16,6 +16,30 @@ use crate::claude::ClaudeInput;
 use crate::config::Config;
 use crate::system::{NetThroughput, SystemSnapshot};
 use crate::theme::{band_index, band_tint, parse_hex_pub, pick_emoji, pulse_color, ColorSpec};
+use serde::Serialize;
+
+/// cmux 사이드바 pill로 노출할 핵심 세그먼트(model/ctx/cpu/mem)의 구조화된 메타데이터.
+///
+/// oneline SGR 경로는 `plain`/`colored`로 색을 미리 합성하지만(COLOR-ONCE), cmux pill 경로는
+/// 색을 `#RRGGBB` hex로 별도 직렬화하므로(SGR가 아니라 cmux `--color` 인자) 값/색/우선순위를
+/// 구조화해 둔다. oneline 출력 바이트에는 일절 영향이 없는 additive-optional 부착물이다(설계 §5.2).
+///
+/// `value`는 같은 세그먼트의 원시 값(plain의 값 부분)에서 **단일 파생**한다(별도 손계산 금지 —
+/// plain/colored/pill 3중 소스 드리프트 봉인, 설계 §5.2).
+struct PillMeta {
+    /// pill 식별 id(prefix 없음). 예 `"model"`/`"ctx"`/`"cpu"`/`"mem"`. lterm이 pane prefix를 붙인다.
+    id: &'static str,
+    /// pill 라벨(있으면 표시). 핵심 4개는 모두 `None`(값 자체가 라벨을 포함).
+    label: Option<String>,
+    /// pill 표시 값(예 `"gpt-5.5"`/`"ctx 42%"`/`"cpu 31%"`/`"mem 48%"`).
+    value: String,
+    /// pill 색(테마 일관 색맵 또는 cpu band_tint). `None`이면 cmux 기본색.
+    color: Option<ColorSpec>,
+    /// 우선순위(oneline과 동일 의미, 낮을수록 저우선). cmux priority 인자로도 전달.
+    priority: u8,
+    /// pill 아이콘명(cmux `--icon`, 미지원명은 cmux가 무시). model만 `Some("sparkles")`.
+    icon: Option<&'static str>,
+}
 
 /// 세그먼트 한 조각: 폭 계산용 순수 텍스트 + ANSI 적용된 표시 텍스트 + 우선순위.
 ///
@@ -29,6 +53,51 @@ struct Segment {
     colored: String,
     /// 폭 초과 시 생략 우선순위(낮을수록 먼저 버림).
     priority: u8,
+    /// cmux pill 경로 전용 메타데이터(model/ctx/cpu/mem에만 `Some`). oneline 경로는 미사용.
+    /// 기본 `None` — oneline SGR 바이트에 영향 없음(additive-optional, 설계 §5.2).
+    pill: Option<PillMeta>,
+}
+
+/// `understatus render --surface-format cmux-status`의 stdout 직렬화 루트(설계 §3.3).
+///
+/// lterm `CmuxStatusSink`가 이 JSON을 파싱해 cmux `set-status`/`set-progress`로 diff 적용한다.
+/// 한 줄 JSON으로 출력된다(`serde_json::to_string`).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct CmuxStatusOutput {
+    /// 스키마 식별자(항상 `"cmux-status"`). lterm sink가 non-JSON/타 스키마를 무해 처리하는 근거.
+    schema: &'static str,
+    /// 스키마 버전(현재 1). additive-optional 계약상 lterm은 version 하드게이트하지 않는다.
+    version: u32,
+    /// pill 배열(model/ctx/cpu/mem 중 소스 가용분만).
+    pills: Vec<Pill>,
+    /// ctx 진행바(ctx 세그먼트 있으면 `Some`, 없으면 `None`).
+    progress: Option<Progress>,
+}
+
+/// cmux 사이드바 pill 하나(설계 §3.3). `key`는 prefix 없는 세그먼트 id다.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Pill {
+    /// 세그먼트 id(prefix 없음). lterm이 `lterm.<pane>.` prefix를 앞에 붙인다.
+    key: String,
+    /// pill 라벨(있으면). 핵심 4개는 `None`.
+    label: Option<String>,
+    /// pill 표시 값.
+    value: String,
+    /// pill 색 `#RRGGBB`(없으면 cmux 기본색).
+    color: Option<String>,
+    /// pill 아이콘명(cmux가 미지원명은 무시).
+    icon: Option<String>,
+    /// 우선순위(낮을수록 저우선).
+    priority: u8,
+}
+
+/// ctx 진행바(설계 §3.3). value는 정수%/100.0(0.0..=1.0), label은 `"ctx NN%"`.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Progress {
+    /// 진행률(0.0..=1.0). ctx 정수%를 100.0으로 나눈 값(pill 텍스트와 동일 양자화).
+    value: f64,
+    /// 진행바 라벨(`"ctx NN%"`). pill `ctx` value와 동일.
+    label: Option<String>,
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -68,6 +137,31 @@ pub fn render(
         .join(&separator)
 }
 
+// CONTRACT: cmux pill 경로 진입점 — oneline `render()`와 동일 `collect_segments` 호출을 공유한다.
+/// cmux 네이티브 status pill JSON 구조를 만든다(`--surface-format cmux-status` 경로, 설계 §3.3).
+///
+/// oneline [`render`]와 **동일한 [`collect_segments`] 호출**을 써서 세그먼트 가용성 드리프트를
+/// 막는다(같은 입력 → 같은 핵심 세그먼트 집합). pill은 model/ctx/cpu/mem에만 부착되어 있으므로
+/// [`to_cmux_pills`]가 그 4개(소스 가용분)만 수집한다. 색은 `#RRGGBB` hex로 직렬화된다(SGR 아님).
+///
+/// # 인자
+/// - `input`/`snap`/`cfg`/`now_ms`/`pulse_on`: [`render`]와 동일(세그먼트 수집 소스).
+///
+/// # 반환
+/// 직렬화 가능한 [`CmuxStatusOutput`]. 호출부(main.rs)가 `serde_json::to_string`으로 1줄 출력한다.
+pub fn render_cmux_pills(
+    input: &ClaudeInput,
+    snap: &SystemSnapshot,
+    cfg: &Config,
+    now_ms: u128,
+    pulse_on: bool,
+) -> CmuxStatusOutput {
+    // color_on은 pill 색(hex)에 무관하지만 collect_segments 계약상 전달한다(oneline과 동일 수집).
+    let color_on = std::env::var_os("NO_COLOR").is_none() && cfg.color.mode != "none";
+    let segments = collect_segments(input, snap, cfg, now_ms, pulse_on, color_on);
+    to_cmux_pills(&segments)
+}
+
 /// 표시 토글/스냅샷/세션 정보로 세그먼트 목록을 만든다(부분별 ANSI 적용).
 ///
 /// 각 정보원이 부재(`None`)면 해당 세그먼트를 생략한다(AC5 우아한 저하).
@@ -95,16 +189,30 @@ fn collect_segments(
             cpu_value
         ),
         priority: 100,
+        // cpu pill 값은 동일 cpu_value에서 단일 파생(3중-소스 동기화). 색은 기존 band_tint 재사용.
+        pill: Some(PillMeta {
+            id: "cpu",
+            label: None,
+            value: format!("cpu {cpu_value}"),
+            color: Some(band_tint(band_index(snap.cpu_percent, cfg), cfg)),
+            priority: 100,
+            icon: None,
+        }),
     });
 
     // 메모리%: 라벨 "mem" dim + 값 색 없음.
-    segments.push(label_value_segment(
-        "mem",
-        &format!("{:.0}%", snap.mem_percent),
-        90,
-        cfg,
-        color_on,
-    ));
+    let mem_value = format!("{:.0}%", snap.mem_percent);
+    let mut mem_segment = label_value_segment("mem", &mem_value, 90, cfg, color_on);
+    // mem pill 값은 mem_value(plain의 값 부분)에서 단일 파생. 색은 테마 중립 색맵.
+    mem_segment.pill = Some(PillMeta {
+        id: "mem",
+        label: None,
+        value: format!("mem {mem_value}"),
+        color: Some(pill_neutral_color()),
+        priority: 90,
+        icon: None,
+    });
+    segments.push(mem_segment);
 
     // 배터리(P2): 토글 on + 값 있을 때만. 라벨 마커 dim + 값 색 없음.
     if cfg.display.show_battery {
@@ -143,7 +251,18 @@ fn collect_segments(
     if cfg.display.show_model {
         if let Some(model) = input.model_display_name.as_deref() {
             if !model.is_empty() {
-                segments.push(value_segment(model, 60));
+                let mut model_segment = value_segment(model, 60);
+                // model pill 값은 plain과 동일한 model 문자열에서 단일 파생(enrich 성공 시 풍부한
+                // 이름, 실패 시 bare agent 토큰 "codex" — oneline과 동일). 색은 테마 accent.
+                model_segment.pill = Some(PillMeta {
+                    id: "model",
+                    label: None,
+                    value: model.to_string(),
+                    color: Some(pill_accent_color()),
+                    priority: 60,
+                    icon: Some("sparkles"),
+                });
+                segments.push(model_segment);
             }
         }
     }
@@ -151,13 +270,20 @@ fn collect_segments(
     // 컨텍스트 사용률%: null이면 세그먼트 생략(AC2). 라벨 "ctx" dim + 값 색 없음.
     if cfg.display.show_context {
         if let Some(context) = input.context_used_percentage {
-            segments.push(label_value_segment(
-                "ctx",
-                &format!("{context:.0}%"),
-                50,
-                cfg,
-                color_on,
-            ));
+            // ctx pill/progress는 정수%로 양자화한다(유휴 스폰 0 + pill·progress 동기화, 설계 §4.4).
+            let context_pct_int = context.round() as u32;
+            let mut ctx_segment =
+                label_value_segment("ctx", &format!("{context:.0}%"), 50, cfg, color_on);
+            // ctx pill 값은 동일 정수% 양자화에서 단일 파생. 색은 테마 band 색맵.
+            ctx_segment.pill = Some(PillMeta {
+                id: "ctx",
+                label: None,
+                value: format!("ctx {context_pct_int}%"),
+                color: Some(pill_band_color()),
+                priority: 50,
+                icon: None,
+            });
+            segments.push(ctx_segment);
         }
     }
 
@@ -260,6 +386,7 @@ fn label_value_segment(
         plain: format!("{label} {value}"),
         colored: format!("{} {value}", dim_label(label, cfg, color_on)),
         priority,
+        pill: None,
     }
 }
 
@@ -269,7 +396,106 @@ fn value_segment(value: &str, priority: u8) -> Segment {
         plain: value.to_string(),
         colored: value.to_string(),
         priority,
+        pill: None,
     }
+}
+
+/// model pill 전용 accent 색(테마 일관 상수). understatus 값 세그먼트엔 색이 없으므로 신규 매핑.
+///
+/// understatus 디자인 토큰에 cmux pill 전용 색이 없어 pill 가독성을 위해 정의한다(설계 §5.3).
+/// `#7AA2F7`(차분한 blue accent) — 모델명을 사이드바에서 한눈에 식별하게 한다.
+fn pill_accent_color() -> ColorSpec {
+    ColorSpec {
+        r: 0x7a,
+        g: 0xa2,
+        b: 0xf7,
+    }
+}
+
+/// ctx pill 전용 band 색(테마 일관 상수). 신규 매핑(설계 §5.3).
+///
+/// `#34D399`(차분한 green) — ctx 진행을 사이드바에서 식별하게 한다.
+fn pill_band_color() -> ColorSpec {
+    ColorSpec {
+        r: 0x34,
+        g: 0xd3,
+        b: 0x99,
+    }
+}
+
+/// mem pill 전용 중립 색(테마 일관 상수). 신규 매핑(설계 §5.3).
+///
+/// `#A0A0A0`(중립 회색) — 시스템 보조 지표라 강조하지 않는다.
+fn pill_neutral_color() -> ColorSpec {
+    ColorSpec {
+        r: 0xa0,
+        g: 0xa0,
+        b: 0xa0,
+    }
+}
+
+/// [`ColorSpec`](RGB)을 `#RRGGBB` 16진 문자열로 변환한다(cmux `--color` 인자용).
+///
+/// [`ansi_fg`]의 truecolor 산식(r/g/b 채널 추출)과 **동일 소스**를 쓰되, SGR 시퀀스가 아니라
+/// cmux가 받는 hex를 출력한다(설계 §5.3). 색상 모드(auto/256)와 무관하게 항상 truecolor hex다
+/// (cmux pill은 hex만 받으므로 256 근사가 불필요).
+fn color_to_hex(color: ColorSpec) -> String {
+    format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+}
+
+/// 세그먼트 목록에서 `pill`이 있는 핵심 세그먼트만 모아 cmux pill JSON 구조를 만든다(설계 §3.3).
+///
+/// # 인자
+/// - `segments`: [`collect_segments`]가 만든 세그먼트들(같은 호출을 oneline 경로와 공유 → 가용성
+///   드리프트 없음). `pill.is_some()`인 것만 수집한다.
+///
+/// # 반환
+/// `{schema, version, pills, progress}`. ctx 세그먼트가 있으면 pill과 progress **둘 다** 채운다
+/// (사용자 결정, 설계 §3.3). ctx pill value의 정수%를 100.0으로 나눠 progress value로 쓴다(동일
+/// 양자화 → pill·progress 동기화). ctx가 없으면 progress는 `None`.
+fn to_cmux_pills(segments: &[Segment]) -> CmuxStatusOutput {
+    let mut pills = Vec::new();
+    let mut progress = None;
+    for segment in segments {
+        let Some(meta) = segment.pill.as_ref() else {
+            continue;
+        };
+        // ctx는 pills와 progress 둘 다에 들어간다. progress 값은 pill value의 정수%에서 파생한다.
+        if meta.id == "ctx" {
+            progress = Some(Progress {
+                value: ctx_progress_value(&meta.value),
+                label: Some(meta.value.clone()),
+            });
+        }
+        pills.push(Pill {
+            key: meta.id.to_string(),
+            label: meta.label.clone(),
+            value: meta.value.clone(),
+            color: meta.color.map(color_to_hex),
+            icon: meta.icon.map(str::to_string),
+            priority: meta.priority,
+        });
+    }
+    CmuxStatusOutput {
+        schema: "cmux-status",
+        version: 1,
+        pills,
+        progress,
+    }
+}
+
+/// ctx pill value(`"ctx NN%"`)에서 progress value(정수%/100.0)를 파생한다.
+///
+/// pill 텍스트와 동일한 정수% 양자화에서 단일 파생해 pill·progress 동기화를 보장한다(설계 §4.4).
+/// 파싱 실패(미상 포맷)는 0.0으로 안전 저하한다(무패닉).
+fn ctx_progress_value(ctx_value: &str) -> f64 {
+    ctx_value
+        .trim_start_matches("ctx ")
+        .trim_end_matches('%')
+        .trim()
+        .parse::<f64>()
+        .map(|pct| pct / 100.0)
+        .unwrap_or(0.0)
 }
 
 /// 네트워크 throughput 세그먼트를 만든다(↓ ↑ 화살표 dim + 속도 값 색 없음).
@@ -284,6 +510,7 @@ fn net_segment(net: &NetThroughput, priority: u8, cfg: &Config, color_on: bool) 
             dim_label("↑", cfg, color_on)
         ),
         priority,
+        pill: None,
     }
 }
 
@@ -1081,5 +1308,186 @@ mod tests {
         assert_eq!(display_width("🔥a"), 3);
         // 가운뎃점 구분자 " · "는 폭 3(공백1 + 중점1 + 공백1).
         assert_eq!(display_width(" · "), 3);
+    }
+
+    // ===== cmux 네이티브 status pills(C1: PillMeta + 색맵 + to_cmux_pills) =====
+
+    /// 한 pill을 key로 찾는 헬퍼(순서 무관 단언).
+    fn find_pill<'a>(out: &'a CmuxStatusOutput, key: &str) -> Option<&'a Pill> {
+        out.pills.iter().find(|p| p.key == key)
+    }
+
+    /// 색 문자열이 `#RRGGBB` 정규식(6 hex 대문자/숫자)인지 검사한다.
+    fn is_rrggbb(color: &str) -> bool {
+        let bytes = color.as_bytes();
+        color.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// color_to_hex: ansi_fg truecolor 산식과 동일 채널 소스를 써서 #RRGGBB(대문자)로 출력한다.
+    #[test]
+    fn color_to_hex_formats_uppercase_rrggbb() {
+        assert_eq!(
+            color_to_hex(ColorSpec {
+                r: 0x7a,
+                g: 0xa2,
+                b: 0xf7
+            }),
+            "#7AA2F7"
+        );
+        // 0 패딩 확인(한 자리 채널도 두 자리로).
+        assert_eq!(color_to_hex(ColorSpec { r: 0, g: 5, b: 255 }), "#0005FF");
+    }
+
+    /// AC2(가용 집합): enrich-성공 상당(model+ctx+cpu+mem 소스 가용) → pill key 집합 {model,ctx,cpu,mem}(4).
+    #[test]
+    fn to_cmux_pills_enriched_has_four_keys() {
+        // sample_input: model=Some, ctx=Some(42.0). sample_snap: cpu/mem 무조건. → 4 pill.
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&sample_input(), &sample_snap(58.0), &cfg, 0, false);
+        let mut keys: Vec<&str> = out.pills.iter().map(|p| p.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["cpu", "ctx", "mem", "model"],
+            "enrich-성공 4 pill"
+        );
+    }
+
+    /// AC2(가용 집합): enrich-실패 상당(ctx None, model bare "codex") → pill key 집합 {model,cpu,mem}(3, ctx 부재).
+    #[test]
+    fn to_cmux_pills_unenriched_has_three_keys_no_ctx() {
+        let mut input = sample_input();
+        input.context_used_percentage = None; // enrich 실패 → ctx 없음.
+        input.model_display_name = Some("codex".to_string()); // bare agent 토큰 폴백.
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&input, &sample_snap(58.0), &cfg, 0, false);
+        let mut keys: Vec<&str> = out.pills.iter().map(|p| p.key.as_str()).collect();
+        keys.sort_unstable();
+        // **2가 아니라 3**: ctx만 None-skip, model(bare)+cpu+mem은 가용.
+        assert_eq!(
+            keys,
+            vec!["cpu", "mem", "model"],
+            "enrich-실패 3 pill(ctx 부재)"
+        );
+        assert!(find_pill(&out, "ctx").is_none(), "ctx pill 부재");
+        assert!(out.progress.is_none(), "ctx 부재 → progress None");
+        // bare "codex"가 그대로 model pill 값으로 표시(oneline과 동일).
+        assert_eq!(find_pill(&out, "model").unwrap().value, "codex");
+    }
+
+    /// AC3(색): 각 pill.color는 #RRGGBB 또는 null. cpu.color는 color_to_hex(band_tint(..))와 일치.
+    #[test]
+    fn to_cmux_pills_colors_are_rrggbb_and_cpu_uses_band_tint() {
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let cpu_percent = 58.0;
+        let out = render_cmux_pills(&sample_input(), &sample_snap(cpu_percent), &cfg, 0, false);
+        for pill in &out.pills {
+            if let Some(color) = &pill.color {
+                assert!(
+                    is_rrggbb(color),
+                    "pill {} 색 #RRGGBB 위반: {color:?}",
+                    pill.key
+                );
+            }
+        }
+        // cpu.color == color_to_hex(band_tint(band_index(cpu, cfg), cfg)) — 기존 글리프 밴드 색 재사용.
+        let expected_cpu = color_to_hex(band_tint(band_index(cpu_percent, &cfg), &cfg));
+        assert_eq!(
+            find_pill(&out, "cpu").unwrap().color.as_deref(),
+            Some(expected_cpu.as_str()),
+            "cpu pill 색은 band_tint 재사용"
+        );
+    }
+
+    /// AC4(ctx 양자화): ctx 41.6% → pill "ctx 42%", progress.value ≈ 0.42(정수%/100).
+    #[test]
+    fn to_cmux_pills_ctx_quantizes_to_integer_percent() {
+        let mut input = sample_input();
+        input.context_used_percentage = Some(41.6);
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&input, &sample_snap(10.0), &cfg, 0, false);
+        let ctx = find_pill(&out, "ctx").expect("ctx pill");
+        assert_eq!(ctx.value, "ctx 42%", "41.6% → 반올림 42%");
+        let progress = out.progress.as_ref().expect("ctx → progress");
+        assert!(
+            (progress.value - 0.42).abs() < 1e-9,
+            "progress.value ≈ 0.42: {}",
+            progress.value
+        );
+        assert_eq!(
+            progress.label.as_deref(),
+            Some("ctx 42%"),
+            "progress 라벨 = pill 값"
+        );
+    }
+
+    /// AC5(동기화): pill.value가 해당 세그먼트 plain 값과 일치(model/cpu/mem).
+    ///
+    /// model: pill.value == plain(둘 다 model 문자열). cpu/mem: 값 부분(NN%)이 plain의 NN%와 동일.
+    #[test]
+    fn to_cmux_pills_values_match_plain_source() {
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let snap = sample_snap(58.0); // cpu 58% → "58%", mem 55% → "55%".
+                                      // collect_segments를 직접 호출해 plain과 pill을 같은 수집에서 대조한다(3중-소스 동기화).
+        let segments = collect_segments(&sample_input(), &snap, &cfg, 0, false, false);
+        for segment in &segments {
+            let Some(meta) = segment.pill.as_ref() else {
+                continue;
+            };
+            match meta.id {
+                // model: pill 값 == plain(둘 다 model 문자열 그대로).
+                "model" => assert_eq!(meta.value, segment.plain, "model pill==plain"),
+                // cpu: plain="<glyph> 58%", pill="cpu 58%" → 값 부분(58%)이 plain에 포함.
+                "cpu" => {
+                    let value_part = meta.value.trim_start_matches("cpu ");
+                    assert!(
+                        segment.plain.ends_with(value_part),
+                        "cpu pill 값 부분이 plain과 동기화: pill={:?} plain={:?}",
+                        meta.value,
+                        segment.plain
+                    );
+                }
+                // mem: plain="mem 55%" == pill="mem 55%".
+                "mem" => assert_eq!(meta.value, segment.plain, "mem pill==plain"),
+                // ctx: plain="ctx 42%"(정수%), pill="ctx 42%"(정수%) → 동일 양자화.
+                "ctx" => assert_eq!(meta.value, segment.plain, "ctx pill==plain(정수% 동기화)"),
+                _ => {}
+            }
+        }
+    }
+
+    /// to_cmux_pills 스키마 봉투(schema/version) 고정.
+    #[test]
+    fn to_cmux_pills_schema_envelope() {
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
+        assert_eq!(out.schema, "cmux-status");
+        assert_eq!(out.version, 1);
+        // 직렬화가 유효 JSON 1줄(개행 없음).
+        let json = serde_json::to_string(&out).expect("직렬화");
+        assert!(!json.contains('\n'), "단일 줄 JSON: {json:?}");
+        assert!(json.contains("\"schema\":\"cmux-status\""));
+    }
+
+    /// 소스 없는 세그먼트(None)는 pill 미부착 → 수집에서 제외(None-skip).
+    #[test]
+    fn to_cmux_pills_skips_pillless_segments() {
+        // show_model=false면 model 세그먼트 자체가 없고, 다른 세그먼트(cwd 등)는 pill:None.
+        let mut input = sample_input();
+        input.model_display_name = None; // model 세그먼트 없음.
+        input.context_used_percentage = None; // ctx 없음.
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&input, &sample_snap(10.0), &cfg, 0, false);
+        // cwd 세그먼트는 pill:None이라 수집 안 됨 → cpu/mem만.
+        let mut keys: Vec<&str> = out.pills.iter().map(|p| p.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["cpu", "mem"], "pill 없는 세그먼트는 제외");
     }
 }

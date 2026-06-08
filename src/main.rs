@@ -34,7 +34,11 @@ fn main() -> ExitCode {
     match subcommand {
         None | Some("render") => match parse_render_args(&args) {
             Ok(render_args) => {
-                run_render_pipeline(render_args.source, render_args.oneline);
+                run_render_pipeline(
+                    render_args.source,
+                    render_args.oneline,
+                    render_args.surface_format,
+                );
                 ExitCode::SUCCESS
             }
             // 미지 플래그/미지 source 값은 기존 `Some(other)` 관례와 동일하게 FAILURE.
@@ -93,12 +97,27 @@ enum Source {
     Lterm,
 }
 
+/// 렌더 출력 표면(surface) 형식. `--surface-format <oneline|cmux-status>`로 선택하며 기본 Oneline.
+///
+/// - `Oneline`: 기존 동작(SGR 한 줄, oneline은 후행 개행 없음). 출력 바이트 불변.
+/// - `CmuxStatus`: cmux 네이티브 status pill JSON 1줄(설계 §3.3). lterm `CmuxStatusSink`가 소비.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceFormat {
+    /// SGR 한 줄(기본값). 기존 oneline/일반 render 동작 보존.
+    Oneline,
+    /// cmux pill JSON 1줄(`--surface-format cmux-status`).
+    CmuxStatus,
+}
+
 /// render 경로의 파싱된 플래그.
 struct RenderArgs {
     /// `--source <claude|lterm>`. 미지정 시 [`Source::Claude`].
     source: Source,
     /// `--oneline`. true면 chain 미수행 + 후행 개행 없이 1행 출력(spec §6.3).
     oneline: bool,
+    /// `--surface-format <oneline|cmux-status>`. 미지정 시 [`SurfaceFormat::Oneline`].
+    /// `--surface-format`이 명시되면 `--oneline`보다 우선한다(설계 §5.1).
+    surface_format: SurfaceFormat,
 }
 
 /// render 경로용 플래그를 파싱한다(순수 함수, clap 미사용 — 기존 수동 디스패치 스타일).
@@ -107,14 +126,18 @@ struct RenderArgs {
 /// - `args`: 전체 인자 슬라이스. `args[0]`이 `"render"`이면 건너뛰고, 무인자(`render` 생략)도 허용한다.
 ///
 /// # 반환
-/// 파싱된 [`RenderArgs`]. `--source`/`--oneline`은 순서 무관이며 둘 다 선택적이다.
-/// 미지 플래그/미지 source 값/`--source` 값 누락은 `Err(메시지)`(호출부가 `ExitCode::FAILURE`).
+/// 파싱된 [`RenderArgs`]. `--source`/`--oneline`/`--surface-format`은 순서 무관이며 모두 선택적이다.
+/// 미지 플래그/미지 source 값/미지 surface-format 값/값 누락은 `Err(메시지)`(호출부가 `ExitCode::FAILURE`).
 ///
 /// # 주의
-/// `--source` 중복 지정 시 마지막 값이 이긴다(수동 파서의 일반 관례). `--oneline` 중복은 무해(idempotent).
+/// `--source`/`--surface-format` 중복 지정 시 마지막 값이 이긴다(수동 파서의 일반 관례).
+/// `--oneline` 중복은 무해(idempotent). `--surface-format`이 명시되면 그 값이 최종 surface_format이
+/// 되어 `--oneline`의 Oneline 매핑보다 우선한다(설계 §5.1: 둘 다 있으면 --surface-format 우선).
 fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
     let mut source = Source::Claude;
     let mut oneline = false;
+    // 명시된 --surface-format 값(없으면 None → --oneline 매핑/기본 Oneline으로 결정).
+    let mut surface_format_flag: Option<SurfaceFormat> = None;
 
     // args[0]이 "render"면 건너뛴다(무인자 호출은 args가 비어 시작 인덱스 0).
     let mut index = if args.first().map(String::as_str) == Some("render") {
@@ -135,13 +158,39 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                 oneline = true;
                 index += 1;
             }
+            "--surface-format" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--surface-format 뒤에 값이 필요합니다(oneline|cmux-status).".to_string()
+                })?;
+                surface_format_flag = Some(parse_surface_format(value)?);
+                index += 2;
+            }
             other => {
                 return Err(format!("알 수 없는 render 옵션 '{other}'. --help 참조."));
             }
         }
     }
 
-    Ok(RenderArgs { source, oneline })
+    // surface_format 결정: 명시 플래그가 최우선, 없으면 --oneline도 Oneline 표면이라 기본 Oneline.
+    // (--oneline은 oneline 필드로 chain-skip/후행개행 제어를 따로 하고, 표면은 항상 Oneline에 매핑.)
+    let surface_format = surface_format_flag.unwrap_or(SurfaceFormat::Oneline);
+
+    Ok(RenderArgs {
+        source,
+        oneline,
+        surface_format,
+    })
+}
+
+/// `--surface-format` 값 문자열을 [`SurfaceFormat`]으로 해석한다(미지값은 에러).
+fn parse_surface_format(value: &str) -> Result<SurfaceFormat, String> {
+    match value {
+        "oneline" => Ok(SurfaceFormat::Oneline),
+        "cmux-status" => Ok(SurfaceFormat::CmuxStatus),
+        other => Err(format!(
+            "알 수 없는 surface-format '{other}'. 사용 가능: oneline|cmux-status."
+        )),
+    }
 }
 
 /// `--source` 값 문자열을 [`Source`]로 해석한다(미지값은 에러).
@@ -566,7 +615,9 @@ fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Opt
 /// # 인자
 /// - `source`: 입력 소스(claude=기존 동작, lterm=합성 JSON). lterm은 git 비활성·chain 기본 off.
 /// - `oneline`: true면 chain을 수행하지 않고 코어 `render()` 1행만 **후행 개행 없이** 출력한다(spec §6.3).
-fn run_render_pipeline(source: Source, oneline: bool) {
+/// - `surface_format`: 출력 표면. [`SurfaceFormat::CmuxStatus`]면 SGR 한 줄 대신 cmux pill JSON 1줄을
+///   출력한다(설계 §3.3). 수집부(parse + codex enrich + system sample)는 표면 분기와 무관하게 재사용된다.
+fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFormat) {
     // (1) stdin 원본 보존(체이닝을 위해 raw 그대로 자식에 전달).
     let raw_stdin = read_stdin();
 
@@ -613,6 +664,19 @@ fn run_render_pipeline(source: Source, oneline: bool) {
     //   lterm/codex 경로는 context_window가 없어 자연 no-op이므로 Claude로 게이팅한다.
     if source == Source::Claude {
         resolve_claude_context(&mut claude_input, &session_key, now_ms);
+    }
+
+    // (6') --surface-format cmux-status: SGR 한 줄 대신 cmux pill JSON 1줄을 출력하고 종료한다.
+    //   수집부(parse + codex enrich + system sample + ctx 해석)는 위에서 그대로 끝났으므로 재사용한다.
+    //   oneline 분기 직전에 분기해 chain/compose 경로를 타지 않는다(설계 §5.2). 직렬화 실패는 무패닉
+    //   no-op(빈 출력) — lterm sink가 non-JSON을 무해 처리(additive-optional 계약).
+    if surface_format == SurfaceFormat::CmuxStatus {
+        let pills = render::render_cmux_pills(&claude_input, &snapshot, &cfg, now_ms, pulse_on);
+        if let Ok(json) = serde_json::to_string(&pills) {
+            print!("{json}");
+            let _ = std::io::stdout().flush();
+        }
+        return;
     }
 
     // (6) understatus 자체 세그먼트 렌더.
@@ -695,8 +759,9 @@ fn print_help() {
          \x20 understatus --version      버전 출력\n\
          \n\
          render 옵션(understatus render 뒤에 사용):\n\
-         \x20 --source <s>     입력 소스(claude|lterm). 미지정 시 claude.\n\
-         \x20 --oneline        chain 없이 코어 한 줄만 후행 개행 없이 출력(status row용).\n\
+         \x20 --source <s>          입력 소스(claude|lterm). 미지정 시 claude.\n\
+         \x20 --oneline             chain 없이 코어 한 줄만 후행 개행 없이 출력(status row용).\n\
+         \x20 --surface-format <f>  출력 표면(oneline|cmux-status). 미지정 시 oneline.\n\
          \n\
          install 옵션:\n\
          \x20 --interval <N>   refreshInterval 초(정수 ≥ 1). 미지정 시 프롬프트/승계/기본 5.\n\
@@ -802,6 +867,82 @@ mod tests {
         let parsed = parse_render_args(&render_argv(&["--source", "claude", "--source", "lterm"]))
             .expect("파싱 성공");
         assert_eq!(parsed.source, Source::Lterm);
+    }
+
+    // --- parse_render_args: --surface-format (설계 §5.1) ---
+
+    /// 미지정 시 surface_format 기본은 Oneline(behavior-preserving).
+    #[test]
+    fn parse_render_args_default_surface_format_is_oneline() {
+        let parsed = parse_render_args(&render_argv(&[])).expect("파싱 성공");
+        assert_eq!(parsed.surface_format, SurfaceFormat::Oneline);
+    }
+
+    /// `--surface-format cmux-status` → CmuxStatus.
+    #[test]
+    fn parse_render_args_surface_format_cmux_status() {
+        let parsed = parse_render_args(&render_argv(&["--surface-format", "cmux-status"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.surface_format, SurfaceFormat::CmuxStatus);
+    }
+
+    /// `--surface-format oneline` → Oneline(명시).
+    #[test]
+    fn parse_render_args_surface_format_oneline() {
+        let parsed =
+            parse_render_args(&render_argv(&["--surface-format", "oneline"])).expect("파싱 성공");
+        assert_eq!(parsed.surface_format, SurfaceFormat::Oneline);
+    }
+
+    /// 미지 surface-format 값은 에러(ExitCode::FAILURE로 이어짐).
+    #[test]
+    fn parse_render_args_rejects_unknown_surface_format() {
+        assert!(parse_render_args(&render_argv(&["--surface-format", "bogus"])).is_err());
+    }
+
+    /// `--surface-format` 값 누락은 에러여야 한다.
+    #[test]
+    fn parse_render_args_rejects_missing_surface_format_value() {
+        assert!(parse_render_args(&render_argv(&["--surface-format"])).is_err());
+    }
+
+    /// `--surface-format`이 명시되면 `--oneline`보다 우선(둘 다 있어도 cmux-status 우선, 설계 §5.1).
+    #[test]
+    fn parse_render_args_surface_format_overrides_oneline() {
+        let parsed = parse_render_args(&render_argv(&[
+            "--oneline",
+            "--surface-format",
+            "cmux-status",
+        ]))
+        .expect("파싱 성공");
+        assert_eq!(parsed.surface_format, SurfaceFormat::CmuxStatus);
+        // --oneline 플래그 자체는 보존된다(chain-skip 제어용).
+        assert!(parsed.oneline);
+    }
+
+    /// `--surface-format` 중복은 마지막 값이 이긴다(last-wins).
+    #[test]
+    fn parse_render_args_duplicate_surface_format_last_wins() {
+        let parsed = parse_render_args(&render_argv(&[
+            "--surface-format",
+            "cmux-status",
+            "--surface-format",
+            "oneline",
+        ]))
+        .expect("파싱 성공");
+        assert_eq!(parsed.surface_format, SurfaceFormat::Oneline);
+    }
+
+    /// parse_surface_format: 값 해석 + 미지값 거부.
+    #[test]
+    fn parse_surface_format_values() {
+        assert_eq!(parse_surface_format("oneline"), Ok(SurfaceFormat::Oneline));
+        assert_eq!(
+            parse_surface_format("cmux-status"),
+            Ok(SurfaceFormat::CmuxStatus)
+        );
+        assert!(parse_surface_format("bogus").is_err());
+        assert!(parse_surface_format("").is_err());
     }
 
     /// 인자 슬라이스를 만든다(args[0] == "install").

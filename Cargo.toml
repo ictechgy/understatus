@@ -25,3 +25,7 @@ serde_json = "1"
 toml = "0.8"
 # install/uninstall 등 fallible 경로의 에러 전파 (install.rs)
 anyhow = "1"
+
+[dev-dependencies]
+# 통합 테스트(tests/oneline.rs)에서 cmux-status JSON 출력을 파싱·검증 (surface-format 계약).
+serde_json = "1"

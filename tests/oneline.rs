@@ -241,6 +241,124 @@ fn oneline_lterm_shows_session_pane_label() {
     );
 }
 
+// ===== cmux 네이티브 status pills(C1/C2 surface-format, 설계 §3.3) =====
+
+/// 빌드된 바이너리를 실행하되 종료 코드도 함께 반환한다(에러 경로 검증용).
+fn run_understatus_status(args: &[&str], stdin: &str) -> (Vec<u8>, std::process::ExitStatus) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_understatus"))
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env(
+            "UNDERSTATUS_CONFIG",
+            "/nonexistent/understatus-test-config.toml",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("understatus 바이너리 실행 실패");
+    child
+        .stdin
+        .take()
+        .expect("stdin 핸들 없음")
+        .write_all(stdin.as_bytes())
+        .expect("stdin 쓰기 실패");
+    let output = child.wait_with_output().expect("자식 종료 대기 실패");
+    (output.stdout, output.status)
+}
+
+/// AC6: `--surface-format cmux-status` → 단일 줄 valid JSON(개행 0, schema/version 봉투).
+#[test]
+fn surface_format_cmux_status_emits_single_line_json() {
+    let stdout = run_understatus(
+        &[
+            "render",
+            "--source",
+            "lterm",
+            "--surface-format",
+            "cmux-status",
+        ],
+        r#"{"source":"lterm","session":"codex","pane":"%3","cwd":"/tmp/proj","agent":"codex"}"#,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+    // 단일 줄(내부/후행 개행 0).
+    assert_eq!(
+        text.matches('\n').count(),
+        0,
+        "cmux-status는 단일 줄 JSON이어야 함: {text:?}"
+    );
+    // valid JSON으로 파싱 가능 + 스키마 봉투.
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON이어야 함");
+    assert_eq!(value["schema"], "cmux-status");
+    assert_eq!(value["version"], 1);
+    assert!(value["pills"].is_array(), "pills 배열 필요: {text:?}");
+}
+
+/// AC6: `--surface-format bogus` → Err exit(비정상 종료 코드).
+#[test]
+fn surface_format_bogus_exits_failure() {
+    let (_stdout, status) = run_understatus_status(&["render", "--surface-format", "bogus"], "{}");
+    assert!(
+        !status.success(),
+        "미지 surface-format은 실패 종료해야 함: {status:?}"
+    );
+}
+
+/// AC6: 미지정 → oneline(기존 기본 render = 후행 개행 + JSON 아님).
+#[test]
+fn surface_format_unspecified_defaults_to_oneline() {
+    let stdout = run_understatus(
+        &["render", "--source", "lterm", "--oneline"],
+        r#"{"source":"lterm","session":"codex","pane":"%3","cwd":"/tmp/proj","agent":"codex"}"#,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+    // oneline 표면은 cmux JSON이 아니다(schema 키 없음).
+    assert!(
+        !text.contains("\"schema\""),
+        "미지정 표면은 oneline이어야 함(JSON 아님): {text:?}"
+    );
+    assert!(text.contains('%'), "oneline 코어 세그먼트 유지: {text:?}");
+}
+
+/// enrich-실패(bare codex) cmux-status → pill key 집합 {model,cpu,mem}(3), ctx/progress 부재.
+#[test]
+fn surface_format_cmux_status_unenriched_three_pills() {
+    let stdout = run_understatus(
+        &[
+            "render",
+            "--source",
+            "lterm",
+            "--surface-format",
+            "cmux-status",
+        ],
+        // 존재하지 않는 cwd → codex enrich 후보 0 → ctx None, model bare "codex".
+        r#"{"source":"lterm","session":"codex","pane":"%3","cwd":"/nonexistent-cmux-pill-cwd","agent":"codex"}"#,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let pills = value["pills"].as_array().expect("pills 배열");
+    let mut keys: Vec<&str> = pills.iter().filter_map(|p| p["key"].as_str()).collect();
+    keys.sort_unstable();
+    // **2가 아니라 3**: ctx만 부재, model(bare codex)+cpu+mem 가용.
+    assert_eq!(
+        keys,
+        vec!["cpu", "mem", "model"],
+        "enrich-실패 3 pill: {text:?}"
+    );
+    assert!(
+        value["progress"].is_null(),
+        "ctx 부재 → progress null: {text:?}"
+    );
+    // 색은 #RRGGBB(model 등).
+    let model = pills.iter().find(|p| p["key"] == "model").unwrap();
+    let color = model["color"].as_str().expect("model 색");
+    assert!(
+        color.len() == 7 && color.starts_with('#'),
+        "model 색 #RRGGBB: {color:?}"
+    );
+    assert_eq!(model["value"], "codex", "bare agent 토큰 표시");
+}
+
 // ===== E2E: Codex 세션 심층판독(spec §11 E2E, AC1/AC2) =====
 
 /// 넓은 max_width(codex 풀 프로필이 폭 트림으로 잘리지 않게)를 가진 임시 config를 만든다.
