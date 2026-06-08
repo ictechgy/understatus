@@ -397,9 +397,11 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
 /// `null`/부재에 견딘다. [`parse_claude_input`]이 이 타입을 [`ClaudeInput`]으로 평탄화한다.
 #[derive(Debug, Deserialize, Default)]
 struct RawClaudeInput {
-    #[serde(default)]
+    // 표시/캐시키용 최상위 String 필드도 lenient로 받는다(`workspace.repo`처럼 Claude Code가 향후
+    // 객체화해도 전체 파싱이 깨지지 않도록 — repo 회귀의 일반화 방어).
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     cwd: Option<String>,
     #[serde(default)]
     model: Option<RawModel>,
@@ -414,10 +416,10 @@ struct RawClaudeInput {
 /// `model` 중첩 객체.
 #[derive(Debug, Deserialize, Default)]
 struct RawModel {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     display_name: Option<String>,
     // 스키마 완전성을 위해 역직렬화하지만 라인 렌더에는 쓰지 않는다(§G).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     #[allow(dead_code)]
     id: Option<String>,
 }
@@ -425,15 +427,17 @@ struct RawModel {
 /// `workspace` 중첩 객체. git 브랜치 파생 근거(`git_worktree`/`repo`)를 포함.
 #[derive(Debug, Deserialize, Default)]
 struct RawWorkspace {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     current_dir: Option<String>,
     // 스키마 완전성을 위해 역직렬화하지만 라인 렌더에는 쓰지 않는다(§G).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     #[allow(dead_code)]
     project_dir: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     git_worktree: Option<String>,
-    #[serde(default)]
+    // `repo`는 Claude Code가 문자열→`{host,owner,name}` 객체로 바꿨다. lenient로 받아 객체면 `None`
+    // (git 도출은 git_worktree 우선이라 자연 폴백)으로 흡수해 전체 파싱 실패를 막는다.
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     repo: Option<String>,
 }
 
@@ -456,6 +460,22 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<serde_json::Value>::deserialize(deserializer)?.and_then(|value| value.as_f64()))
+}
+
+/// 문자열 자리에 객체/숫자 등 다른 타입이 와도 전체 파싱을 깨지 않고 `None`으로 흡수하는 lenient
+/// String 역직렬화기(serde `deserialize_with`용).
+///
+/// 실제 사례: Claude Code가 `workspace.repo`를 문자열에서 `{host, owner, name}` **객체**로 바꾸자,
+/// `Option<String>` strict 역직렬화가 이를 거부해 `RawClaudeInput` **전체 파싱이 실패**하고
+/// model/ctx/cost/git 세그먼트가 통째로 사라졌다([`parse_claude_input`]의 전부-None 저하). 표시용
+/// String 필드를 이 헬퍼로 받으면, 어떤 JSON 값이 와도 문자열일 때만 추출하고 그 외(객체/숫자/배열/
+/// 불리언/null)는 `None`으로 흡수해 무관 세그먼트를 보존한다([`deserialize_lenient_f64`]와 같은 정신).
+fn deserialize_lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| value.as_str().map(str::to_string)))
 }
 
 /// `current_usage` 객체가 통째로 다른 타입(예: 문자열)으로 와도 전체 파싱을 깨지 않게 흡수하는
@@ -964,6 +984,56 @@ mod tests {
         );
     }
 
+    /// 실제 회귀: Claude Code가 `workspace.repo`를 문자열→`{host,owner,name}` 객체로 바꿔도
+    /// 전체 파싱이 안 깨지고 model/ctx/cwd가 보존된다(이 변경이 고치는 핵심 버그).
+    #[test]
+    fn workspace_repo_object_drift_preserves_all_segments() {
+        let raw = r#"{
+            "model": { "display_name": "Opus 4.8 (1M context)", "id": "claude-opus-4-8" },
+            "cwd": "/Users/me/proj",
+            "workspace": {
+                "current_dir": "/Users/me/proj",
+                "added_dirs": ["/a", "/b"],
+                "repo": { "host": "github.com", "owner": "ictechgy", "name": "understatus" }
+            },
+            "cost": { "total_cost_usd": 33.9 },
+            "context_window": { "context_window_size": 1000000, "used_percentage": 62 }
+        }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(
+            input.model_display_name.as_deref(),
+            Some("Opus 4.8 (1M context)"),
+            "model 보존(파싱 안 깨짐)"
+        );
+        assert_eq!(input.context_used_percentage, Some(62.0), "ctx 보존");
+        assert_eq!(input.cwd.as_deref(), Some("/Users/me/proj"), "cwd 보존");
+        assert_eq!(input.cost_usd, Some(33.9), "cost 보존");
+        // repo가 객체라 git 도출 근거(경로)로 못 쓰지만 None으로 흡수 → 파싱은 정상.
+        assert_eq!(input.git_branch, None);
+    }
+
+    /// model.display_name이 객체로 드리프트해도 흡수되고 다른 필드는 보존된다.
+    #[test]
+    fn model_display_name_object_drift_absorbed() {
+        let raw = r#"{ "model": { "display_name": { "x": 1 } }, "context_window": { "used_percentage": 50 } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(
+            input.model_display_name, None,
+            "객체 display_name → None 흡수"
+        );
+        assert_eq!(input.context_used_percentage, Some(50.0), "ctx 보존");
+    }
+
+    /// `workspace.repo`가 정상 문자열이면 git 도출 근거로 그대로 쓰인다(lenient가 기존 동작 보존).
+    #[test]
+    fn workspace_repo_string_still_used_for_git() {
+        // repo가 문자열이면 derive_git_branch가 그 경로를 본다(존재 안 하면 None이지만 파싱은 정상).
+        let raw = r#"{ "workspace": { "repo": "/nonexistent/repo/path" }, "context_window": { "used_percentage": 30 } }"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.context_used_percentage, Some(30.0));
+        assert_eq!(input.git_branch, None, "존재 않는 경로 → None(파싱은 정상)");
+    }
+
     /// 필드 누락: 부재 필드는 전부 None이어야 한다(에러/패닉 없음).
     #[test]
     fn missing_fields_default_to_none() {
@@ -1019,6 +1089,32 @@ mod tests {
         );
         let input = parse_claude_input(&raw);
         assert_eq!(input.git_branch.as_deref(), Some("feature/my-branch"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// repo가 객체(`{host,owner,name}`)로 드리프트해도 git_worktree가 정상이면 폴백 도출이 살아 있다.
+    /// (repo lenient 흡수가 git_worktree 우선 폴백 체인을 깨지 않음을 직접 고정한다.)
+    #[test]
+    fn git_worktree_derives_branch_even_when_repo_is_object() {
+        use std::io::Write;
+        let tmp =
+            std::env::temp_dir().join(format!("understatus-git-repoobj-{}", std::process::id()));
+        let git_dir = tmp.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+        let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
+        writeln!(file, "ref: refs/heads/main").expect("HEAD 쓰기 실패");
+
+        let raw = format!(
+            r#"{{ "workspace": {{ "git_worktree": {:?}, "repo": {{ "host": "github.com", "owner": "x", "name": "y" }} }} }}"#,
+            tmp.to_string_lossy()
+        );
+        let input = parse_claude_input(&raw);
+        assert_eq!(
+            input.git_branch.as_deref(),
+            Some("main"),
+            "repo 객체여도 git_worktree로 브랜치 도출"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
