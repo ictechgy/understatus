@@ -99,11 +99,17 @@ enum Source {
 
 /// 렌더 출력 표면(surface) 형식. `--surface-format <oneline|cmux-status>`로 선택하며 기본 Oneline.
 ///
-/// - `Oneline`: 기존 동작(SGR 한 줄, oneline은 후행 개행 없음). 출력 바이트 불변.
+/// `--surface-format`은 **출력 표면(텍스트 vs cmux JSON)** 선택이고, `--oneline`은 **그 텍스트
+/// 표면을 1행 terse 모드(chain 미수행 + 후행 개행 없음)로 만들지** 여부다. 둘은 직교한다:
+/// `--surface-format oneline`은 terse를 의미하지 않으며, terse는 오직 `--oneline`가 결정한다.
+///
+/// - `Oneline`: 비-cmux 텍스트 표면(SGR 한 줄). terse 여부는 별도 `--oneline`가 정한다. `--oneline`
+///   없는 일반 render는 chain/compose + 후행 개행을 그대로 거치므로 기존 출력 바이트가 불변이다.
 /// - `CmuxStatus`: cmux 네이티브 status pill JSON 1줄(설계 §3.3). lterm `CmuxStatusSink`가 소비.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceFormat {
-    /// SGR 한 줄(기본값). 기존 oneline/일반 render 동작 보존.
+    /// 비-cmux 텍스트 표면(기본값, SGR 한 줄). terse 여부는 별도 `--oneline` 플래그가 결정한다.
+    /// 즉 `--surface-format oneline`만으로는 terse가 아니며, 기존 일반 render 동작을 그대로 보존한다.
     Oneline,
     /// cmux pill JSON 1줄(`--surface-format cmux-status`).
     CmuxStatus,
@@ -615,8 +621,11 @@ fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Opt
 /// # 인자
 /// - `source`: 입력 소스(claude=기존 동작, lterm=합성 JSON). lterm은 git 비활성·chain 기본 off.
 /// - `oneline`: true면 chain을 수행하지 않고 코어 `render()` 1행만 **후행 개행 없이** 출력한다(spec §6.3).
-/// - `surface_format`: 출력 표면. [`SurfaceFormat::CmuxStatus`]면 SGR 한 줄 대신 cmux pill JSON 1줄을
-///   출력한다(설계 §3.3). 수집부(parse + codex enrich + system sample)는 표면 분기와 무관하게 재사용된다.
+/// - `surface_format`: 출력 표면(텍스트 vs cmux JSON). [`SurfaceFormat::CmuxStatus`]면 SGR 한 줄 대신
+///   cmux pill JSON 1줄을 출력한다(설계 §3.3). [`SurfaceFormat::Oneline`]은 비-cmux 텍스트 표면일
+///   뿐이며 terse(1행/chain-skip) 여부는 `oneline` 인자와 직교다. 즉 `--surface-format oneline`(=
+///   `Oneline`)이라도 `oneline=false`면 chain/compose + 후행 개행을 거치는 기존 경로를 그대로 탄다.
+///   수집부(parse + codex enrich + system sample)는 표면 분기와 무관하게 재사용된다.
 fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFormat) {
     // (1) stdin 원본 보존(체이닝을 위해 raw 그대로 자식에 전달).
     let raw_stdin = read_stdin();
@@ -760,8 +769,9 @@ fn print_help() {
          \n\
          render 옵션(understatus render 뒤에 사용):\n\
          \x20 --source <s>          입력 소스(claude|lterm). 미지정 시 claude.\n\
-         \x20 --oneline             chain 없이 코어 한 줄만 후행 개행 없이 출력(status row용).\n\
+         \x20 --oneline             chain 없이 코어 한 줄만 후행 개행 없이 출력(terse, status row용).\n\
          \x20 --surface-format <f>  출력 표면(oneline|cmux-status). 미지정 시 oneline.\n\
+         \x20                       (--surface-format은 표면 선택, --oneline은 terse 여부 — 직교)\n\
          \n\
          install 옵션:\n\
          \x20 --interval <N>   refreshInterval 초(정수 ≥ 1). 미지정 시 프롬프트/승계/기본 5.\n\
