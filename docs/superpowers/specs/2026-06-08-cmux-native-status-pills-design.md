@@ -164,24 +164,28 @@ lterm-in-cmux에서 도는 에이전트(codex 등)의 status를, **인그리드 
 
 **수정**:
 ```
-// in-grid DECSTBM: 해당 backend + 정책이 행을 원할 때만(기존 의미 보존)
-let in_grid = status_backend.reserves_in_grid_row() && presence_policy.requests_row();
-// off-grid sink: backend==Cmux + 콘텐츠 명령 구성 + 명시적 비활성 아님. requests_row() 비종속.
+// off-grid sink(pill): backend==Cmux + 콘텐츠 명령 구성 + 명시적 비활성 아님. requests_row() 비종속.
 let sink_enabled = matches!(status_backend, DelegatedSurface(SurfaceKind::Cmux))
     && status_command_config.is_some()   // LTERM_STATUS_COMMAND 설정(understatus 콘텐츠 소스)
     && !status_explicitly_disabled;      // --no-status면 끔
-attach_pty_rows(rows, in_grid)           // Cmux → 풀 rows(rows-1 아님)
+// in-grid DECSTBM: pill 비활성일 때만 기존 status_enabled 동작 보존(!sink_enabled로 상호배타).
+//   → LTERM_STATUS_COMMAND 없는 cmux 셸은 예전대로 DECSTBM(회귀 방지), pill 활성 세션만 off-grid.
+let in_grid = !sink_enabled
+    && status_backend != StatusBackend::Disabled
+    && presence_policy.requests_row();
+attach_pty_rows(rows, in_grid)           // pill 활성 Cmux → 풀 rows(rows-1 아님)
 // 콘텐츠 게이트(in_grid || sink_enabled)로 확장 — sink도 콘텐츠/메타/poll 필요:
 //   명령 스레드 스폰(client.rs:3297), status_info=info(target)(client.rs:3104), idle_wakeup_enabled(client.rs:3099)
 // StatusBar::enter/refresh는 in_grid 경로에서만
 ```
 - **agent-RowOff vs --no-status 구분(구현 요구)**: 정책 `RowOff`는 "agent 기본(→pill OK)"과 "--no-status 명시 비활성(→pill 끔)"을 구분 못 함. 명시적 비활성 신호(`no_status`)를 attach 진입부에서 sink 게이트로 plumb(또는 env 강제-off를 `select_status_backend`가 `Disabled`로 반환).
 - **회귀 게이트(3종, 전부 차단성, §7)**:
-  ① `in_grid`가 Cmux에서 false(DECSTBM+pill 이중렌더 방지).
+  ① sink_enabled일 때 `in_grid==false`(DECSTBM+pill 이중렌더 방지).
   ② **codex agent 세션(RowOff)+cmux+LTERM_STATUS_COMMAND → `sink_enabled==true`**(트랙이 1차 표적에서 켜짐 — R3 BLOCKER 회귀 봉인).
   ③ codex+cmux+**`--no-status` → `sink_enabled==false`**(명시 비활성 존중).
+  ④ **cmux 셸(RowAuto)+LTERM_STATUS_COMMAND 없음 → `in_grid==true`(DECSTBM 보존)**(pill 미사용 세션 회귀 방지).
 - **config 호이스트(Critic m1)**: `StatusCommandConfig::from_env()`는 현재 `status_enabled` 게이트 안(`client.rs:3298`)에서 생성됨 → `sink_enabled`가 `status_command_config.is_some()`를 읽으려면 그 생성을 게이트 밖으로 호이스트.
-- **셸도 포함(Critic m3)**: RowAuto 셸이 cmux에 있으면 `inside_cmux`가 `RowOff` 체크보다 먼저라(`select_status_backend` `client.rs:4543`) backend==Cmux → `in_grid`는 false(Cmux는 `reserves_in_grid_row()`=false)지만 `sink_enabled`는 true → **셸도 pill 받음**(off-grid 안전, 의도된 동작). `in_grid`와 `sink_enabled`는 backend variant상 **상호배타**(동시 true 불가 — DECSTBM+pill 이중렌더 구조적 봉인).
+- **셸 처리(Critic m3 / 구현 회귀 정정)**: cmux RowAuto 셸은 **LTERM_STATUS_COMMAND 있으면 pill**(sink_enabled), **없으면 기존 DECSTBM 보존**(`in_grid = !sink_enabled && backend!=Disabled && requests_row()`). 즉 **pill 미사용 cmux 세션은 동작 불변(회귀 0)** — `reserves_in_grid_row()` 기반 가드는 cmux 셸의 DECSTBM까지 제거해 회귀를 냈으므로 `!sink_enabled` 기반으로 정정. `in_grid`와 `sink_enabled`는 `!sink_enabled` 항으로 **상호배타**(DECSTBM+pill 이중렌더 구조적 봉인).
 
 ### 4.2 워크스페이스 식별 (attach 시점 1회)
 
