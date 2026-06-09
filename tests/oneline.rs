@@ -337,7 +337,9 @@ fn write_deterministic_core_config(tag: &str) -> String {
 }
 
 /// 직교성 고정: `--surface-format oneline`(--oneline 없이)은 플래그 전혀 없는 기본 render와
-/// **byte-identical**이어야 한다(예상치 못한 terse 동작 없음).
+/// **동일 골격**이어야 한다(예상치 못한 terse 동작 없음). 라이브 시스템 지표(cpu/mem 숫자·밴드
+/// 글리프) 때문에 리터럴 byte-identical 단언은 불가하므로, 그 라이브 산출물만 제거한 골격이
+/// byte-identical임을 단언한다(skeleton equivalence).
 ///
 /// `--surface-format`은 표면 선택일 뿐 terse 여부는 `--oneline`가 별도로 정하므로, `oneline`
 /// 표면을 명시해도 chain/compose + 후행 개행을 거치는 기존 경로를 그대로 타야 한다. 비결정 P2
@@ -345,7 +347,7 @@ fn write_deterministic_core_config(tag: &str) -> String {
 /// 의존 산출물(cpu% 숫자 + 밴드 글리프)과 mem% 숫자만 제거로 무력화한 뒤 두 출력 골격이
 /// **byte-identical**임을 단언한다.
 #[test]
-fn surface_format_oneline_is_byte_identical_to_default() {
+fn surface_format_oneline_matches_default_render_skeleton() {
     // claude source(기본) + chain_command 없음 + P2 세그먼트 off → 두 경로가 동일 골격을 낸다.
     let config = write_deterministic_core_config("surface-oneline-identical");
     let stdin = r#"{"session_id":"surface-oneline-identical"}"#;

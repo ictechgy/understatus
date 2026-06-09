@@ -5,6 +5,8 @@
 > 범위: lterm status 라우팅의 `DelegatedSurface(Cmux)` 백엔드 **실렌더 배선**. 다른 미구현 백엔드(NativeChrome/TitleCueDelegation)는 비범위.
 > 교차 레포: lterm = `/Users/jinhongan/Desktop/light_terminal`, understatus = 본 레포.
 > 선행: 라우팅 인프라(`select_status_backend`)는 lterm PR #121(PoC)+#122(배선)로 머지됨(behavior-preserving). 본 문서는 그 위에 실렌더를 얹는다.
+>
+> **⚠️ 개정(구현 중 — quad-review Codex Issue 3): ctx 진행바(`set-progress`) 전면 제거 → ctx는 pill만.** cmux `set-progress`는 **워크스페이스 전역**이라 (a) 다중 pane 클로버, (b) `list-progress` 부재로 SIGKILL 시 stale progress 청소 불가(누수0 위반)다. 따라서 진행바를 버리고 ctx를 **pane-keyed pill**로만 표시한다. **아래에 남은 `progress`/`set-progress`/`clear-progress`/"진행바"/"둘 다" 기술은 전부 이 개정으로 폐기(superseded)** — 실제 출력 JSON엔 `progress` 필드가 없고, sink엔 progress 코드가 없다.
 
 ## 0. 요약 (TL;DR)
 
@@ -30,7 +32,7 @@ lterm-in-cmux에서 도는 에이전트(codex 등)의 status를, **인그리드 
 |---|---|
 | 백엔드 트랙 | **Cmux 우선**(DelegatedSurface(Cmux)) |
 | pill 구성 | **`model` · `ctx` · `cpu` · `mem`** (codex 경로 실가용. cost·git은 lterm 파서에서 구조적 None `claude.rs:288-289`이라 제외 — 띄우려면 별도 payload 확장 트랙) |
-| ctx 표현 | **진행바 + pill 둘 다** |
+| ctx 표현 | ~~진행바 + pill 둘 다~~ → **pill만**(상단 개정: set-progress 워크스페이스 전역 누수로 진행바 제거) |
 | cmux 호출 실패 시 폴백 | **비표시(blackout) + stderr 경고 1줄**(DECSTBM 폴백 안 함 → codex 충돌 재발 방지) |
 | 키 네임스페이스(기본값) | `lterm.<pane>.<seg>` (pane 스코프, sanitized) |
 | 업데이트 간격(기본값) | 기존 `LTERM_STATUS_INTERVAL`(2s) 재사용 + **diff 게이트**(바뀐 pill만 스폰) |
@@ -131,10 +133,11 @@ lterm-in-cmux에서 도는 에이전트(codex 등)의 status를, **인그리드 
    {"key":"cpu","label":null,"value":"cpu 31%","color":"#9ECE6A","icon":null,"priority":100},
    {"key":"mem","label":null,"value":"mem 48%","color":"#A0A0A0","icon":null,"priority":90}
  ],
- "progress":{"value":0.42,"label":"ctx 42%"}}
+ }
 ```
+- (개정) `progress` 필드 **없음** — ctx는 `pills[]`의 `{"key":"ctx",...}` 하나로만 표시.
 - `key`는 **prefix 없는** 세그먼트 id. **lterm이 `key_prefix`를 앞에 붙임**(understatus는 pane 모름 → 순수성 유지).
-- ctx는 **둘 다**: `progress`(진행바) + `pills[]`에 `{"key":"ctx","value":"ctx 42%",...}` 동시 포함(사용자 결정).
+- ctx는 **pill만**: `pills[]`에 `{"key":"ctx","value":"ctx 42%",...}`. 값은 **0..=100 클램프 + 정수% 양자화**.
 - 소스 없음(`None`) 세그먼트는 pill 미생성 → lterm diff가 `clear-status`.
 
 ### 3.4 세그먼트 → pill 매핑 (model·ctx·cpu·mem — codex 경로 실가용)
@@ -142,7 +145,7 @@ lterm-in-cmux에서 도는 에이전트(codex 등)의 status를, **인그리드 
 | understatus 세그먼트(render.rs) | cmux 출력 | 색 소스 | 비고 |
 |---|---|---|---|
 | model (`render.rs:144`, prio 60) | pill `model` (icon `sparkles`) | 신규 accent | codex/claude 세션, bare value |
-| ctx% (`render.rs:153`, prio 50) | **progress + pill `ctx`** | 신규 band | 둘 다(사용자 결정). 진행바 값·pill 텍스트 모두 **정수 %로 양자화**(§4.4) |
+| ctx% (`render.rs:153`, prio 50) | **pill `ctx`만**(개정: 진행바 제거) | 신규 band | 값 0..=100 클램프 + **정수% 양자화**(§4.4) |
 | cpu (`render.rs:87`, prio 100) | pill `cpu` | **`band_tint` 재사용**(`render.rs:244`) | 시스템 샘플링(소스 무관) |
 | mem (`render.rs:101`, prio 90) | pill `mem` | 신규 중립 | 시스템 샘플링(소스 무관) |
 

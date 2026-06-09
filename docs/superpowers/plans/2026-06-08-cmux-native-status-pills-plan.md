@@ -4,6 +4,8 @@
 > 설계 진실원천: `docs/superpowers/specs/2026-06-08-cmux-native-status-pills-design.md`
 > 교차 레포: lterm `/Users/jinhongan/Desktop/light_terminal`, understatus `/Users/jinhongan/Desktop/status_ticon/statusticon`(본 레포)
 > 합의: Planner×2 → Architect×3 → Critic×2. 최종 Critic 클로즈(M1) 반영 완료. Architect R3 = SOUND-WITH-CHANGES(BLOCKER 교정 검증), Critic R2 = "M1 한 줄 수정 → APPROVE"(반영됨).
+>
+> **⚠️ 구현 후 개정(quad-review Codex):** ① ctx 진행바(`set-progress`) 전면 제거 → ctx는 pill만(cmux set-progress 워크스페이스 전역 누수). 아래 C1/C5/C6의 progress·set-progress 기술은 **폐기(superseded)**. ② cmux 호출 타임아웃(3s)·pill key 검증·value/color/icon cap 추가(Codex HIGH 3건). quad-review-loop round 2: lterm APPROVE, understatus 코드 클린.
 
 ---
 
