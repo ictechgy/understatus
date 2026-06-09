@@ -60,8 +60,12 @@ struct Segment {
 
 /// `understatus render --surface-format cmux-status`의 stdout 직렬화 루트(설계 §3.3).
 ///
-/// lterm `CmuxStatusSink`가 이 JSON을 파싱해 cmux `set-status`/`set-progress`로 diff 적용한다.
-/// 한 줄 JSON으로 출력된다(`serde_json::to_string`).
+/// lterm `CmuxStatusSink`가 이 JSON을 파싱해 cmux `set-status`로 diff 적용한다. 한 줄 JSON으로
+/// 출력된다(`serde_json::to_string`).
+///
+/// 진행바(`set-progress`)는 의도적으로 직렬화하지 않는다: cmux `set-progress`가 워크스페이스
+/// 전역이라 페인별 ctx 값이 서로 누수/덮어쓰기(클로버)되기 때문이다. ctx는 pill로만 표시한다
+/// (사용자 결정).
 #[derive(Debug, Serialize, PartialEq)]
 pub struct CmuxStatusOutput {
     /// 스키마 식별자(항상 `"cmux-status"`). lterm sink가 non-JSON/타 스키마를 무해 처리하는 근거.
@@ -70,8 +74,6 @@ pub struct CmuxStatusOutput {
     version: u32,
     /// pill 배열(model/ctx/cpu/mem 중 소스 가용분만).
     pills: Vec<Pill>,
-    /// ctx 진행바(ctx 세그먼트 있으면 `Some`, 없으면 `None`).
-    progress: Option<Progress>,
 }
 
 /// cmux 사이드바 pill 하나(설계 §3.3). `key`는 prefix 없는 세그먼트 id다.
@@ -89,15 +91,6 @@ pub struct Pill {
     icon: Option<String>,
     /// 우선순위(낮을수록 저우선).
     priority: u8,
-}
-
-/// ctx 진행바(설계 §3.3). value는 정수%/100.0(0.0..=1.0), label은 `"ctx NN%"`.
-#[derive(Debug, Serialize, PartialEq)]
-pub struct Progress {
-    /// 진행률(0.0..=1.0). ctx 정수%를 100.0으로 나눈 값(pill 텍스트와 동일 양자화).
-    value: f64,
-    /// 진행바 라벨(`"ctx NN%"`). pill `ctx` value와 동일.
-    label: Option<String>,
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -270,10 +263,12 @@ fn collect_segments(
     // 컨텍스트 사용률%: null이면 세그먼트 생략(AC2). 라벨 "ctx" dim + 값 색 없음.
     if cfg.display.show_context {
         if let Some(context) = input.context_used_percentage {
-            // ctx pill/progress는 정수%로 양자화한다(유휴 스폰 0 + pill·progress 동기화, 설계 §4.4).
-            let context_pct_int = context.round() as u32;
+            // ctx %를 0..=100으로 클램프 + 단일 정수 양자화한다. 한 번 양자화한 정수를 plain/pill
+            // 양쪽에 동일하게 써서 분기 드리프트(plain {:.0}% vs pill round())를 봉인한다(Codex
+            // render.rs:272 지적). >100/음수/NaN 입력에서도 안전하다.
+            let context_pct_int = clamp_ctx_percent(context);
             let mut ctx_segment =
-                label_value_segment("ctx", &format!("{context:.0}%"), 50, cfg, color_on);
+                label_value_segment("ctx", &format!("{context_pct_int}%"), 50, cfg, color_on);
             // ctx pill 값은 동일 정수% 양자화에서 단일 파생. 색은 테마 band 색맵.
             ctx_segment.pill = Some(PillMeta {
                 id: "ctx",
@@ -412,6 +407,19 @@ fn pill_accent_color() -> ColorSpec {
     }
 }
 
+/// ctx 사용률%를 0..=100으로 클램프 + 단일 정수로 양자화한다(plain/pill 공통 소스).
+///
+/// `context_used_percentage`가 100을 넘거나(예 분모 차이로 인한 값 튐) 음수/NaN이어도 안전하게
+/// 0..=100 정수로 수렴시킨다. plain(`format!("{N}%")`)과 pill(`format!("ctx {N}%")`) 양쪽이 이
+/// 한 정수를 공유하므로 양자화 분기 드리프트가 없다(Codex render.rs:272 지적).
+fn clamp_ctx_percent(context: f64) -> u32 {
+    if !context.is_finite() || context <= 0.0 {
+        return 0;
+    }
+    // 0.0 초과가 보장된 시점에서 반올림 후 100으로 상한 클램프.
+    context.round().min(100.0) as u32
+}
+
 /// ctx pill 전용 band 색(테마 일관 상수). 신규 매핑(설계 §5.3).
 ///
 /// `#34D399`(차분한 green) — ctx 진행을 사이드바에서 식별하게 한다.
@@ -450,23 +458,14 @@ fn color_to_hex(color: ColorSpec) -> String {
 ///   드리프트 없음). `pill.is_some()`인 것만 수집한다.
 ///
 /// # 반환
-/// `{schema, version, pills, progress}`. ctx 세그먼트가 있으면 pill과 progress **둘 다** 채운다
-/// (사용자 결정, 설계 §3.3). ctx pill value의 정수%를 100.0으로 나눠 progress value로 쓴다(동일
-/// 양자화 → pill·progress 동기화). ctx가 없으면 progress는 `None`.
+/// `{schema, version, pills}`. ctx 세그먼트는 다른 핵심 세그먼트와 동일하게 pill로만 표시한다.
+/// 진행바(`set-progress`)는 워크스페이스 전역 누수/클로버 때문에 직렬화하지 않는다(사용자 결정).
 fn to_cmux_pills(segments: &[Segment]) -> CmuxStatusOutput {
     let mut pills = Vec::new();
-    let mut progress = None;
     for segment in segments {
         let Some(meta) = segment.pill.as_ref() else {
             continue;
         };
-        // ctx는 pills와 progress 둘 다에 들어간다. progress 값은 pill value의 정수%에서 파생한다.
-        if meta.id == "ctx" {
-            progress = Some(Progress {
-                value: ctx_progress_value(&meta.value),
-                label: Some(meta.value.clone()),
-            });
-        }
         pills.push(Pill {
             key: meta.id.to_string(),
             label: meta.label.clone(),
@@ -480,22 +479,7 @@ fn to_cmux_pills(segments: &[Segment]) -> CmuxStatusOutput {
         schema: "cmux-status",
         version: 1,
         pills,
-        progress,
     }
-}
-
-/// ctx pill value(`"ctx NN%"`)에서 progress value(정수%/100.0)를 파생한다.
-///
-/// pill 텍스트와 동일한 정수% 양자화에서 단일 파생해 pill·progress 동기화를 보장한다(설계 §4.4).
-/// 파싱 실패(미상 포맷)는 0.0으로 안전 저하한다(무패닉).
-fn ctx_progress_value(ctx_value: &str) -> f64 {
-    ctx_value
-        .trim_start_matches("ctx ")
-        .trim_end_matches('%')
-        .trim()
-        .parse::<f64>()
-        .map(|pct| pct / 100.0)
-        .unwrap_or(0.0)
 }
 
 /// 네트워크 throughput 세그먼트를 만든다(↓ ↑ 화살표 dim + 속도 값 색 없음).
@@ -1372,7 +1356,6 @@ mod tests {
             "enrich-실패 3 pill(ctx 부재)"
         );
         assert!(find_pill(&out, "ctx").is_none(), "ctx pill 부재");
-        assert!(out.progress.is_none(), "ctx 부재 → progress None");
         // bare "codex"가 그대로 model pill 값으로 표시(oneline과 동일).
         assert_eq!(find_pill(&out, "model").unwrap().value, "codex");
     }
@@ -1402,7 +1385,7 @@ mod tests {
         );
     }
 
-    /// AC4(ctx 양자화): ctx 41.6% → pill "ctx 42%", progress.value ≈ 0.42(정수%/100).
+    /// AC4(ctx 양자화): ctx 41.6% → pill "ctx 42%"(정수% 반올림). progress는 더 이상 직렬화하지 않는다.
     #[test]
     fn to_cmux_pills_ctx_quantizes_to_integer_percent() {
         let mut input = sample_input();
@@ -1412,17 +1395,26 @@ mod tests {
         let out = render_cmux_pills(&input, &sample_snap(10.0), &cfg, 0, false);
         let ctx = find_pill(&out, "ctx").expect("ctx pill");
         assert_eq!(ctx.value, "ctx 42%", "41.6% → 반올림 42%");
-        let progress = out.progress.as_ref().expect("ctx → progress");
-        assert!(
-            (progress.value - 0.42).abs() < 1e-9,
-            "progress.value ≈ 0.42: {}",
-            progress.value
-        );
-        assert_eq!(
-            progress.label.as_deref(),
-            Some("ctx 42%"),
-            "progress 라벨 = pill 값"
-        );
+    }
+
+    /// ctx 클램프: >100/음수/NaN 입력도 0..=100 정수로 안전 수렴(pill 텍스트 동일 소스).
+    #[test]
+    fn to_cmux_pills_ctx_clamps_out_of_range() {
+        let cases = [
+            (137.0_f64, "ctx 100%"), // 100 초과 → 상한 클램프.
+            (100.4, "ctx 100%"),     // 반올림 후 상한.
+            (-5.0, "ctx 0%"),        // 음수 → 0.
+            (f64::NAN, "ctx 0%"),    // NaN → 0(무패닉).
+        ];
+        for (input_pct, expected) in cases {
+            let mut input = sample_input();
+            input.context_used_percentage = Some(input_pct);
+            let mut cfg = Config::default();
+            cfg.color.mode = "none".to_string();
+            let out = render_cmux_pills(&input, &sample_snap(10.0), &cfg, 0, false);
+            let ctx = find_pill(&out, "ctx").expect("ctx pill");
+            assert_eq!(ctx.value, expected, "{input_pct} → {expected}");
+        }
     }
 
     /// AC5(동기화): pill.value가 해당 세그먼트 plain 값과 일치(model/cpu/mem).

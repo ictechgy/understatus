@@ -320,6 +320,73 @@ fn surface_format_unspecified_defaults_to_oneline() {
     assert!(text.contains('%'), "oneline 코어 세그먼트 유지: {text:?}");
 }
 
+/// 비결정 P2 세그먼트(network/disk/battery)를 모두 끈 격리 config를 만들고 경로를 반환한다.
+///
+/// network throughput은 직전 샘플이 캐시되어야 노출되므로 별도 프로세스 호출 간에 노출 여부가
+/// 흔들린다(첫 샘플 None → 둘째 Some). disk/battery도 호스트 상태 의존이라 비결정적이다. 이들을
+/// 꺼서 CPU 글리프 + cpu% + mem%만 남기면 세그먼트 골격이 호출 간 안정된다(수치만 라이브로 변동).
+fn write_deterministic_core_config(tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "understatus-core-cfg-{}-{}.toml",
+        std::process::id(),
+        tag
+    ));
+    let toml = "[display]\nshow_network = false\nshow_disk = false\nshow_battery = false\n";
+    std::fs::write(&path, toml).expect("임시 config 작성 실패");
+    path.to_string_lossy().into_owned()
+}
+
+/// 직교성 고정: `--surface-format oneline`(--oneline 없이)은 플래그 전혀 없는 기본 render와
+/// **byte-identical**이어야 한다(예상치 못한 terse 동작 없음).
+///
+/// `--surface-format`은 표면 선택일 뿐 terse 여부는 `--oneline`가 별도로 정하므로, `oneline`
+/// 표면을 명시해도 chain/compose + 후행 개행을 거치는 기존 경로를 그대로 타야 한다. 비결정 P2
+/// 세그먼트(network/disk/battery)는 config로 꺼서 세그먼트 골격을 호출 간 고정하고, 라이브 CPU
+/// 의존 산출물(cpu% 숫자 + 밴드 글리프)과 mem% 숫자만 제거로 무력화한 뒤 두 출력 골격이
+/// **byte-identical**임을 단언한다.
+#[test]
+fn surface_format_oneline_is_byte_identical_to_default() {
+    // claude source(기본) + chain_command 없음 + P2 세그먼트 off → 두 경로가 동일 골격을 낸다.
+    let config = write_deterministic_core_config("surface-oneline-identical");
+    let stdin = r#"{"session_id":"surface-oneline-identical"}"#;
+    let default_out = run_understatus_with_config(&["render"], stdin, &config);
+    let explicit_out =
+        run_understatus_with_config(&["render", "--surface-format", "oneline"], stdin, &config);
+    let default_text = String::from_utf8(default_out).expect("stdout는 UTF-8이어야 함");
+    let explicit_text = String::from_utf8(explicit_out).expect("stdout는 UTF-8이어야 함");
+    let _ = std::fs::remove_file(&config);
+
+    // 후행 개행 유지(terse가 아님 = 기존 일반 render 동작).
+    assert!(
+        explicit_text.ends_with('\n'),
+        "--surface-format oneline은 terse가 아니라 후행 개행을 유지해야 함: {explicit_text:?}"
+    );
+    // %를 포함한 코어 세그먼트가 양쪽 모두 존재.
+    assert!(
+        default_text.contains('%'),
+        "기본 코어 세그먼트: {default_text:?}"
+    );
+    assert!(
+        explicit_text.contains('%'),
+        "명시 oneline 코어 세그먼트: {explicit_text:?}"
+    );
+    // 핵심: 라이브 CPU 의존 산출물(cpu% 숫자 + CPU 밴드 글리프) + mem% 숫자를 제거하면, 두 출력
+    // 골격이 byte-identical이어야 한다(추가/누락 세그먼트·후행 개행·구분자 차이가 전혀 없음 =
+    // 직교성 고정). 밴드 글리프(○▁▄▆◆)는 라이브 CPU%에 따라 별도 프로세스 호출 간 달라진다.
+    let strip_live = |text: &str| -> String {
+        text.chars()
+            .filter(|c| {
+                !c.is_ascii_digit() && *c != '.' && !matches!(c, '○' | '▁' | '▄' | '▆' | '◆')
+            })
+            .collect()
+    };
+    assert_eq!(
+        strip_live(&default_text),
+        strip_live(&explicit_text),
+        "라이브 산출물을 제외한 세그먼트 골격은 byte-identical이어야 함:\n  default={default_text:?}\n  explicit={explicit_text:?}"
+    );
+}
+
 /// enrich-실패(bare codex) cmux-status → pill key 집합 {model,cpu,mem}(3), ctx/progress 부재.
 #[test]
 fn surface_format_cmux_status_unenriched_three_pills() {
@@ -345,9 +412,10 @@ fn surface_format_cmux_status_unenriched_three_pills() {
         vec!["cpu", "mem", "model"],
         "enrich-실패 3 pill: {text:?}"
     );
+    // progress 필드는 더 이상 직렬화되지 않는다(set-progress 워크스페이스 전역 누수 회피).
     assert!(
-        value["progress"].is_null(),
-        "ctx 부재 → progress null: {text:?}"
+        value.get("progress").is_none(),
+        "progress 필드는 직렬화에서 제거되어야 함: {text:?}"
     );
     // 색은 #RRGGBB(model 등).
     let model = pills.iter().find(|p| p["key"] == "model").unwrap();
