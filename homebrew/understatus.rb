@@ -9,13 +9,13 @@ class Understatus < Formula
   desc "Claude Code statusline addon: CPU/memory/session info with responsive pulse glyphs"
   homepage "https://github.com/ictechgy/understatus"
 
-  # URL points to the source tarball for the v0.4.0 release tag.
-  url "https://github.com/ictechgy/understatus/archive/refs/tags/v0.4.0.tar.gz"
+  # URL points to the source tarball for the v0.5.0 release tag.
+  url "https://github.com/ictechgy/understatus/archive/refs/tags/v0.5.0.tar.gz"
 
-  # SHA-256 of the v0.4.0 source tarball.
-  #   curl -L https://github.com/ictechgy/understatus/archive/refs/tags/v0.4.0.tar.gz \
+  # SHA-256 of the v0.5.0 source tarball.
+  #   curl -L https://github.com/ictechgy/understatus/archive/refs/tags/v0.5.0.tar.gz \
   #     | shasum -a 256
-  sha256 "483672d256827d8783bb71758212aab0d8942f1181a623e13eca54c4af729da2"
+  sha256 "4fe6384c5aa2e153c39f49c2599bea20b90e5f8a5011d055830de0a5d6d02746"
 
   license "MIT"
 
