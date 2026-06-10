@@ -205,21 +205,78 @@ fn oneline_cols_hint_does_not_force_truncation() {
     );
 }
 
-/// git 세그먼트는 lterm 소스에서 비활성이어야 한다(Phase 1, spec §6.2).
+/// non-git cwd인 lterm 세션은 git 세그먼트가 부재해야 한다(조건부 — 절대 비활성이 아님).
 ///
-/// lterm payload엔 git 도출 입력이 없고 parse_lterm_input이 git_branch를 채우지 않으므로
-/// git 마커(⎇)가 출력에 없어야 한다.
+/// parse_lterm_input은 cwd가 유효 git repo일 때만 git_branch를 채운다(cwd-only). 확실히 non-git인
+/// 격리 임시 경로를 cwd로 주어(우연한 git repo 회피) git 마커(⎇)가 출력에 없음을 검증한다.
+/// (유효 git cwd의 positive 케이스는 oneline_lterm_git_cwd_shows_branch가 담당.)
 #[test]
-fn oneline_lterm_has_no_git_segment() {
-    let stdout = run_understatus(
-        &["render", "--source", "lterm", "--oneline"],
-        r#"{"source":"lterm","session":"codex","pane":"%3","cwd":"/tmp/proj"}"#,
+fn oneline_lterm_non_git_cwd_has_no_git_segment() {
+    // 확실히 non-git인 격리 경로(생성하지 않음 → 존재하지 않는 경로라 `.git`도 없음).
+    let non_git_cwd = std::env::temp_dir().join(format!("understatus-nogit-{}", unique_token()));
+    let stdin = format!(
+        r#"{{"source":"lterm","session":"codex","pane":"%3","cwd":{:?}}}"#,
+        non_git_cwd.to_string_lossy()
     );
+    let stdout = run_understatus(&["render", "--source", "lterm", "--oneline"], &stdin);
     let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
     assert!(
         !text.contains('⎇'),
-        "lterm 소스는 git 세그먼트(⎇)가 없어야 함: {text:?}"
+        "non-git cwd lterm은 git 세그먼트(⎇)가 없어야 함: {text:?}"
     );
+}
+
+/// 유효 git cwd인 lterm 세션은 oneline에 `⎇ <branch>` + cmux-status에 "git" pill을 노출해야 한다.
+///
+/// run_understatus는 서브프로세스이므로 stdin의 cwd가 실재해야 한다 → hermetic temp `.git`을
+/// **spawn 전에 디스크에 생성**한 뒤 두 표면(oneline/cmux-status)을 동일 cwd로 검증한다.
+#[test]
+fn oneline_lterm_git_cwd_shows_branch() {
+    use std::io::Write;
+    // create-before-spawn: 서브프로세스가 읽을 수 있도록 spawn 전에 `.git/HEAD`를 만든다.
+    let tmp = std::env::temp_dir().join(format!("understatus-lterm-git-{}", unique_token()));
+    let git_dir = tmp.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+    let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
+    writeln!(file, "ref: refs/heads/main").expect("HEAD 쓰기 실패");
+
+    let cwd = tmp.to_string_lossy().into_owned();
+    let stdin = format!(
+        r#"{{"source":"lterm","session":"codex","pane":"%3","agent":"codex","cwd":{cwd:?}}}"#
+    );
+
+    // (1) oneline 표면: ⎇ <branch> 표시.
+    let oneline_out = run_understatus(&["render", "--source", "lterm", "--oneline"], &stdin);
+    let oneline_text = String::from_utf8(oneline_out).expect("stdout는 UTF-8이어야 함");
+    assert!(
+        oneline_text.contains("⎇ main"),
+        "유효 git cwd는 oneline에 ⎇ <branch>를 표시해야 함: {oneline_text:?}"
+    );
+
+    // (2) cmux-status 표면: "git" pill(value=="main") 존재.
+    let cmux_out = run_understatus(
+        &[
+            "render",
+            "--source",
+            "lterm",
+            "--surface-format",
+            "cmux-status",
+        ],
+        &stdin,
+    );
+    let cmux_text = String::from_utf8(cmux_out).expect("stdout는 UTF-8이어야 함");
+    let value: serde_json::Value = serde_json::from_str(&cmux_text).expect("valid JSON");
+    let pills = value["pills"].as_array().expect("pills 배열");
+    let git_pill = pills
+        .iter()
+        .find(|p| p["key"] == "git")
+        .expect("git pill이 있어야 함");
+    assert_eq!(
+        git_pill["value"], "main",
+        "git pill 값은 bare 브랜치명: {cmux_text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// lterm 출력에 세션/페인 라벨("session/pane")이 cwd 앞에 표시되어야 한다(--source lterm).

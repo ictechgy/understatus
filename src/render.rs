@@ -324,7 +324,19 @@ fn collect_segments(
     if cfg.display.show_git {
         if let Some(branch) = input.git_branch.as_deref() {
             if !branch.is_empty() {
-                segments.push(label_value_segment("⎇", branch, 40, cfg, color_on));
+                // oneline plain/colored 바이트 보존을 위해 label_value_segment 시그니처는 불변으로 두고,
+                // cmux pill 메타만 additive로 부착한다(model/ctx/mem pill 패턴 동형).
+                let mut git_segment = label_value_segment("⎇", branch, 40, cfg, color_on);
+                git_segment.pill = Some(PillMeta {
+                    id: "git",
+                    label: None,
+                    // bare 브랜치명(model pill 선례). 식별은 git-branch 아이콘이 담당.
+                    value: branch.to_string(),
+                    color: Some(pill_git_color()),
+                    priority: 40,
+                    icon: Some("git-branch"),
+                });
+                segments.push(git_segment);
             }
         }
     }
@@ -439,6 +451,18 @@ fn pill_neutral_color() -> ColorSpec {
         r: 0xa0,
         g: 0xa0,
         b: 0xa0,
+    }
+}
+
+/// git pill 전용 색(테마 일관 상수). 신규 매핑.
+///
+/// `#F1502F`(git 주황) — 브랜치 pill을 사이드바에서 한눈에 식별하게 한다. 기존 4색
+/// (`#7AA2F7`/`#34D399`/`#A0A0A0`/cpu band_tint)과 정적 충돌이 없다.
+fn pill_git_color() -> ColorSpec {
+    ColorSpec {
+        r: 0xf1,
+        g: 0x50,
+        b: 0x2f,
     }
 }
 
@@ -1322,10 +1346,11 @@ mod tests {
         assert_eq!(color_to_hex(ColorSpec { r: 0, g: 5, b: 255 }), "#0005FF");
     }
 
-    /// AC2(가용 집합): enrich-성공 상당(model+ctx+cpu+mem 소스 가용) → pill key 집합 {model,ctx,cpu,mem}(4).
+    /// AC4(가용 집합 + git pill): enrich-성공 상당(model+ctx+cpu+mem+git 소스 가용) →
+    /// pill key 집합 {cpu,ctx,git,mem,model}(5). git pill 값/색/아이콘/우선순위도 함께 고정한다.
     #[test]
-    fn to_cmux_pills_enriched_has_four_keys() {
-        // sample_input: model=Some, ctx=Some(42.0). sample_snap: cpu/mem 무조건. → 4 pill.
+    fn to_cmux_pills_enriched_has_five_keys() {
+        // sample_input: model=Some, ctx=Some(42.0), git_branch=Some("main"). sample_snap: cpu/mem. → 5 pill.
         let mut cfg = Config::default();
         cfg.color.mode = "none".to_string();
         let out = render_cmux_pills(&sample_input(), &sample_snap(58.0), &cfg, 0, false);
@@ -1333,8 +1358,25 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["cpu", "ctx", "mem", "model"],
-            "enrich-성공 4 pill"
+            vec!["cpu", "ctx", "git", "mem", "model"],
+            "enrich-성공 5 pill(git 포함)"
+        );
+        // git pill: bare 브랜치명 + git 주황 + git-branch 아이콘 + priority 40(AC4 positive 앵커).
+        let git = find_pill(&out, "git").expect("git pill");
+        assert_eq!(git.value, "main", "git pill 값은 bare 브랜치명");
+        assert_eq!(
+            git.color.as_deref(),
+            Some(color_to_hex(pill_git_color()).as_str()),
+            "git pill 색은 pill_git_color()"
+        );
+        assert_eq!(
+            git.icon.as_deref(),
+            Some("git-branch"),
+            "git pill 아이콘은 git-branch"
+        );
+        assert_eq!(
+            git.priority, 40,
+            "git pill priority는 40(oneline 세그먼트와 일치)"
         );
     }
 
@@ -1343,6 +1385,7 @@ mod tests {
     fn to_cmux_pills_unenriched_has_three_keys_no_ctx() {
         let mut input = sample_input();
         input.context_used_percentage = None; // enrich 실패 → ctx 없음.
+        input.git_branch = None; // git 무관(이 테스트 의도 = ctx-skip + bare model).
         input.model_display_name = Some("codex".to_string()); // bare agent 토큰 폴백.
         let mut cfg = Config::default();
         cfg.color.mode = "none".to_string();
@@ -1474,6 +1517,7 @@ mod tests {
         let mut input = sample_input();
         input.model_display_name = None; // model 세그먼트 없음.
         input.context_used_percentage = None; // ctx 없음.
+        input.git_branch = None; // git pill 무관(이 테스트 의도 = pill:None 세그먼트 제외).
         let mut cfg = Config::default();
         cfg.color.mode = "none".to_string();
         let out = render_cmux_pills(&input, &sample_snap(10.0), &cfg, 0, false);
