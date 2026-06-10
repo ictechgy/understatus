@@ -15,6 +15,8 @@ Most statusline widgets are noisy. understatus is designed around one principle:
 - **Non-destructive chaining** — `understatus install` detects your existing `statusLine.command`, preserves it in config, and chains it. `uninstall` restores byte-for-byte. Your current setup is never lost.
 
 > **macOS only.** Apple Silicon (arm64) + Intel (x86\_64). Linux is not supported.
+>
+> **No Xcode required for the prebuilt paths.** Homebrew and npm install a **prebuilt binary** (deployment target macOS 11.0), so they need **no Xcode Command Line Tools and no Rust toolchain**, and run on **macOS 11 (Big Sur) and newer**. Only `cargo install` / building from source compiles locally and therefore needs the Rust toolchain + Command Line Tools.
 
 ---
 
@@ -26,15 +28,9 @@ Most statusline widgets are noisy. understatus is designed around one principle:
 brew install ictechgy/understatus/understatus
 ```
 
+Installs a prebuilt binary — **no Xcode Command Line Tools, no Rust, no compilation.**
+
 > The formula lives in the tap `ictechgy/understatus` (repo: `ictechgy/homebrew-understatus`).
-
-### Cargo
-
-```bash
-cargo install understatus
-```
-
-Requires Rust 1.75+.
 
 ### npm
 
@@ -42,7 +38,15 @@ Requires Rust 1.75+.
 npm install -g understatus
 ```
 
-The npm package shells out to the prebuilt macOS binary for your architecture (arm64 / x64). macOS only.
+The npm package downloads the prebuilt macOS binary for your architecture (arm64 / x64) and verifies its SHA-256. **No Xcode / Rust required.** macOS only.
+
+### Cargo
+
+```bash
+cargo install understatus
+```
+
+Requires Rust 1.75+ **and** the Xcode Command Line Tools (this path compiles from source). If you want to avoid installing the toolchain, use Homebrew or npm above.
 
 ### From source
 
