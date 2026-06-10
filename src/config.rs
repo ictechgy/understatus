@@ -33,6 +33,8 @@ pub struct Config {
     pub refresh: RefreshConfig,
     /// `[codex]`: Codex 세션 심층판독(opt-out, freshness, 스캔 일수).
     pub codex: CodexConfig,
+    /// `[context]`: ctx(컨텍스트 사용률%) hold 튜닝(직전 native 유지 시간, hold 해제 임계치).
+    pub context: ContextConfig,
 }
 
 /// `[cpu]` 섹션. 임계값은 진짜 순간 CPU%(0–100) 기준.
@@ -173,6 +175,39 @@ pub struct CodexConfig {
     pub scan_days: usize,
 }
 
+/// `[context].hold_ttl_seconds`의 serde/Default 기본값(초).
+///
+/// native(`used_percentage`) 누락 프레임에서 직전 native를 유지(hold)할 최대 시간.
+/// 다른 모듈/테스트가 "프로덕션 기본 TTL"을 재사용할 수 있도록 pub 상수로 노출한다.
+pub const DEFAULT_CONTEXT_HOLD_TTL_SECONDS: u64 = 180;
+
+/// `[context].drop_tolerance`의 serde/Default 기본값(%포인트).
+///
+/// hold를 깨고 토큰 fallback으로 전환하는 하강 임계치. 관측된 native↔토큰 분모 차이(86↔98=12%p)를
+/// 흡수하는 경계값이라, 다른 모듈/테스트가 "프로덕션 기본 tolerance"를 재사용할 수 있도록 pub 상수로 노출한다.
+pub const DEFAULT_CONTEXT_DROP_TOLERANCE: f64 = 12.0;
+
+/// `[context]` 섹션. ctx(컨텍스트 사용률%) hold 동작의 반응성/안정성 튜닝.
+///
+/// Claude Code가 `used_percentage`를 간헐적으로 누락할 때 직전 native를 얼마나 오래 유지할지
+/// (`hold_ttl_seconds`)와, 토큰 fallback이 얼마나 낮아져야 hold를 깨고 실제 감소로 반영할지
+/// (`drop_tolerance`)를 제어한다. 기본값은 반응성을 높이는 방향으로 조정되어 있다.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// native 누락 시 직전 native를 유지(hold)할 최대 시간(초). 기본 180.
+    ///
+    /// 낮출수록 실제값 추종이 빨라지지만, native·토큰이 둘 다 0인 구간에선 ctx가 잠깐 빌 수 있다.
+    /// `0`이면 hold가 비활성화되어(TTL 0 = 항상 stale) native 누락 즉시 토큰 fallback으로 저하한다.
+    pub hold_ttl_seconds: u64,
+    /// hold를 깨고 토큰 fallback으로 전환하는 하강 임계치(%포인트). 기본 12.0.
+    ///
+    /// 토큰 fallback이 직전 native보다 이만큼 이상 낮으면 실제 컨텍스트 감소(예: `/compact`)로 보고
+    /// hold를 깬다. ⚠️ 12 미만으로 낮추면 native↔토큰 분모 차이(관측 86↔98=12%p)로 인한 깜빡임이
+    /// 재발할 수 있다.
+    pub drop_tolerance: f64,
+}
+
 impl Default for CpuConfig {
     fn default() -> Self {
         Self {
@@ -271,6 +306,19 @@ impl Default for CodexConfig {
     }
 }
 
+impl Default for ContextConfig {
+    /// ctx hold 기본값: TTL=180초(반응성↑), drop_tolerance=12.0%p(분모 노이즈 흡수 경계).
+    ///
+    /// 기본값은 단일 출처([`DEFAULT_CONTEXT_HOLD_TTL_SECONDS`]/[`DEFAULT_CONTEXT_DROP_TOLERANCE`])를
+    /// 참조해 다른 모듈·테스트와 일관성을 유지한다.
+    fn default() -> Self {
+        Self {
+            hold_ttl_seconds: DEFAULT_CONTEXT_HOLD_TTL_SECONDS,
+            drop_tolerance: DEFAULT_CONTEXT_DROP_TOLERANCE,
+        }
+    }
+}
+
 /// `theme` 필드의 serde 기본값("calm"). 키 부재 = calm = 현행 동일(하위호환).
 fn default_theme() -> String {
     "calm".to_string()
@@ -290,6 +338,7 @@ impl Default for Config {
             color: ColorConfig::default(),
             refresh: RefreshConfig::default(),
             codex: CodexConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 }
@@ -770,5 +819,30 @@ mod tests {
             config.color.band_tints,
             vec!["#2fd36b", "#d4d13e", "#f0922e", "#e8443a", "#d23ad0"]
         );
+    }
+
+    /// `[context]` 기본값: hold_ttl_seconds=180(반응성↑), drop_tolerance=12.0(분모 노이즈 흡수).
+    #[test]
+    fn context_default_values() {
+        let context = ContextConfig::default();
+        assert_eq!(context.hold_ttl_seconds, 180);
+        assert_eq!(context.drop_tolerance, 12.0);
+    }
+
+    /// `[context]` 부분 설정은 명시한 키만 반영한다(serde default 병합).
+    #[test]
+    fn context_partial_toml_parses() {
+        let toml = "[context]\nhold_ttl_seconds = 300\ndrop_tolerance = 8.0\n";
+        let config = parse_config_str(toml);
+        assert_eq!(config.context.hold_ttl_seconds, 300);
+        assert_eq!(config.context.drop_tolerance, 8.0);
+    }
+
+    /// `[context]` 섹션 누락 시 기본값으로 채워진다(serde default).
+    #[test]
+    fn context_missing_section_uses_defaults() {
+        let config = parse_config_str("");
+        assert_eq!(config.context.hold_ttl_seconds, 180);
+        assert_eq!(config.context.drop_tolerance, 12.0);
     }
 }
