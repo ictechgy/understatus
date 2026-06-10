@@ -377,6 +377,11 @@ fn is_safe_base_path(base_path: &str) -> bool {
 /// # 반환
 /// `ref: refs/heads/<branch>` 형식의 HEAD에서 추출한 `<branch>`. detached HEAD(직접 SHA)나
 /// 읽기 실패 시 `None`. 부재/실패에 안전(절대 패닉하지 않음).
+///
+/// # 주의
+/// branch명은 제어문자 미포함만 허용한다(터미널/status 인젝션 방어). 신뢰 불가 `.git/HEAD`가
+/// ESC/개행/CR 등 제어문자가 섞인 branch명을 담으면 oneline SGR/cmux pill로 그대로 렌더돼
+/// 인젝션이 되므로, 정상 git branch명이 절대 갖지 않는 제어문자를 source chokepoint에서 거부한다.
 fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     use std::path::Path;
     // 표준 워크트리는 `<base>/.git/HEAD`. (linked worktree의 gitfile 케이스는 v1 범위 밖.)
@@ -393,7 +398,9 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     let trimmed = contents.trim();
     // 심볼릭 ref만 브랜치명을 가진다: "ref: refs/heads/main".
     let branch = trimmed.strip_prefix("ref: refs/heads/")?;
-    if branch.is_empty() {
+    // 인젝션 방어: 신뢰 불가 HEAD 내용에 제어문자(ESC/개행/CR/기타 C0·DEL)가 섞이면 거부한다.
+    // 정상 git branch명은 제어문자를 절대 갖지 않으므로 정상 케이스 회귀는 0이다.
+    if branch.is_empty() || branch.chars().any(char::is_control) {
         None
     } else {
         Some(branch.to_string())
@@ -418,9 +425,16 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
 ///   **후속 기여자는 무심코 부모 상승을 추가하지 말 것.**
 /// - 외부 입력 cwd traversal 방어는 [`is_safe_base_path`], 심볼릭 방어는 [`read_branch_from_git_dir`]의
 ///   canonicalize 가드가 담당한다(기존 Claude 경로와 동일 검증 재사용 — 새 fs 순회 0).
+/// - 상대경로 cwd는 거부한다(프로세스 cwd 기준 false-positive 방지). `"."`/`"repo"`처럼 `..`가
+///   없어 traversal 검사를 통과해도, understatus 프로세스 cwd 기준으로 해석돼 엉뚱한 위치의
+///   branch를 도출하는 cwd-only 계약 위반이 되므로 절대경로만 허용한다.
 fn derive_git_branch_from_cwd(cwd: &str) -> Option<String> {
     // traversal 차단: `..`가 섞인 cwd는 임의 위치 `.git/HEAD` 탐색을 노릴 수 있어 거부한다.
     if !is_safe_base_path(cwd) {
+        return None;
+    }
+    // 상대경로 거부: 프로세스 cwd 기준 해석으로 엉뚱한 repo branch를 도출하는 false-positive를 막는다.
+    if !std::path::Path::new(cwd).is_absolute() {
         return None;
     }
     // 부모 상승 없이 `<cwd>/.git/HEAD`만 1회 읽는다(cwd-only).
@@ -610,6 +624,25 @@ struct RawLtermInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 호출마다 고유한 비존재 절대 temp 경로를 반환한다(테스트 격리).
+    ///
+    /// # 인자
+    /// - `label`: 경로를 사람이 식별하기 위한 라벨(테스트 의도 표시).
+    ///
+    /// # 반환
+    /// `<temp_dir>/understatus-<label>-<pid>-<seq>` 형태의 고유 절대 경로(미생성).
+    ///
+    /// # 주의
+    /// `process::id()` 단독은 같은 프로세스 내 스레드 병렬 실행 시 prefix가 같으면 충돌·stale
+    /// 누수 위험이 있다. `AtomicU64` 정적 카운터를 조합해 호출마다 고유 경로를 보장한다.
+    /// 경로는 생성하지 않으므로, `.git` 없는 비존재 경로가 필요한 negative 테스트에도 그대로 쓴다.
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("understatus-{label}-{}-{seq}", std::process::id()))
+    }
 
     /// 정상 JSON: 모든 필드가 올바르게 평탄화되어야 한다(AC2).
     #[test]
@@ -1206,9 +1239,8 @@ mod tests {
     #[test]
     fn derive_from_cwd_ok_branch() {
         use std::io::Write;
-        // 테스트별 distinct static suffix + pid로 병렬 충돌을 차단한다(claude.rs git 테스트 컨벤션).
-        let tmp =
-            std::env::temp_dir().join(format!("understatus-lterm-git-ok-{}", std::process::id()));
+        // 호출마다 고유 절대경로(AtomicU64 + pid)로 병렬 충돌·stale 누수를 차단한다.
+        let tmp = unique_test_dir("lterm-git-ok");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
@@ -1223,10 +1255,7 @@ mod tests {
     /// detached HEAD(직접 SHA)는 브랜치명이 없으므로 None이어야 한다(AC2).
     #[test]
     fn derive_from_cwd_detached_head_none() {
-        let tmp = std::env::temp_dir().join(format!(
-            "understatus-lterm-git-detached-{}",
-            std::process::id()
-        ));
+        let tmp = unique_test_dir("lterm-git-detached");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         std::fs::write(git_dir.join("HEAD"), "0123456789abcdef\n").expect("HEAD 쓰기 실패");
@@ -1239,10 +1268,7 @@ mod tests {
     /// `.git` 부재 cwd(존재하나 git이 아닌 디렉터리) → None(AC2).
     #[test]
     fn derive_from_cwd_no_git_dir_none() {
-        let tmp = std::env::temp_dir().join(format!(
-            "understatus-lterm-git-nogit-{}",
-            std::process::id()
-        ));
+        let tmp = unique_test_dir("lterm-git-nogit");
         std::fs::create_dir_all(&tmp).expect("임시 디렉터리 생성 실패");
 
         assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
@@ -1262,10 +1288,7 @@ mod tests {
     #[cfg(unix)]
     fn derive_from_cwd_symlink_head_pointing_outside_none() {
         use std::os::unix::fs::symlink;
-        let tmp = std::env::temp_dir().join(format!(
-            "understatus-lterm-git-symlink-{}",
-            std::process::id()
-        ));
+        let tmp = unique_test_dir("lterm-git-symlink");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         // `.git/HEAD`가 아닌 외부 파일을 유효 ref로 만든 뒤, HEAD를 그 파일로 심볼릭 링크한다.
@@ -1279,25 +1302,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// BLOCKER 회귀 가드: 제어문자(ESC/개행)가 섞인 branch명은 거부돼 None이어야 한다.
+    /// 악성 repo의 `.git/HEAD`가 `ref: refs/heads/main␛[31m…`처럼 인젝션 페이로드를 담아도
+    /// source chokepoint(read_branch_from_git_dir)에서 차단됨을 실증한다.
+    #[test]
+    fn derive_from_cwd_rejects_control_chars() {
+        let tmp = unique_test_dir("lterm-git-ctrl");
+        let git_dir = tmp.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+        // ESC(SGR) 인젝션 페이로드를 branch명에 심는다.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\x1b[31mX\n")
+            .expect("HEAD 쓰기 실패");
+        assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
+
+        // 개행 인젝션도 동일하게 거부돼야 한다.
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\nINJECT\n")
+            .expect("HEAD 쓰기 실패");
+        assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 상대경로 cwd는 프로세스 cwd 기준 false-positive를 막기 위해 거부돼 None이어야 한다.
+    #[test]
+    fn derive_from_cwd_rejects_relative_cwd() {
+        assert_eq!(derive_git_branch_from_cwd("repo"), None);
+        assert_eq!(derive_git_branch_from_cwd("./x"), None);
+    }
+
     // === parse_lterm_input (spec §6.2, §10) ===
 
     /// 정상 lterm JSON: 표시 필드가 정확히 매핑된다. git_branch는 cwd가 실존하지 않는
     /// non-git 경로라 None(조건부 부재 — 절대 비활성이 아님. 유효 git cwd 케이스는 별도 테스트).
     #[test]
     fn lterm_parses_normal_input() {
-        let raw = r#"{
+        // 비존재 고유 절대 temp 경로: `.git` 없으니 branch는 항상 None(host-독립).
+        let cwd = unique_test_dir("lterm-normal");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let raw = format!(
+            r#"{{
             "source": "lterm",
             "version": 1,
             "session": "codex",
             "pane": "%3",
             "session_key": "codex/%3",
             "agent": "codex",
-            "cwd": "/Users/me/dev/app",
+            "cwd": {cwd_str:?},
             "cols": 120,
             "rows": 40
-        }"#;
-        let input = parse_lterm_input(raw);
-        assert_eq!(input.cwd.as_deref(), Some("/Users/me/dev/app"));
+        }}"#
+        );
+        let input = parse_lterm_input(&raw);
+        assert_eq!(input.cwd.as_deref(), Some(cwd_str.as_str()));
         assert_eq!(input.model_display_name.as_deref(), Some("codex"));
         assert_eq!(input.session_id.as_deref(), Some("codex/%3"));
         // non-git cwd(실존하지 않는 경로)라 branch 없음(조건부 — 절대 비활성이 아님).
@@ -1317,31 +1373,39 @@ mod tests {
     /// 미상/추가 필드가 섞여도 무시하고 정상 매핑해야 한다(lenient, 무패닉).
     #[test]
     fn lterm_unknown_fields_ignored() {
-        let raw = r#"{
+        // 비존재 고유 절대 temp 경로: `.git` 없으니 branch는 항상 None(host-독립).
+        let cwd = unique_test_dir("lterm-unknown");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let raw = format!(
+            r#"{{
             "source": "lterm",
             "session": "s",
             "pane": "%1",
-            "cwd": "/tmp/x",
-            "future_field": { "nested": [1, 2, 3] },
+            "cwd": {cwd_str:?},
+            "future_field": {{ "nested": [1, 2, 3] }},
             "another": "ignored"
-        }"#;
-        let input = parse_lterm_input(raw);
-        assert_eq!(input.cwd.as_deref(), Some("/tmp/x"));
+        }}"#
+        );
+        let input = parse_lterm_input(&raw);
+        assert_eq!(input.cwd.as_deref(), Some(cwd_str.as_str()));
         assert_eq!(input.session_id.as_deref(), Some("s/%1"));
-        // non-git cwd(`/tmp/x`에 `.git` 없음)라 branch 없음(조건부 부재).
+        // non-git cwd(`.git` 없는 비존재 경로)라 branch 없음(조건부 부재).
         assert_eq!(input.git_branch, None);
     }
 
     /// 필드 누락: 부재 필드는 전부 None(또는 합성)으로 안전 저하해야 한다(무패닉).
     #[test]
     fn lterm_missing_fields_default_to_none() {
-        let raw = r#"{ "source": "lterm", "cwd": "/only/cwd" }"#;
-        let input = parse_lterm_input(raw);
-        assert_eq!(input.cwd.as_deref(), Some("/only/cwd"));
+        // 비존재 고유 절대 temp 경로: `.git` 없으니 branch는 항상 None(host-독립).
+        let cwd = unique_test_dir("lterm-missing");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let raw = format!(r#"{{ "source": "lterm", "cwd": {cwd_str:?} }}"#);
+        let input = parse_lterm_input(&raw);
+        assert_eq!(input.cwd.as_deref(), Some(cwd_str.as_str()));
         assert_eq!(input.model_display_name, None);
         // session/pane 둘 다 부재 → session_key 합성 불가 → None.
         assert_eq!(input.session_id, None);
-        // non-git cwd(실존하지 않는 `/only/cwd`)라 branch 없음(조건부 부재).
+        // non-git cwd(`.git` 없는 비존재 경로)라 branch 없음(조건부 부재).
         assert_eq!(input.git_branch, None);
         assert_eq!(input.context_used_percentage, None);
         assert_eq!(input.cost_usd, None);
@@ -1439,21 +1503,26 @@ mod tests {
     /// default로 저하되며 정상 필드까지 소실됐다.
     #[test]
     fn lterm_ignored_field_type_drift_preserves_useful_fields() {
-        let raw = r#"{
+        // 비존재 고유 절대 temp 경로: `.git` 없으니 branch는 항상 None(host-독립).
+        let cwd = unique_test_dir("lterm-drift");
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let raw = format!(
+            r#"{{
             "session": "codex",
             "pane": "%3",
             "agent": "codex",
-            "cwd": "/Users/me/dev/app",
+            "cwd": {cwd_str:?},
             "version": "1",
             "cols": "120",
             "rows": "40"
-        }"#;
-        let input = parse_lterm_input(raw);
+        }}"#
+        );
+        let input = parse_lterm_input(&raw);
         // 타입 드리프트한 ignored 필드가 있어도 useful 필드가 살아남아야 한다.
         assert_eq!(input.session_id.as_deref(), Some("codex/%3"));
         assert_eq!(input.model_display_name.as_deref(), Some("codex"));
-        assert_eq!(input.cwd.as_deref(), Some("/Users/me/dev/app"));
-        // non-git cwd(실존하지 않는 경로)라 branch 없음(조건부 부재).
+        assert_eq!(input.cwd.as_deref(), Some(cwd_str.as_str()));
+        // non-git cwd(`.git` 없는 비존재 경로)라 branch 없음(조건부 부재).
         assert_eq!(input.git_branch, None);
     }
 
@@ -1462,10 +1531,7 @@ mod tests {
     #[test]
     fn lterm_git_cwd_derives_branch() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "understatus-lterm-parse-git-{}",
-            std::process::id()
-        ));
+        let tmp = unique_test_dir("lterm-parse-git");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
