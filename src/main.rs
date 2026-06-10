@@ -528,37 +528,35 @@ fn print_themes() {
 /// 유지해 토큰 fallback으로의 값 튐을 막는다(pulse_state/net_counters와 동일한 단기 TTL 캐시 예외).
 const CONTEXT_NATIVE_CACHE: &str = "ctx_native";
 
-/// 직전 native ctx를 유지하는 최대 시간(초). 이보다 오래 native가 누락되면 토큰 fallback으로 저하한다.
-///
-/// Claude Code는 긴 세션에서 `used_percentage`와 토큰(`current_usage`/`total_input_tokens`)을 **모두
-/// 0/null로 보내는 프레임**을 수십 초~수 분간 지속하는 경우가 있다(라이브 관측: 양수 native 직후
-/// ~98초간 0 지속, omc HUD도 같은 프레임에 `ctx:0%`). 그 구간엔 토큰 fallback도 분자가 0이라 불가
-/// 하므로, 직전 native를 충분히 길게(10분) 유지해야 ctx가 사라지지 않는다.
-///
-/// 갱신/안전 모델: hold 프레임은 TTL을 재시작하지 않으므로(양수 native를 본 프레임만 영속화) 이 시계는
-/// **마지막 실제 native 시점부터** 흐른다 — native가 주기적으로 오는 활성 세션에선 사실상 계속 갱신되어
-/// 만료되지 않고, "native가 10분 내내 한 번도 안 온" 장기 idle에서만 만료된다. 실제 컨텍스트 급감은
-/// 비대칭 하강 가드([`claude::resolve_context_percent`])가 토큰이 양수로 줄 때 즉시 반영하므로,
-/// 긴 TTL의 stale-high 노출 위험은 "native·토큰이 둘 다 0인 동안"으로 한정된다(그 구간엔 직전 값이
-/// 최선의 추정).
-const CONTEXT_HOLD_TTL_SECONDS: u64 = 600;
-
 /// Claude 소스의 ctx 사용률%를 해석해 `claude_input.context_used_percentage`에 확정한다.
 ///
 /// [`claude::resolve_context_percent`]로 native·토큰 fallback·직전 native(hold)를 종합한다.
 /// 양수 native를 본 프레임에서는 그 값을 세션 캐시에 기록해 이후 누락 프레임이 유지(hold)에
 /// 쓰도록 한다. 모든 캐시 I/O는 best-effort이며 실패해도 패닉하지 않는다.
 ///
+/// hold 튜닝(TTL·하강 임계치)은 `[context]` 설정([`config::ContextConfig`])에서 주입한다.
+/// Claude Code는 긴 세션에서 `used_percentage`와 토큰을 **모두 0/null로 보내는 프레임**을 지속할 수
+/// 있어(라이브 관측: 양수 native 직후 ~98초간 0 지속), 그 구간엔 토큰 fallback도 불가하므로
+/// 직전 native를 `hold_ttl_seconds`만큼 유지해 ctx가 사라지지 않게 한다. hold 프레임은 TTL을
+/// 재시작하지 않으므로(양수 native를 본 프레임만 영속화) 시계는 **마지막 실제 native 시점부터** 흐른다.
+///
 /// # 인자
 /// - `claude_input`: 해석 결과를 반영할 입력(in-place 갱신).
 /// - `session_key`: 세션 캐시 격리 키(이미 살균됨).
 /// - `now_ms`: 현재 시각(epoch ms). TTL 판정·캐시 타임스탬프에 사용.
-fn resolve_claude_context(claude_input: &mut claude::ClaudeInput, session_key: &str, now_ms: u128) {
-    let held_native = read_held_native_ctx(session_key, now_ms);
+/// - `ctx_cfg`: ctx hold 튜닝(`hold_ttl_seconds`/`drop_tolerance`).
+fn resolve_claude_context(
+    claude_input: &mut claude::ClaudeInput,
+    session_key: &str,
+    now_ms: u128,
+    ctx_cfg: &config::ContextConfig,
+) {
+    let held_native = read_held_native_ctx(session_key, now_ms, ctx_cfg.hold_ttl_seconds);
     let resolution = claude::resolve_context_percent(
         claude_input.context_used_percentage,
         claude_input.context_fallback_percentage,
         held_native,
+        ctx_cfg.drop_tolerance,
     );
     claude_input.context_used_percentage = resolution.display;
     // 양수 native를 본 프레임만 영속화한다(유지 프레임은 재기록하지 않아 TTL이 마지막 실제
@@ -573,16 +571,21 @@ fn resolve_claude_context(claude_input: &mut claude::ClaudeInput, session_key: &
     }
 }
 
-/// 세션 캐시에서 TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내 직전 양수 native ctx%를 읽는다.
+/// 세션 캐시에서 TTL(`ttl_seconds`) 내 직전 양수 native ctx%를 읽는다.
 ///
 /// I/O(세션 캐시 읽기)는 여기서 하고, TTL·파싱·유한성 판정은 순수 [`interpret_held_native_ctx`]에
 /// 위임해 HOME 의존 없이 단위 테스트할 수 있게 한다.
 ///
+/// # 인자
+/// - `session_key`: 세션 캐시 격리 키.
+/// - `now_ms`: 현재 시각(epoch ms). TTL 판정 기준.
+/// - `ttl_seconds`: hold 유지 시간(초, config `[context].hold_ttl_seconds`).
+///
 /// # 반환
 /// 신선한 직전 native가 있으면 `Some(percent)`. 항목 부재/stale/파싱 실패/비유한이면 `None`.
-fn read_held_native_ctx(session_key: &str, now_ms: u128) -> Option<f64> {
+fn read_held_native_ctx(session_key: &str, now_ms: u128, ttl_seconds: u64) -> Option<f64> {
     let entry = chain::read_session_named_cache(session_key, CONTEXT_NATIVE_CACHE);
-    interpret_held_native_ctx(entry, now_ms)
+    interpret_held_native_ctx(entry, now_ms, ttl_seconds)
 }
 
 /// 세션 캐시 읽기 결과 `(written_ms, payload)`를 직전 native ctx%로 해석한다(순수, I/O 없음).
@@ -598,13 +601,18 @@ fn read_held_native_ctx(session_key: &str, now_ms: u128) -> Option<f64> {
 /// # 인자
 /// - `entry`: 캐시 읽기 결과. `None`이면 항목 부재.
 /// - `now_ms`: 현재 시각(epoch ms). TTL 판정 기준.
+/// - `ttl_seconds`: hold 유지 시간(초, config `[context].hold_ttl_seconds`).
 ///
 /// # 반환
-/// TTL([`CONTEXT_HOLD_TTL_SECONDS`]) 내이고 `0 < v <= 100`인 유한 `f64`로 파싱되면 `Some(percent)`,
+/// TTL(`ttl_seconds`) 내이고 `0 < v <= 100`인 유한 `f64`로 파싱되면 `Some(percent)`,
 /// 아니면 `None`.
-fn interpret_held_native_ctx(entry: Option<(u128, String)>, now_ms: u128) -> Option<f64> {
+fn interpret_held_native_ctx(
+    entry: Option<(u128, String)>,
+    now_ms: u128,
+    ttl_seconds: u64,
+) -> Option<f64> {
     let (written_ms, payload) = entry?;
-    if !chain::is_named_cache_fresh(written_ms, now_ms, CONTEXT_HOLD_TTL_SECONDS) {
+    if !chain::is_named_cache_fresh(written_ms, now_ms, ttl_seconds) {
         return None;
     }
     payload
@@ -672,7 +680,7 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
     //   ctx 세그먼트가 사라지지 않게 하고, native↔토큰 분모 차이로 인한 값 튐(예: 86↔98)을 막는다.
     //   lterm/codex 경로는 context_window가 없어 자연 no-op이므로 Claude로 게이팅한다.
     if source == Source::Claude {
-        resolve_claude_context(&mut claude_input, &session_key, now_ms);
+        resolve_claude_context(&mut claude_input, &session_key, now_ms, &cfg.context);
     }
 
     // (6') --surface-format cmux-status: SGR 한 줄 대신 cmux pill JSON 1줄을 출력하고 종료한다.
@@ -1170,7 +1178,10 @@ mod tests {
     /// 캐시 항목 부재면 None(유지값 없음).
     #[test]
     fn interpret_held_missing_entry_is_none() {
-        assert_eq!(interpret_held_native_ctx(None, 10_000), None);
+        assert_eq!(
+            interpret_held_native_ctx(None, 10_000, config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS),
+            None
+        );
     }
 
     /// TTL 내 정수/소수 payload는 그대로 복원된다(`format!`↔`parse` 라운드트립).
@@ -1181,21 +1192,30 @@ mod tests {
         for value in [86.0_f64, 33.7, 100.0, 12.5, 0.5] {
             let payload = format!("{value}");
             assert_eq!(
-                interpret_held_native_ctx(Some((1_000, payload)), 1_000),
+                interpret_held_native_ctx(
+                    Some((1_000, payload)),
+                    1_000,
+                    config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+                ),
                 Some(value),
                 "값 {value} 라운드트립 실패",
             );
         }
     }
 
-    /// TTL 경계: 정확히 TTL이면 신선(유지), 1ms 초과면 stale(None).
+    /// TTL 경계: 정확히 TTL이면 신선(유지), 1ms 초과면 stale(None). 프로덕션 기본 TTL 기준으로 검증.
     #[test]
     fn interpret_held_respects_ttl_boundary() {
-        let ttl_ms = (CONTEXT_HOLD_TTL_SECONDS as u128) * 1_000;
-        let at_ttl = interpret_held_native_ctx(Some((1_000, "86".to_string())), 1_000 + ttl_ms);
+        let ttl_seconds = config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS;
+        let ttl_ms = (ttl_seconds as u128) * 1_000;
+        let at_ttl =
+            interpret_held_native_ctx(Some((1_000, "86".to_string())), 1_000 + ttl_ms, ttl_seconds);
         assert_eq!(at_ttl, Some(86.0), "경계(정확히 TTL)는 유지");
-        let past_ttl =
-            interpret_held_native_ctx(Some((1_000, "86".to_string())), 1_000 + ttl_ms + 1);
+        let past_ttl = interpret_held_native_ctx(
+            Some((1_000, "86".to_string())),
+            1_000 + ttl_ms + 1,
+            ttl_seconds,
+        );
         assert_eq!(past_ttl, None, "TTL 초과는 stale → None");
     }
 
@@ -1203,7 +1223,11 @@ mod tests {
     #[test]
     fn interpret_held_clock_skew_is_stale() {
         assert_eq!(
-            interpret_held_native_ctx(Some((2_000, "86".to_string())), 1_000),
+            interpret_held_native_ctx(
+                Some((2_000, "86".to_string())),
+                1_000,
+                config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+            ),
             None
         );
     }
@@ -1213,7 +1237,11 @@ mod tests {
     fn interpret_held_rejects_garbage_and_nonfinite() {
         for bad in ["abc", "", "NaN", "inf", "-inf"] {
             assert_eq!(
-                interpret_held_native_ctx(Some((1_000, bad.to_string())), 1_000),
+                interpret_held_native_ctx(
+                    Some((1_000, bad.to_string())),
+                    1_000,
+                    config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+                ),
                 None,
                 "payload {bad:?}는 None이어야 함",
             );
@@ -1225,18 +1253,30 @@ mod tests {
     fn interpret_held_rejects_out_of_range() {
         for bad in ["150", "101", "0", "-5", "1e24"] {
             assert_eq!(
-                interpret_held_native_ctx(Some((1_000, bad.to_string())), 1_000),
+                interpret_held_native_ctx(
+                    Some((1_000, bad.to_string())),
+                    1_000,
+                    config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+                ),
                 None,
                 "범위 밖 payload {bad:?}는 None이어야 함(손상 캐시 → fallback 저하)",
             );
         }
         // 경계: 100은 유효, 양의 소수도 유효.
         assert_eq!(
-            interpret_held_native_ctx(Some((1_000, "100".to_string())), 1_000),
+            interpret_held_native_ctx(
+                Some((1_000, "100".to_string())),
+                1_000,
+                config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+            ),
             Some(100.0)
         );
         assert_eq!(
-            interpret_held_native_ctx(Some((1_000, "0.5".to_string())), 1_000),
+            interpret_held_native_ctx(
+                Some((1_000, "0.5".to_string())),
+                1_000,
+                config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS
+            ),
             Some(0.5)
         );
     }
@@ -1264,7 +1304,7 @@ mod tests {
         // 읽기 + 해석: TTL 내이므로 기록값이 그대로 복원되어야 한다.
         let entry = chain::read_session_named_cache_in(&base, session_key, CONTEXT_NATIVE_CACHE);
         assert_eq!(
-            interpret_held_native_ctx(entry, now_ms),
+            interpret_held_native_ctx(entry, now_ms, config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS),
             Some(native),
             "세션 캐시 라운드트립으로 직전 native가 복원되어야 함",
         );
@@ -1272,7 +1312,10 @@ mod tests {
         // 다른 세션 키로는 보이지 않는다(세션 격리 확인).
         let other =
             chain::read_session_named_cache_in(&base, "other-session", CONTEXT_NATIVE_CACHE);
-        assert_eq!(interpret_held_native_ctx(other, now_ms), None);
+        assert_eq!(
+            interpret_held_native_ctx(other, now_ms, config::DEFAULT_CONTEXT_HOLD_TTL_SECONDS),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

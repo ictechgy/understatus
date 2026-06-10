@@ -152,14 +152,6 @@ fn clamp_percent(percent: f64) -> f64 {
     percent.clamp(0.0, 100.0)
 }
 
-/// 직전 native 유지(hold)를 깨고 토큰 fallback으로 전환하는 하강 임계치(%포인트).
-///
-/// 토큰 fallback은 native 대비 체계적 과대추정이라(분모 차이로 86↔98) 상승 방향 노이즈는 유지로
-/// 막는다. 그러나 fallback이 직전 native보다 이만큼 이상 *낮으면* 노이즈가 아니라 실제 컨텍스트
-/// 감소(예: `/compact`)로 보고 유지를 깬다. 관측된 분모 노이즈 폭(~12%p)을 흡수하되 실제 급감
-/// (통상 수십%p)은 즉시 반영하도록 그 경계값으로 둔다.
-const CONTEXT_HOLD_DROP_TOLERANCE: f64 = 12.0;
-
 /// 컨텍스트 사용률% 해석 결과: 이번 프레임에 표시할 값과, 양수 native를 본 경우 영속화할 값.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextResolution {
@@ -176,8 +168,8 @@ pub struct ContextResolution {
 /// 분모 불일치로 인한 체계적 노이즈이므로, native가 일시 누락된 동안에는 직전 native를 유지한다:
 ///   1) 양수 native가 있으면 그것을 표시하고 영속화한다(권위값, 0..=100 클램프).
 ///   2) native가 없고 TTL 내 직전 native(`held_native`)가 있으면 그 값을 유지한다(상승 노이즈 차단).
-///      단, 토큰 fallback이 직전 native보다 [`CONTEXT_HOLD_DROP_TOLERANCE`] 이상 *낮으면*
-///      실제 감소(예: `/compact`)로 보고 유지를 깨 아래 3)에서 fallback을 반영한다.
+///      단, 토큰 fallback이 직전 native보다 `drop_tolerance`(config `[context].drop_tolerance`) 이상
+///      *낮으면* 실제 감소(예: `/compact`)로 보고 유지를 깨 아래 3)에서 fallback을 반영한다.
 ///   3) 유지 안 함 → 토큰 fallback, 없으면 유한한 raw native(예: 0), 끝으로 `None`(생략).
 ///
 /// 비대칭 가드 주의: omc HUD는 대칭 tolerance(`|fallback-native| > 3`)로 전환해 86↔98 *상승*
@@ -188,6 +180,8 @@ pub struct ContextResolution {
 /// - `native`: 이번 프레임의 `used_percentage`(부재/0/NaN 가능).
 /// - `fallback`: 이번 프레임의 토큰 기반 추정치([`compute_context_fallback`], 부재/양수).
 /// - `held_native`: TTL 내 직전 양수 native(호출부가 세션 캐시에서 읽어 주입; 없으면 `None`).
+/// - `drop_tolerance`: hold를 깨는 하강 임계치(%포인트, config `[context].drop_tolerance`).
+///   fallback이 직전 native보다 이만큼 이상 낮으면 실제 감소로 보고 유지를 깬다.
 ///
 /// 입력 방어: 본 함수는 `pub`이라 직접 호출자도 임의값을 넘길 수 있고, `held_native`는 변조 가능한
 /// 캐시에서 올 수 있다. 따라서 세 입력 모두 표시/유지 전에 유한·`0..=100` 경계로 정규화한다
@@ -196,6 +190,7 @@ pub fn resolve_context_percent(
     native: Option<f64>,
     fallback: Option<f64>,
     held_native: Option<f64>,
+    drop_tolerance: f64,
 ) -> ContextResolution {
     // fallback을 함수 진입 시 1회 정규화해 hold 해제 판정(2)과 표시(3)가 같은 값을 쓰게 한다.
     // 비유한/음수(직접 호출자의 잘못된 입력)는 제거해 hold를 잘못 깨지 않도록 하고, 범위는 0..=100으로
@@ -222,7 +217,7 @@ pub fn resolve_context_percent(
         .filter(|p| p.is_finite() && *p > 0.0)
         .map(clamp_percent)
     {
-        let real_drop = fallback.is_some_and(|fb| fb <= held - CONTEXT_HOLD_DROP_TOLERANCE);
+        let real_drop = fallback.is_some_and(|fb| fb <= held - drop_tolerance);
         if !real_drop {
             return ContextResolution {
                 display: Some(held),
@@ -774,10 +769,24 @@ mod tests {
 
     // === ctx 표시값 해석(resolve_context_percent) ===
 
+    /// 테스트 헬퍼: 프로덕션 기본 drop tolerance로 ctx 해석을 호출한다(기존 3-인자 호출 보존용).
+    fn resolve_with_default_tolerance(
+        native: Option<f64>,
+        fallback: Option<f64>,
+        held: Option<f64>,
+    ) -> ContextResolution {
+        resolve_context_percent(
+            native,
+            fallback,
+            held,
+            crate::config::DEFAULT_CONTEXT_DROP_TOLERANCE,
+        )
+    }
+
     /// 양수 native가 있으면 그것을 표시하고 영속화 신호를 낸다(권위값 우선).
     #[test]
     fn resolve_prefers_positive_native_and_persists() {
-        let r = resolve_context_percent(Some(86.0), Some(98.0), Some(50.0));
+        let r = resolve_with_default_tolerance(Some(86.0), Some(98.0), Some(50.0));
         assert_eq!(r.display, Some(86.0));
         assert_eq!(r.persist_native, Some(86.0));
     }
@@ -786,7 +795,7 @@ mod tests {
     #[test]
     fn resolve_holds_previous_native_on_transient_gap() {
         // 토큰 fallback이 98로 갈렸어도 직전 native 86을 유지해야 한다.
-        let r = resolve_context_percent(None, Some(98.0), Some(86.0));
+        let r = resolve_with_default_tolerance(None, Some(98.0), Some(86.0));
         assert_eq!(r.display, Some(86.0), "직전 native 유지로 86↔98 튐 차단");
         assert_eq!(r.persist_native, None, "유지 프레임은 재영속화하지 않음");
     }
@@ -794,7 +803,7 @@ mod tests {
     /// native·hold 모두 없으면 토큰 fallback을 표시한다(cold-start/비-native 프로바이더).
     #[test]
     fn resolve_uses_fallback_when_no_native_and_no_hold() {
-        let r = resolve_context_percent(None, Some(45.0), None);
+        let r = resolve_with_default_tolerance(None, Some(45.0), None);
         assert_eq!(r.display, Some(45.0));
         assert_eq!(r.persist_native, None);
     }
@@ -802,7 +811,7 @@ mod tests {
     /// 표시할 근거가 전혀 없으면 None(세그먼트 생략, AC2 보존).
     #[test]
     fn resolve_yields_none_when_nothing_available() {
-        let r = resolve_context_percent(None, None, None);
+        let r = resolve_with_default_tolerance(None, None, None);
         assert_eq!(r.display, None);
         assert_eq!(r.persist_native, None);
     }
@@ -810,7 +819,7 @@ mod tests {
     /// native 0은 양수가 아니므로 hold 없을 때 토큰 fallback이 우선한다(스푸리어스 0% 회피).
     #[test]
     fn resolve_zero_native_defers_to_fallback() {
-        let r = resolve_context_percent(Some(0.0), Some(45.0), None);
+        let r = resolve_with_default_tolerance(Some(0.0), Some(45.0), None);
         assert_eq!(r.display, Some(45.0));
         assert_eq!(r.persist_native, None);
     }
@@ -818,7 +827,7 @@ mod tests {
     /// native 0 + fallback/hold 모두 없으면 마지막 수단으로 raw native(0%)를 표시한다.
     #[test]
     fn resolve_zero_native_shown_as_last_resort() {
-        let r = resolve_context_percent(Some(0.0), None, None);
+        let r = resolve_with_default_tolerance(Some(0.0), None, None);
         assert_eq!(r.display, Some(0.0));
         assert_eq!(r.persist_native, None);
     }
@@ -826,10 +835,10 @@ mod tests {
     /// NaN native는 양수로 인정하지 않으며, 표시 후보에서도 제외한다(비유한 방어).
     #[test]
     fn resolve_rejects_nonfinite_native() {
-        let r = resolve_context_percent(Some(f64::NAN), None, Some(70.0));
+        let r = resolve_with_default_tolerance(Some(f64::NAN), None, Some(70.0));
         assert_eq!(r.display, Some(70.0), "NaN native 무시 → hold 사용");
         assert_eq!(r.persist_native, None);
-        let cold = resolve_context_percent(Some(f64::NAN), None, None);
+        let cold = resolve_with_default_tolerance(Some(f64::NAN), None, None);
         assert_eq!(cold.display, None, "NaN은 raw native 표시 후보에서도 제외");
     }
 
@@ -837,7 +846,7 @@ mod tests {
     #[test]
     fn resolve_breaks_hold_on_real_drop() {
         // held 86, /compact 후 토큰 fallback 20 → 86-12=74 이하이므로 유지를 깨고 20을 표시.
-        let r = resolve_context_percent(None, Some(20.0), Some(86.0));
+        let r = resolve_with_default_tolerance(None, Some(20.0), Some(86.0));
         assert_eq!(r.display, Some(20.0), "급감은 즉시 반영(stale-high 방지)");
         assert_eq!(r.persist_native, None, "토큰 fallback은 영속화하지 않음");
     }
@@ -846,7 +855,7 @@ mod tests {
     #[test]
     fn resolve_holds_on_small_dip_within_tolerance() {
         // held 86, fallback 78 → 86-78=8 < 12 → 유지(상승 노이즈와 동급의 미세 하강은 흡수).
-        let r = resolve_context_percent(None, Some(78.0), Some(86.0));
+        let r = resolve_with_default_tolerance(None, Some(78.0), Some(86.0));
         assert_eq!(r.display, Some(86.0));
         assert_eq!(r.persist_native, None);
     }
@@ -856,11 +865,11 @@ mod tests {
     fn resolve_drop_guard_boundary() {
         // 86-12=74: fallback 74는 '이하'라 깸, 75는 유지.
         assert_eq!(
-            resolve_context_percent(None, Some(74.0), Some(86.0)).display,
+            resolve_with_default_tolerance(None, Some(74.0), Some(86.0)).display,
             Some(74.0)
         );
         assert_eq!(
-            resolve_context_percent(None, Some(75.0), Some(86.0)).display,
+            resolve_with_default_tolerance(None, Some(75.0), Some(86.0)).display,
             Some(86.0)
         );
     }
@@ -868,7 +877,7 @@ mod tests {
     /// 토큰 fallback이 없으면(급감 판정 불가) 직전 native를 유지한다.
     #[test]
     fn resolve_holds_when_no_fallback_to_compare() {
-        let r = resolve_context_percent(None, None, Some(86.0));
+        let r = resolve_with_default_tolerance(None, None, Some(86.0));
         assert_eq!(r.display, Some(86.0));
         assert_eq!(r.persist_native, None);
     }
@@ -876,7 +885,7 @@ mod tests {
     /// 비정상 상한 native(>100)는 표시·영속 전에 0..=100으로 클램프한다(캐시 전파 차단).
     #[test]
     fn resolve_clamps_out_of_range_native() {
-        let r = resolve_context_percent(Some(150.0), None, None);
+        let r = resolve_with_default_tolerance(Some(150.0), None, None);
         assert_eq!(r.display, Some(100.0));
         assert_eq!(r.persist_native, Some(100.0), "클램프된 값만 영속화");
     }
@@ -884,7 +893,7 @@ mod tests {
     /// 음수 raw native(분기 3 마지막 수단)는 0%로 클램프되어 표시된다(하한 클램프 불변식 고정).
     #[test]
     fn resolve_clamps_negative_native_to_zero() {
-        let r = resolve_context_percent(Some(-5.0), None, None);
+        let r = resolve_with_default_tolerance(Some(-5.0), None, None);
         assert_eq!(r.display, Some(0.0));
         assert_eq!(r.persist_native, None);
     }
@@ -894,7 +903,7 @@ mod tests {
     /// held가 범위를 벗어나면(>100) 표시 전에 0..=100으로 클램프한다.
     #[test]
     fn resolve_clamps_out_of_range_held() {
-        let r = resolve_context_percent(None, None, Some(150.0));
+        let r = resolve_with_default_tolerance(None, None, Some(150.0));
         assert_eq!(r.display, Some(100.0));
         assert_eq!(r.persist_native, None);
     }
@@ -904,14 +913,17 @@ mod tests {
     fn resolve_rejects_nonpositive_or_nonfinite_held() {
         // held -5(손상 캐시) → 유지 안 함, fallback 45 표시.
         assert_eq!(
-            resolve_context_percent(None, Some(45.0), Some(-5.0)).display,
+            resolve_with_default_tolerance(None, Some(45.0), Some(-5.0)).display,
             Some(45.0)
         );
         // held 0 → 유지 안 함, fallback도 없으면 None.
-        assert_eq!(resolve_context_percent(None, None, Some(0.0)).display, None);
+        assert_eq!(
+            resolve_with_default_tolerance(None, None, Some(0.0)).display,
+            None
+        );
         // held NaN → 유지 안 함, fallback 30 표시.
         assert_eq!(
-            resolve_context_percent(None, Some(30.0), Some(f64::NAN)).display,
+            resolve_with_default_tolerance(None, Some(30.0), Some(f64::NAN)).display,
             Some(30.0)
         );
     }
@@ -920,11 +932,11 @@ mod tests {
     #[test]
     fn resolve_rejects_nonfinite_fallback() {
         assert_eq!(
-            resolve_context_percent(None, Some(f64::NAN), None).display,
+            resolve_with_default_tolerance(None, Some(f64::NAN), None).display,
             None
         );
         assert_eq!(
-            resolve_context_percent(None, Some(f64::INFINITY), None).display,
+            resolve_with_default_tolerance(None, Some(f64::INFINITY), None).display,
             None
         );
     }
@@ -932,7 +944,7 @@ mod tests {
     /// fallback이 범위를 벗어나면(>100) 0..=100으로 클램프한다(직접 호출자 방어).
     #[test]
     fn resolve_clamps_out_of_range_fallback() {
-        let r = resolve_context_percent(None, Some(150.0), None);
+        let r = resolve_with_default_tolerance(None, Some(150.0), None);
         assert_eq!(r.display, Some(100.0));
     }
 
@@ -940,12 +952,12 @@ mod tests {
     #[test]
     fn resolve_normalized_fallback_does_not_break_hold() {
         // fallback -5(잘못된 입력)는 정규화로 None이 되어 held 86을 깨지 않는다(폴리시: real_drop 전 정규화).
-        let r = resolve_context_percent(None, Some(-5.0), Some(86.0));
+        let r = resolve_with_default_tolerance(None, Some(-5.0), Some(86.0));
         assert_eq!(r.display, Some(86.0), "음수 fallback은 hold를 깨지 못함");
         assert_eq!(r.persist_native, None);
         // 비유한 fallback도 동일.
         assert_eq!(
-            resolve_context_percent(None, Some(f64::NAN), Some(86.0)).display,
+            resolve_with_default_tolerance(None, Some(f64::NAN), Some(86.0)).display,
             Some(86.0)
         );
     }
@@ -955,12 +967,12 @@ mod tests {
     fn resolve_drop_guard_uses_clamped_held() {
         // held 150 → 클램프 100. 임계는 100-12=88: fallback 89는 유지(100 표시), 87은 깸(87 표시).
         assert_eq!(
-            resolve_context_percent(None, Some(89.0), Some(150.0)).display,
+            resolve_with_default_tolerance(None, Some(89.0), Some(150.0)).display,
             Some(100.0),
             "89 > 88 → 클램프된 held(100) 유지",
         );
         assert_eq!(
-            resolve_context_percent(None, Some(87.0), Some(150.0)).display,
+            resolve_with_default_tolerance(None, Some(87.0), Some(150.0)).display,
             Some(87.0),
             "87 <= 88 → 유지를 깨고 fallback 표시",
         );

@@ -243,6 +243,8 @@ All keys are optional; omitting a key uses its default.
 | `[color] separator_color` | `"#3b4048"` | Color for separator and HUD seam. |
 | `[color] hud_seam` | `"│"` | Character placed between understatus output and the chained command output. |
 | `[refresh] interval_seconds` | `5` | Value written to `settings.json` as `refreshInterval`. Set via `install --interval` or the interactive prompt. On reinstall the existing value is inherited unless `--interval` overrides it. ⚠️ Global side-effect — see above. |
+| `[context] hold_ttl_seconds` | `180` | How long (s) to hold the previous native context % when Claude Code omits `used_percentage`. Lower = faster tracking of the real value; too low and ctx can briefly blank out when both native and token counts are 0. `0` disables hold. |
+| `[context] drop_tolerance` | `12` | Downward threshold (percentage points) for breaking the hold and switching to the token fallback. The fallback must be at least this far below the held native to count as a real drop (e.g. `/compact`). ⚠️ Lowering below 12 can reintroduce flicker from the native↔token denominator gap (observed 86↔98 = 12 pp). |
 
 **Default `band_tints`** (cool blue-grey brightness ladder, warm terracotta only at critical):
 
