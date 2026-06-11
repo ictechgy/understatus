@@ -330,11 +330,16 @@ fn collect_segments(
                 git_segment.pill = Some(PillMeta {
                     id: "git",
                     label: None,
-                    // bare 브랜치명(model pill 선례). 식별은 git-branch 아이콘이 담당.
+                    // bare 브랜치명(model pill 선례). 식별은 git 브랜치 아이콘이 담당.
                     value: branch.to_string(),
                     color: Some(pill_git_color()),
                     priority: 40,
-                    icon: Some("git-branch"),
+                    // cmux `--icon`은 **SF Symbol 이름**을 그대로 렌더한다(cmux 바이너리 내
+                    // `toolIcon` 주석 "SF Symbol names rendered inside the cmux status badge"로
+                    // 확인). 과거 `"git-branch"`(Lucide/nerd-font명)는 SF Symbol이 아니라 cmux가
+                    // 무시(silently drop)해 주황 텍스트만 떴다. `arrow.triangle.branch`는 git
+                    // 브랜치/포크를 나타내는 표준 SF Symbol(macOS 11+, cmux는 macOS 14+ 요구라 가용).
+                    icon: Some("arrow.triangle.branch"),
                 });
                 segments.push(git_segment);
             }
@@ -1361,7 +1366,7 @@ mod tests {
             vec!["cpu", "ctx", "git", "mem", "model"],
             "enrich-성공 5 pill(git 포함)"
         );
-        // git pill: bare 브랜치명 + git 주황 + git-branch 아이콘 + priority 40(AC4 positive 앵커).
+        // git pill: bare 브랜치명 + git 주황 + arrow.triangle.branch 아이콘 + priority 40(AC4 positive 앵커).
         let git = find_pill(&out, "git").expect("git pill");
         assert_eq!(git.value, "main", "git pill 값은 bare 브랜치명");
         assert_eq!(
@@ -1371,8 +1376,8 @@ mod tests {
         );
         assert_eq!(
             git.icon.as_deref(),
-            Some("git-branch"),
-            "git pill 아이콘은 git-branch"
+            Some("arrow.triangle.branch"),
+            "git pill 아이콘은 arrow.triangle.branch (git 브랜치 SF Symbol)"
         );
         assert_eq!(
             git.priority, 40,
