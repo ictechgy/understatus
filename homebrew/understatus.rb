@@ -16,7 +16,7 @@
 class Understatus < Formula
   desc "Claude Code statusline addon: CPU/memory/session info with pulse glyphs"
   homepage "https://github.com/ictechgy/understatus"
-  version "0.5.0"
+  version "0.6.0"
   license "MIT"
 
   # understatus uses macOS-only APIs (host_processor_info, sysctl, IOKit FFI).
@@ -26,12 +26,12 @@ class Understatus < Formula
   #   curl -L <release tarball> | shasum -a 256
   on_macos do
     on_arm do
-      url "https://github.com/ictechgy/understatus/releases/download/v0.5.0/understatus-0.5.0-aarch64-apple-darwin.tar.gz"
-      sha256 "3df74aee0120b98ef5d57adcb47158cce7268cfa89cb661432fbff66afb26310"
+      url "https://github.com/ictechgy/understatus/releases/download/v0.6.0/understatus-0.6.0-aarch64-apple-darwin.tar.gz"
+      sha256 "c911694482440d4b1c828a61a95ae7cf16cecd2f6a676c0d9d6abd9a6638aad3"
     end
     on_intel do
-      url "https://github.com/ictechgy/understatus/releases/download/v0.5.0/understatus-0.5.0-x86_64-apple-darwin.tar.gz"
-      sha256 "eb40e1449d7e498c982198235bb8d37c4f04659645c6235589db433c604304be"
+      url "https://github.com/ictechgy/understatus/releases/download/v0.6.0/understatus-0.6.0-x86_64-apple-darwin.tar.gz"
+      sha256 "febcd0f19d5e41934b71d4c14f5abb22280f269382fd270bd27ecb4260ffd452"
     end
   end
 
