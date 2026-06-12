@@ -403,9 +403,10 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     use std::path::Path;
     // 표준 워크트리는 `<base>/.git/HEAD`(디렉터리). linked worktree(`git worktree add`)와 서브모듈은
     // `<base>/.git`가 `gitdir: <path>`를 담은 정규 파일이고 실제 HEAD는 그 gitdir(보통 main repo 하위
-    // = `<base>` 밖)에 있다. 이 gitfile 추종은 v1 범위 밖 — `<base>/.git/HEAD` 경로가 부재해
-    // canonicalize가 Err를 내고 None으로 안전 저하한다(의도된 false-negative=branch 미표시). gitdir
-    // 추종은 임의 위치 파일 read를 열어 공격면을 키우므로(gitfile 내용=신뢰 불가 입력) 의도적으로 미지원.
+    // = `<base>` 밖)에 있다. 이 gitfile 추종은 v1 범위 밖 — `<base>/.git`가 정규 파일이라 그 하위
+    // `<base>/.git/HEAD` 탐색이 불가(ENOTDIR)해 canonicalize가 Err를 내고 None으로 안전 저하한다
+    // (의도된 false-negative=branch 미표시). gitdir 추종은 임의 위치 파일 read를 열어 공격면을
+    // 키우므로(추종을 추가하면 gitfile 내용이 신뢰 불가 입력이 되어 공격면이 열리므로) 의도적으로 미지원.
     let head_path = Path::new(base_path).join(".git").join("HEAD");
     // 외부 입력 경로 검증(심볼릭 차단): canonicalize로 심볼릭 링크/`.` 등을 해소한 실제
     // 경로가 여전히 `.git/HEAD`로 끝나는지 확인한다. 심볼릭 링크가 다른 파일을 가리키면
@@ -1738,48 +1739,63 @@ mod tests {
         );
     }
 
-    /// 회귀 가드(Task3 No-go): `<cwd>/.git`가 `gitdir:`를 담은 정규 파일(linked worktree/서브모듈)이면
-    /// 추종하지 않고 None(안전 FN). gitfile 추종은 v1 미지원 — 이 동작이 회귀로 깨지지 않게 고정한다.
+    /// 회귀 가드(Task3 No-go, mutation 저항): `<cwd>/.git`가 `gitdir:` 정규 파일이고 그 gitdir에
+    /// 유효 HEAD(sentinel ref)가 실재해도, 현재는 추종하지 않아 None(안전 FN)이다. 누가 gitfile
+    /// 추종을 추가하면 Some("<sentinel>")을 반환해 이 None 단언이 깨진다 = 추종 회귀를 실제로 포착.
     #[test]
     fn derive_from_cwd_gitfile_not_followed_none() {
-        // (a) 절대 gitdir (linked worktree 형태)
-        let tmp_abs = unique_test_dir("gitfile-abs");
-        std::fs::create_dir_all(&*tmp_abs).expect("cwd 생성 실패");
+        // (a) 절대 gitdir — 타깃 실재화 + sentinel HEAD
+        let gitdir_abs = unique_test_dir("gitfile-target-abs");
+        std::fs::create_dir_all(&*gitdir_abs).expect("gitdir 생성 실패");
+        std::fs::write(gitdir_abs.join("HEAD"), "ref: refs/heads/sentinel-abs\n")
+            .expect("타깃 HEAD 생성 실패");
+        let base_abs = unique_test_dir("gitfile-abs");
+        std::fs::create_dir_all(&*base_abs).expect("cwd 생성 실패");
         std::fs::write(
-            tmp_abs.join(".git"),
-            "gitdir: /tmp/elsewhere/.git/worktrees/x\n",
+            base_abs.join(".git"),
+            format!("gitdir: {}\n", gitdir_abs.to_string_lossy()),
         )
         .expect(".git 파일 생성 실패");
         assert_eq!(
-            derive_git_branch_from_cwd(&tmp_abs.to_string_lossy()),
+            derive_git_branch_from_cwd(&base_abs.to_string_lossy()),
             None,
-            "절대 gitdir gitfile은 미추종 → None(안전 FN)"
+            "절대 gitdir gitfile 미추종 → None(추종 구현 시 Some(sentinel-abs)로 깨짐)"
         );
-        // (b) 상대 gitdir (서브모듈 형태 ../)
-        let tmp_rel = unique_test_dir("gitfile-rel");
-        std::fs::create_dir_all(&*tmp_rel).expect("cwd 생성 실패");
-        std::fs::write(tmp_rel.join(".git"), "gitdir: ../.git/modules/sub\n")
-            .expect(".git 파일 생성 실패");
+
+        // (b) 상대 gitdir — base 하위 타깃 실재화 + sentinel HEAD
+        let base_rel = unique_test_dir("gitfile-rel");
+        std::fs::create_dir_all(base_rel.join("realgit")).expect("상대 gitdir 생성 실패");
+        std::fs::write(
+            base_rel.join("realgit").join("HEAD"),
+            "ref: refs/heads/sentinel-rel\n",
+        )
+        .expect("타깃 HEAD 생성 실패");
+        std::fs::write(base_rel.join(".git"), "gitdir: realgit\n").expect(".git 파일 생성 실패");
         assert_eq!(
-            derive_git_branch_from_cwd(&tmp_rel.to_string_lossy()),
+            derive_git_branch_from_cwd(&base_rel.to_string_lossy()),
             None,
-            "상대 gitdir gitfile도 미추종 → None"
+            "상대 gitdir gitfile 미추종 → None(추종 구현 시 Some(sentinel-rel)로 깨짐)"
         );
     }
 
-    /// 회귀 가드(Task3 No-go): workspace `git_worktree`가 gitfile(`.git`=정규파일)인 워크트리를
-    /// 가리켜도 추종하지 않고 None. cwd 경로(위 테스트)와 대칭으로 양 진입점 FN을 고정한다.
+    /// 회귀 가드(Task3 No-go, mutation 저항): workspace git_worktree가 gitfile 워크트리를 가리키고
+    /// 그 gitdir에 유효 HEAD가 실재해도 미추종 → None. cwd 경로와 대칭으로 양 진입점 고정.
+    /// 추종이 구현되면 Some("sentinel-ws")를 반환해 이 None 단언이 깨진다 = 추종 회귀를 실제로 포착.
     #[test]
     fn derive_git_branch_gitfile_worktree_not_followed_none() {
-        let tmp = unique_test_dir("gitfile-ws");
-        std::fs::create_dir_all(&*tmp).expect("워크트리 생성 실패");
+        let gitdir = unique_test_dir("gitfile-ws-target");
+        std::fs::create_dir_all(&*gitdir).expect("gitdir 생성 실패");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/sentinel-ws\n")
+            .expect("타깃 HEAD 생성 실패");
+        let base = unique_test_dir("gitfile-ws");
+        std::fs::create_dir_all(&*base).expect("워크트리 생성 실패");
         std::fs::write(
-            tmp.join(".git"),
-            "gitdir: /tmp/elsewhere/.git/worktrees/y\n",
+            base.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy()),
         )
         .expect(".git 파일 생성 실패");
         let ws = RawWorkspace {
-            git_worktree: Some(tmp.to_string_lossy().into_owned()),
+            git_worktree: Some(base.to_string_lossy().into_owned()),
             repo: None,
             current_dir: None,
             project_dir: None,
@@ -1787,7 +1803,7 @@ mod tests {
         assert_eq!(
             derive_git_branch(&ws),
             None,
-            "gitfile 워크트리는 미추종 → None"
+            "gitfile 워크트리 미추종 → None(추종 구현 시 Some(sentinel-ws)로 깨짐)"
         );
     }
 }
