@@ -401,7 +401,11 @@ const MAX_BRANCH_LEN: usize = 256;
 ///   (NFS 등)에서 status 렌더가 블록될 수 있다(알려진 트레이드오프). 완화(timeout/캐시)는 future work.
 fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     use std::path::Path;
-    // 표준 워크트리는 `<base>/.git/HEAD`. (linked worktree의 gitfile 케이스는 v1 범위 밖.)
+    // 표준 워크트리는 `<base>/.git/HEAD`(디렉터리). linked worktree(`git worktree add`)와 서브모듈은
+    // `<base>/.git`가 `gitdir: <path>`를 담은 정규 파일이고 실제 HEAD는 그 gitdir(보통 main repo 하위
+    // = `<base>` 밖)에 있다. 이 gitfile 추종은 v1 범위 밖 — `<base>/.git/HEAD` 경로가 부재해
+    // canonicalize가 Err를 내고 None으로 안전 저하한다(의도된 false-negative=branch 미표시). gitdir
+    // 추종은 임의 위치 파일 read를 열어 공격면을 키우므로(gitfile 내용=신뢰 불가 입력) 의도적으로 미지원.
     let head_path = Path::new(base_path).join(".git").join("HEAD");
     // 외부 입력 경로 검증(심볼릭 차단): canonicalize로 심볼릭 링크/`.` 등을 해소한 실제
     // 경로가 여전히 `.git/HEAD`로 끝나는지 확인한다. 심볼릭 링크가 다른 파일을 가리키면
@@ -1731,6 +1735,59 @@ mod tests {
             input.git_branch.as_deref(),
             Some("main"),
             "유효 git cwd → branch 도출"
+        );
+    }
+
+    /// 회귀 가드(Task3 No-go): `<cwd>/.git`가 `gitdir:`를 담은 정규 파일(linked worktree/서브모듈)이면
+    /// 추종하지 않고 None(안전 FN). gitfile 추종은 v1 미지원 — 이 동작이 회귀로 깨지지 않게 고정한다.
+    #[test]
+    fn derive_from_cwd_gitfile_not_followed_none() {
+        // (a) 절대 gitdir (linked worktree 형태)
+        let tmp_abs = unique_test_dir("gitfile-abs");
+        std::fs::create_dir_all(&*tmp_abs).expect("cwd 생성 실패");
+        std::fs::write(
+            tmp_abs.join(".git"),
+            "gitdir: /tmp/elsewhere/.git/worktrees/x\n",
+        )
+        .expect(".git 파일 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&tmp_abs.to_string_lossy()),
+            None,
+            "절대 gitdir gitfile은 미추종 → None(안전 FN)"
+        );
+        // (b) 상대 gitdir (서브모듈 형태 ../)
+        let tmp_rel = unique_test_dir("gitfile-rel");
+        std::fs::create_dir_all(&*tmp_rel).expect("cwd 생성 실패");
+        std::fs::write(tmp_rel.join(".git"), "gitdir: ../.git/modules/sub\n")
+            .expect(".git 파일 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&tmp_rel.to_string_lossy()),
+            None,
+            "상대 gitdir gitfile도 미추종 → None"
+        );
+    }
+
+    /// 회귀 가드(Task3 No-go): workspace `git_worktree`가 gitfile(`.git`=정규파일)인 워크트리를
+    /// 가리켜도 추종하지 않고 None. cwd 경로(위 테스트)와 대칭으로 양 진입점 FN을 고정한다.
+    #[test]
+    fn derive_git_branch_gitfile_worktree_not_followed_none() {
+        let tmp = unique_test_dir("gitfile-ws");
+        std::fs::create_dir_all(&*tmp).expect("워크트리 생성 실패");
+        std::fs::write(
+            tmp.join(".git"),
+            "gitdir: /tmp/elsewhere/.git/worktrees/y\n",
+        )
+        .expect(".git 파일 생성 실패");
+        let ws = RawWorkspace {
+            git_worktree: Some(tmp.to_string_lossy().into_owned()),
+            repo: None,
+            current_dir: None,
+            project_dir: None,
+        };
+        assert_eq!(
+            derive_git_branch(&ws),
+            None,
+            "gitfile 워크트리는 미추종 → None"
         );
     }
 }
