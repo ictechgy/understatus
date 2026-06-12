@@ -364,19 +364,35 @@ fn is_safe_base_path(base_path: &str) -> bool {
         .any(|component| matches!(component, Component::ParentDir))
 }
 
+/// branch명 byte length 상한(방어적 상한, FP<FN).
+///
+/// loose ref는 파일시스템 경로 컴포넌트(`.git/refs/heads/<branch>`)로 저장되므로 정상 branch명은
+/// APFS NAME_MAX(255)를 넘을 수 없어 256B를 절대 초과하지 않는다. 따라서 256B 초과는 정상 git이
+/// 만들 수 없는 손상/조작된 `.git/HEAD` 신호이며, 표시를 거부해 false-positive(틀린 branch)보다
+/// false-negative(빈 pill)를 택하는 방어적 상한이다(FP<FN).
+const MAX_BRANCH_LEN: usize = 256;
+
 /// 주어진 git 작업트리 경로에서 `.git/HEAD`를 읽어 현재 브랜치명을 추출한다.
 ///
 /// # 인자
 /// - `base_path`: git 워크트리(또는 repo) 루트 경로.
 ///
 /// # 반환
-/// `ref: refs/heads/<branch>` 형식의 HEAD에서 추출한 `<branch>`. detached HEAD(직접 SHA)나
-/// 읽기 실패 시 `None`. 부재/실패에 안전(절대 패닉하지 않음).
+/// `ref: refs/heads/<branch>` 형식의 HEAD에서 추출한 `<branch>`. 다음 4원인 중 하나라도 해당하면
+/// `None`을 반환한다(부재/실패에 안전 — 절대 패닉하지 않음):
+/// 1. `.git/HEAD` 부재 또는 읽기 실패(canonicalize/read 실패).
+/// 2. detached HEAD(`ref:` 접두 없이 SHA 직접 기록).
+/// 3. 외부향 심볼릭 HEAD(canonicalize 결과가 `.git/HEAD`로 끝나지 않음 — 누출 방어 위반).
+/// 4. branch명이 비었거나 제어문자를 포함하거나 [`MAX_BRANCH_LEN`]을 초과.
 ///
 /// # 주의
-/// branch명은 제어문자 미포함만 허용한다(터미널/status 인젝션 방어). 신뢰 불가 `.git/HEAD`가
-/// ESC/개행/CR 등 제어문자가 섞인 branch명을 담으면 oneline SGR/cmux pill로 그대로 렌더돼
-/// 인젝션이 되므로, 정상 git branch명이 절대 갖지 않는 제어문자를 source chokepoint에서 거부한다.
+/// - branch명은 제어문자 미포함만 허용한다(터미널/status 인젝션 방어). 신뢰 불가 `.git/HEAD`가
+///   ESC/개행/CR 등 제어문자가 섞인 branch명을 담으면 oneline SGR/cmux pill로 그대로 렌더돼
+///   인젝션이 되므로, 정상 git branch명이 절대 갖지 않는 제어문자를 source chokepoint에서 거부한다.
+/// - 심볼릭 `.git` 추종은 의도된 표준 git 동작 — canonicalize 가드는 결과가 `.git/HEAD`로 끝나는지만
+///   확인(외부향 누출 차단), 추종 자체는 허용한다.
+/// - 동기 fs read는 의도적 — `<cwd>/.git/HEAD` 단일 소파일을 1회 read한다. 느린 네트워크 마운트
+///   (NFS 등)에서 status 렌더가 블록될 수 있다(알려진 트레이드오프). 완화(timeout/캐시)는 future work.
 fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     use std::path::Path;
     // 표준 워크트리는 `<base>/.git/HEAD`. (linked worktree의 gitfile 케이스는 v1 범위 밖.)
@@ -395,7 +411,8 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     let branch = trimmed.strip_prefix("ref: refs/heads/")?;
     // 인젝션 방어: 신뢰 불가 HEAD 내용에 제어문자(ESC/개행/CR/기타 C0·DEL)가 섞이면 거부한다.
     // 정상 git branch명은 제어문자를 절대 갖지 않으므로 정상 케이스 회귀는 0이다.
-    if branch.is_empty() || branch.chars().any(char::is_control) {
+    // SECURITY: 256B 초과 branch명 = 손상/조작된 .git/HEAD 신호 → 표시 거부(FP<FN)
+    if branch.is_empty() || branch.chars().any(char::is_control) || branch.len() > MAX_BRANCH_LEN {
         None
     } else {
         Some(branch.to_string())
