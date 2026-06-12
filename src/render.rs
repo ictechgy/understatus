@@ -1404,6 +1404,17 @@ mod tests {
                 );
             }
         }
+        // vacuous-pass 방지: sample 시나리오는 pill을 방출하고 최소 model+git 2개 icon이 실제 검사돼야
+        // 회귀 가드가 의미를 가진다(pill 0개/icon 전부 None이면 위 루프가 조용히 통과하는 것을 차단).
+        assert!(
+            !out.pills.is_empty(),
+            "sample 시나리오는 pill을 방출해야 한다"
+        );
+        let icons_checked = out.pills.iter().filter(|p| p.icon.is_some()).count();
+        assert!(
+            icons_checked >= 2,
+            "최소 model(sparkles)+git(arrow.triangle.branch) 2개 icon이 검사돼야 한다(vacuous-pass 방지): {icons_checked}"
+        );
     }
 
     /// AC2(가용 집합): enrich-실패 상당(ctx None, model bare "codex") → pill key 집합 {model,cpu,mem}(3, ctx 부재).
