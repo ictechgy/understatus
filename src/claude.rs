@@ -412,7 +412,7 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     // 인젝션 방어: 신뢰 불가 HEAD 내용에 제어문자(ESC/개행/CR/기타 C0·DEL)가 섞이면 거부한다.
     // 정상 git branch명은 제어문자를 절대 갖지 않으므로 정상 케이스 회귀는 0이다.
     // SECURITY: 256B 초과 branch명 = 손상/조작된 .git/HEAD 신호 → 표시 거부(FP<FN)
-    if branch.is_empty() || branch.chars().any(char::is_control) || branch.len() > MAX_BRANCH_LEN {
+    if branch.is_empty() || branch.len() > MAX_BRANCH_LEN || branch.chars().any(char::is_control) {
         None
     } else {
         Some(branch.to_string())
@@ -649,6 +649,11 @@ mod tests {
     impl std::ops::Deref for TestDir {
         type Target = std::path::Path;
         fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl AsRef<std::path::Path> for TestDir {
+        fn as_ref(&self) -> &std::path::Path {
             &self.0
         }
     }
