@@ -338,6 +338,12 @@ fn derive_git_branch(workspace: &RawWorkspace) -> Option<String> {
     if !is_safe_base_path(base_path) {
         return None;
     }
+    // 상대경로 거부: 상대 git_worktree/repo는 understatus 프로세스 cwd 기준으로 해석돼
+    // 엉뚱한 repo의 branch를 도출하는 false-positive를 만든다(canonicalize가 cwd-상대 해석).
+    // 대칭: cwd 경로(derive_git_branch_from_cwd)의 is_absolute 가드와 동일 — 한쪽 변경 시 양쪽 동기화.
+    if !std::path::Path::new(base_path).is_absolute() {
+        return None;
+    }
     read_branch_from_git_dir(base_path)
 }
 
@@ -446,6 +452,7 @@ fn derive_git_branch_from_cwd(cwd: &str) -> Option<String> {
         return None;
     }
     // 상대경로 거부: 프로세스 cwd 기준 해석으로 엉뚱한 repo branch를 도출하는 false-positive를 막는다.
+    // 대칭: worktree 경로(derive_git_branch)의 절대성 가드와 동일 — 한쪽 변경 시 양쪽 동기화.
     if !std::path::Path::new(cwd).is_absolute() {
         return None;
     }
@@ -1464,6 +1471,48 @@ mod tests {
     fn derive_from_cwd_rejects_relative_cwd() {
         assert_eq!(derive_git_branch_from_cwd("repo"), None);
         assert_eq!(derive_git_branch_from_cwd("./x"), None);
+    }
+
+    /// M-2 회귀 가드: worktree 경로도 상대 git_worktree/repo를 거부해야 한다(절대성 가드).
+    /// 상대경로는 프로세스 cwd 기준 해석돼 엉뚱한 repo branch FP를 만들므로 None이어야 한다.
+    /// derive_git_branch를 직접 호출해 is_absolute 가드가 fs 접근 전 즉시 거부함을 cwd-독립으로 검증
+    /// (parse_claude_input 통합 테스트는 러너 cwd에 repo/.git이 없으면 false-green 위험).
+    #[test]
+    fn git_worktree_relative_path_rejected() {
+        // git_worktree 상대경로 → None
+        let ws_rel = RawWorkspace {
+            git_worktree: Some("repo".to_string()),
+            repo: None,
+            current_dir: None,
+            project_dir: None,
+        };
+        assert_eq!(
+            derive_git_branch(&ws_rel),
+            None,
+            "상대 git_worktree는 절대성 가드로 거부"
+        );
+
+        // "." 상대 → None
+        let ws_dot = RawWorkspace {
+            git_worktree: Some(".".to_string()),
+            repo: None,
+            current_dir: None,
+            project_dir: None,
+        };
+        assert_eq!(
+            derive_git_branch(&ws_dot),
+            None,
+            "'.' 상대 git_worktree 거부"
+        );
+
+        // repo 분기(.or(repo))도 상대 거부
+        let ws_repo = RawWorkspace {
+            git_worktree: None,
+            repo: Some("repo".to_string()),
+            current_dir: None,
+            project_dir: None,
+        };
+        assert_eq!(derive_git_branch(&ws_repo), None, "상대 repo도 거부");
     }
 
     // === parse_lterm_input (spec §6.2, §10) ===
