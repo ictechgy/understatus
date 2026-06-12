@@ -1385,6 +1385,27 @@ mod tests {
         );
     }
 
+    /// 교차-pill 불변식(SF Symbol 계약): cmux는 SF Symbol 이름만 렌더. SF Symbol은 하이픈을
+    /// 쓰지 않으므로(점·소문자) icon에 `-`가 있으면 Lucide/nerd-font명이라 drop됨. 과거
+    /// `git-branch` 회귀를 영구 차단하는 계약 테스트. model(sparkles)+git(arrow.triangle.branch)+
+    /// 미래 pill 전부 커버한다.
+    #[test]
+    fn cmux_pill_icons_contain_no_hyphen() {
+        // enrich-성공 시나리오(model+ctx+git+cpu+mem pill 5종) 재사용.
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        let out = render_cmux_pills(&sample_input(), &sample_snap(58.0), &cfg, 0, false);
+        for pill in &out.pills {
+            if let Some(icon) = pill.icon.as_deref() {
+                assert!(
+                    !icon.contains('-'),
+                    "pill {} 아이콘에 하이픈 포함(Lucide/nerd-font명 → cmux drop): {icon:?}",
+                    pill.key
+                );
+            }
+        }
+    }
+
     /// AC2(가용 집합): enrich-실패 상당(ctx None, model bare "codex") → pill key 집합 {model,cpu,mem}(3, ctx 부재).
     #[test]
     fn to_cmux_pills_unenriched_has_three_keys_no_ctx() {
