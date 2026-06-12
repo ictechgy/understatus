@@ -637,23 +637,81 @@ struct RawLtermInput {
 mod tests {
     use super::*;
 
-    /// 호출마다 고유한 비존재 절대 temp 경로를 반환한다(테스트 격리).
+    /// 테스트용 고유 임시 디렉터리 경로 + RAII 정리 가드.
+    /// Drop에서 remove_dir_all로 정리해 패닉(단언 실패) 시에도 누수 0.
+    /// 주의: unwind 전제 — `[profile.test] panic="abort"` 도입 시 Drop 미실행으로 무효(현재 Cargo.toml은 unwind 기본).
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for TestDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    /// 호출마다 고유한 비존재 절대 temp 경로를 RAII 가드로 감싸 반환한다(테스트 격리).
     ///
     /// # 인자
     /// - `label`: 경로를 사람이 식별하기 위한 라벨(테스트 의도 표시).
     ///
     /// # 반환
-    /// `<temp_dir>/understatus-<label>-<pid>-<seq>` 형태의 고유 절대 경로(미생성).
+    /// `<temp_dir>/understatus-<label>-<pid>-<seq>` 형태의 고유 절대 경로(미생성)를 담은 [`TestDir`].
+    /// `Deref<Target=Path>`로 `PathBuf`처럼 `.join()`/`.to_string_lossy()` 등을 그대로 쓸 수 있다.
     ///
     /// # 주의
     /// `process::id()` 단독은 같은 프로세스 내 스레드 병렬 실행 시 prefix가 같으면 충돌·stale
     /// 누수 위험이 있다. `AtomicU64` 정적 카운터를 조합해 호출마다 고유 경로를 보장한다.
     /// 경로는 생성하지 않으므로, `.git` 없는 비존재 경로가 필요한 negative 테스트에도 그대로 쓴다.
-    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    /// 반환된 [`TestDir`]가 drop될 때 디렉터리를 정리하므로 패닉(단언 실패) 시에도 누수가 없다.
+    fn unique_test_dir(label: &str) -> TestDir {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("understatus-{label}-{}-{seq}", std::process::id()))
+        TestDir(
+            std::env::temp_dir().join(format!("understatus-{label}-{}-{seq}", std::process::id())),
+        )
+    }
+
+    /// AC-d1: [`TestDir`] 가드가 panic 언와인딩 중에도 디렉터리를 정리함을 증명한다.
+    /// 클로저 안에서 디렉터리를 생성하고 경로를 외부 변수로 캡처한 뒤 의도적으로 panic을 일으키고,
+    /// `catch_unwind` 복귀 후 그 경로가 부재함(=Drop이 cleanup 실행)을 단언한다.
+    #[test]
+    fn test_dir_guard_cleans_up_on_panic() {
+        use std::sync::Mutex;
+        // 패닉 클로저 밖으로 경로를 빼기 위한 캡처 변수(Mutex로 AssertUnwindSafe 충족).
+        let captured_path: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+        // 의도적 panic을 catch_unwind로 감싼다. 클로저 안에서 가드 생성 + 디렉터리 실생성 후 panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tmp = unique_test_dir("panic-cleanup");
+            std::fs::create_dir_all(&*tmp).expect("임시 디렉터리 생성 실패");
+            assert!(tmp.exists(), "panic 전엔 디렉터리가 존재해야 한다");
+            // 사후 검사를 위해 경로를 클로저 밖으로 캡처한다.
+            *captured_path.lock().expect("락 획득 실패") = Some(tmp.to_path_buf());
+            // 의도적 panic: 언와인딩이 시작되며 `tmp`(TestDir)의 Drop이 실행돼야 한다.
+            panic!("의도적 패닉 — 가드 cleanup 증명용");
+        }));
+
+        // catch_unwind는 panic을 잡아 Err를 반환해야 한다(테스트가 죽지 않음).
+        assert!(
+            result.is_err(),
+            "catch_unwind가 의도적 panic을 포착해야 한다"
+        );
+
+        // 캡처한 경로가 부재함을 단언 → Drop이 언와인딩에서도 cleanup을 실행했음을 증명.
+        let path = captured_path
+            .lock()
+            .expect("락 획득 실패")
+            .take()
+            .expect("패닉 전 경로가 캡처돼야 한다");
+        assert!(
+            !path.exists(),
+            "panic 언와인딩 후 가드 Drop이 디렉터리를 정리해 부재해야 한다: {path:?}"
+        );
     }
 
     /// 정상 JSON: 모든 필드가 올바르게 평탄화되어야 한다(AC2).
@@ -1174,7 +1232,7 @@ mod tests {
     fn derives_git_branch_from_head() {
         use std::io::Write;
         // 임시 워크트리에 .git/HEAD를 만들어 브랜치 파생을 검증한다.
-        let tmp = std::env::temp_dir().join(format!("understatus-git-test-{}", std::process::id()));
+        let tmp = unique_test_dir("git-test");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         let head = git_dir.join("HEAD");
@@ -1187,8 +1245,6 @@ mod tests {
         );
         let input = parse_claude_input(&raw);
         assert_eq!(input.git_branch.as_deref(), Some("feature/my-branch"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// repo가 객체(`{host,owner,name}`)로 드리프트해도 git_worktree가 정상이면 폴백 도출이 살아 있다.
@@ -1196,8 +1252,7 @@ mod tests {
     #[test]
     fn git_worktree_derives_branch_even_when_repo_is_object() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("understatus-git-repoobj-{}", std::process::id()));
+        let tmp = unique_test_dir("git-repoobj");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
@@ -1213,15 +1268,12 @@ mod tests {
             Some("main"),
             "repo 객체여도 git_worktree로 브랜치 도출"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// detached HEAD(직접 SHA)는 브랜치명이 없으므로 None이어야 한다.
     #[test]
     fn detached_head_yields_no_branch() {
-        let tmp =
-            std::env::temp_dir().join(format!("understatus-git-detached-{}", std::process::id()));
+        let tmp = unique_test_dir("git-detached");
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
         std::fs::write(git_dir.join("HEAD"), "0123456789abcdef\n").expect("HEAD 쓰기 실패");
@@ -1232,8 +1284,6 @@ mod tests {
         );
         let input = parse_claude_input(&raw);
         assert_eq!(input.git_branch, None);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// git_worktree 경로가 존재하지 않으면 브랜치 파생은 None으로 안전 저하한다.
@@ -1277,8 +1327,6 @@ mod tests {
 
         let branch = derive_git_branch_from_cwd(&tmp.to_string_lossy());
         assert_eq!(branch.as_deref(), Some("feature/x"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// detached HEAD(직접 SHA)는 브랜치명이 없으므로 None이어야 한다(AC2).
@@ -1290,19 +1338,15 @@ mod tests {
         std::fs::write(git_dir.join("HEAD"), "0123456789abcdef\n").expect("HEAD 쓰기 실패");
 
         assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `.git` 부재 cwd(존재하나 git이 아닌 디렉터리) → None(AC2).
     #[test]
     fn derive_from_cwd_no_git_dir_none() {
         let tmp = unique_test_dir("lterm-git-nogit");
-        std::fs::create_dir_all(&tmp).expect("임시 디렉터리 생성 실패");
+        std::fs::create_dir_all(&*tmp).expect("임시 디렉터리 생성 실패");
 
         assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// traversal cwd(`..` 포함) → is_safe_base_path가 거부해 None이어야 한다(AC2).
@@ -1327,8 +1371,33 @@ mod tests {
 
         // canonicalize 결과가 `.git/HEAD`로 끝나지 않으므로(outside-ref로 해소) None.
         assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
+    }
 
-        let _ = std::fs::remove_dir_all(&tmp);
+    /// 상보 테스트: `<cwd>/.git`이 심볼릭 디렉터리이고 그 실제 `.git/HEAD`가 정상 `ref:`이면
+    /// `Some("<branch>")`를 반환한다(표준 git symlink 추종이 의도된 동작임을 고정 — 동작 변경 0).
+    /// canonicalize 결과가 여전히 `.git/HEAD`로 끝나므로(실제 디렉터리도 `.git` 명) 누출 가드를 통과한다.
+    #[test]
+    #[cfg(unix)]
+    fn derive_from_cwd_symlink_git_dir_follows_to_some() {
+        use std::os::unix::fs::symlink;
+        // 실제 repo: `<real>/.git/HEAD`에 정상 ref를 둔다.
+        let real = unique_test_dir("lterm-git-symlink-real");
+        let real_git = real.join(".git");
+        std::fs::create_dir_all(&real_git).expect("실제 .git 생성 실패");
+        std::fs::write(real_git.join("HEAD"), "ref: refs/heads/feature/linked\n")
+            .expect("HEAD 쓰기 실패");
+
+        // cwd: `<cwd>/.git`을 실제 `.git` 디렉터리로 심볼릭 링크한다(표준 git symlink 추종 케이스).
+        let cwd = unique_test_dir("lterm-git-symlink-cwd");
+        std::fs::create_dir_all(&*cwd).expect("cwd 생성 실패");
+        symlink(&real_git, cwd.join(".git")).expect("심볼릭 .git 생성 실패");
+
+        // canonicalize가 실제 `.git/HEAD`로 해소되고 `.git/HEAD`로 끝나므로 추종이 허용된다.
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()).as_deref(),
+            Some("feature/linked"),
+            "심볼릭 .git 추종은 표준 git 동작 — 정상 ref면 branch 도출"
+        );
     }
 
     /// BLOCKER 회귀 가드: 제어문자(ESC/개행)가 섞인 branch명은 거부돼 None이어야 한다.
@@ -1348,8 +1417,41 @@ mod tests {
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\nINJECT\n")
             .expect("HEAD 쓰기 실패");
         assert_eq!(derive_git_branch_from_cwd(&tmp.to_string_lossy()), None);
+    }
 
-        let _ = std::fs::remove_dir_all(&tmp);
+    /// 방어적 상한(FP<FN): MAX_BRANCH_LEN(256B) 초과 branch명은 손상/조작 신호로 보고 거부돼
+    /// None이어야 한다. 경계값(정확히 256B는 허용, 257B는 거부)을 함께 고정한다.
+    #[test]
+    fn derive_from_cwd_rejects_overlong_branch() {
+        let tmp = unique_test_dir("lterm-git-overlong");
+        let git_dir = tmp.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+
+        // 257B branch명(ASCII 1B/문자) → 상한 초과로 거부.
+        let overlong = "a".repeat(MAX_BRANCH_LEN + 1);
+        std::fs::write(
+            git_dir.join("HEAD"),
+            format!("ref: refs/heads/{overlong}\n"),
+        )
+        .expect("HEAD 쓰기 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&tmp.to_string_lossy()),
+            None,
+            "256B 초과 branch명은 거부(FP<FN)"
+        );
+
+        // 정확히 256B branch명 → 허용(경계 미초과). 정상 케이스 회귀 0을 고정한다.
+        let boundary = "b".repeat(MAX_BRANCH_LEN);
+        std::fs::write(
+            git_dir.join("HEAD"),
+            format!("ref: refs/heads/{boundary}\n"),
+        )
+        .expect("HEAD 쓰기 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&tmp.to_string_lossy()).as_deref(),
+            Some(boundary.as_str()),
+            "정확히 256B branch명은 허용(경계)"
+        );
     }
 
     /// 상대경로 cwd는 프로세스 cwd 기준 false-positive를 막기 위해 거부돼 None이어야 한다.
@@ -1576,7 +1678,5 @@ mod tests {
             Some("main"),
             "유효 git cwd → branch 도출"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
