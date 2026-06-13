@@ -1,0 +1,76 @@
+name: Publish to npm
+
+# npm Trusted Publishing (GitHub Actions OIDC).
+# 저장된 토큰/passkey 없이 publish 하고 provenance를 자동 생성한다.
+# 사전 등록(npmjs.com > understatus > Settings > Trusted Publishers > Add > GitHub Actions):
+#   - Organization or user: ictechgy
+#   - Repository:           understatus
+#   - Workflow filename:    publish-npm.yml   (이 파일명과 반드시 일치)
+#   - Environment name:     (비움. 채웠다면 아래 `environment:` 주석을 해제하고 같은 값으로)
+#   - Allowed actions:      npm publish  (체크)
+#
+# understatus의 npm 패키지는 GitHub Release의 prebuilt 바이너리를 install.js(postinstall)가
+# 내려받는 "래퍼"다. publish 자체는 래퍼 파일만 올리지만, 릴리스 바이너리가 아직 안 올라온
+# 사이에 publish 되면 그 짧은 창에서 사용자 설치가 실패하므로, 릴리스 에셋을 기다린 뒤 publish 한다.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.7.1)'
+        required: true
+
+permissions:
+  id-token: write   # OIDC 토큰 발급에 필수
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # environment: release   # npm 폼에 Environment name을 넣었다면 주석 해제(동일 값)
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Node + npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing(OIDC)은 npm CLI >= 11.5.1을 요구한다. Node 22 기본 npm은 10.x라 업그레이드.
+      - name: Upgrade npm (OIDC 요구 버전)
+        run: npm install -g npm@latest
+
+      # 릴리스 바이너리(arm64/x64 tarball)가 올라올 때까지 대기(최대 ~10분).
+      # release.yml과 같은 태그 push에 동시 트리거되므로, 보통 수십 초 내 충족된다.
+      - name: Wait for release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          for i in $(seq 1 60); do
+            names="$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)"
+            if printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz" \
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz"; then
+              echo "릴리스 에셋 확인됨 ($TAG)"
+              exit 0
+            fi
+            echo "릴리스 에셋 대기 중... ($i/60)"
+            sleep 10
+          done
+          echo "릴리스 에셋을 시간 내 찾지 못함: $TAG" >&2
+          exit 1
+
+      # 래퍼 서브디렉터리(./npm)를 publish. Trusted Publishing 사용 시 NODE_AUTH_TOKEN 불필요,
+      # provenance는 자동 생성된다. understatus는 unscoped 패키지라 기본 public.
+      - name: npm publish (./npm)
+        run: npm publish ./npm --access public
