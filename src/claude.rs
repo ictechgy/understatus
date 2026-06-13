@@ -435,6 +435,7 @@ fn read_branch_from_git_dir(base_path: &std::path::Path) -> Option<String> {
     // 경로가 여전히 `.git/HEAD`로 끝나는지 확인한다. 심볼릭 링크가 다른 파일을 가리키면
     // 끝이 달라져 거부되고, 경로가 없으면 canonicalize가 Err → None으로 안전 저하한다.
     // (정상 워크트리의 실재 `.git/HEAD`는 문제없이 해소되므로 정상 동작은 보존된다.)
+    // 심볼릭 `.git` 추종은 의도(git-consistent) — 외부 repo로의 심볼릭도 따라감, FP 아님.
     let canonical = std::fs::canonicalize(&head_path).ok()?;
     if !canonical.ends_with(Path::new(".git").join("HEAD")) {
         return None;
@@ -2153,6 +2154,69 @@ mod tests {
             derive_git_branch_from_cwd(&deep.to_string_lossy()),
             None,
             "root .git이 ancestors index 64(MAX_WALK_UP_DEPTH 방문 범위 0..63 밖)라 prod cap이 차단 → None"
+        );
+    }
+
+    /// [threat#3, prod 경로, in-cap 경계 positive] prod `derive_git_branch_from_cwd`가
+    /// `MAX_WALK_UP_DEPTH`(64) cap **경계 내부**(index 63)의 root `.git`은 정상 발견함을 증명한다.
+    /// `..._prod_depth_cap_none`(64단계→index 64→None)과 짝을 이뤄 정확한 경계(63 in / 64 out)를 고정한다.
+    /// 구성: `<root>/.git`(in-cap-root) + `<root>` 아래 63단계 중첩 디렉터리(c1/.../c63) 실생성,
+    /// cwd=최심부(c63). root `.git`은 c63에서 보면 ancestors index 63(자신 c63=0, c62=1, ..., c1=62,
+    /// root=63)이라 `take(64)`=index 0..63에 **포함** → 발견 → Some("in-cap-root").
+    /// 비용: 중첩 dir create_dir_all 1회(작음).
+    #[test]
+    fn derive_from_cwd_walk_up_prod_depth_in_cap_some() {
+        let root = unique_test_dir("walkup-prod-depth-incap");
+        std::fs::create_dir_all(root.join(".git")).expect("root .git 생성 실패");
+        std::fs::write(
+            root.join(".git").join("HEAD"),
+            "ref: refs/heads/in-cap-root\n",
+        )
+        .expect("root HEAD 쓰기 실패");
+        // `<root>` 아래 63단계 중첩(c1/.../c63)을 1회 생성. 최심부에서 root는 ancestors index 63.
+        let mut deep = root.to_path_buf();
+        for i in 1..=63 {
+            deep = deep.join(format!("c{i}"));
+        }
+        std::fs::create_dir_all(&deep).expect("63단계 중첩 dir 생성 실패");
+        // prod 진입점: take(64)는 index 0..63 방문 → index 63인 root .git 포함 → Some.
+        assert_eq!(
+            derive_git_branch_from_cwd(&deep.to_string_lossy()).as_deref(),
+            Some("in-cap-root"),
+            "root .git이 ancestors index 63(MAX_WALK_UP_DEPTH 방문 범위 0..63 내부)라 prod cap이 발견 → Some. cap을 64 미만으로 낮추는 mutation 시 이 in-cap repo가 None으로 깨짐"
+        );
+    }
+
+    /// [Codex MEDIUM, 의도 계약화] 심볼릭 `.git`이 walk-up 트리 **밖**의 외부 repo를 가리켜도
+    /// 그 외부 repo의 branch를 추종해 표시함을 계약으로 고정한다.
+    /// 심볼릭 .git 추종은 의도된 표준 git 동작 — 해당 cwd에서 `git branch`와 동일(git-consistent).
+    /// 외부 repo로의 심볼릭이어도 FP가 아니라 정탐. 이 동작을 바꾸려면 공유 `read_branch_from_git_dir`·
+    /// 기존 `derive_from_cwd_symlink_git_dir_follows_to_some` 계약을 함께 재검토해야 한다.
+    /// 구성: `<external>/.git`(실 디렉터리, external-branch)는 walk-up 트리 **밖**의 별도 base.
+    /// `<base>/.git`→symlink→`<external>/.git`. `<base>/sub` 실생성. cwd=`<base>/sub` → Some("external-branch").
+    #[test]
+    #[cfg(unix)]
+    fn derive_from_cwd_walk_up_symlink_git_to_external_repo_follows_some() {
+        use std::os::unix::fs::symlink;
+        // 외부 repo: walk-up 트리와 무관한 별도 base에 실 `.git` 디렉터리를 둔다.
+        // 심볼릭 타깃은 `.git`로 끝나야 reader의 `ends_with(.git/HEAD)` 누출 가드를 통과한다.
+        let external = unique_test_dir("walkup-symlink-external-repo");
+        let external_git = external.join(".git");
+        std::fs::create_dir_all(&external_git).expect("external/.git 생성 실패");
+        std::fs::write(
+            external_git.join("HEAD"),
+            "ref: refs/heads/external-branch\n",
+        )
+        .expect("external HEAD 쓰기 실패");
+        // base: `<base>/.git`을 외부 repo의 실 `.git` 디렉터리로 심볼릭 링크한다(외부향 추종 케이스).
+        let base = unique_test_dir("walkup-symlink-external-base");
+        std::fs::create_dir_all(base.join("sub")).expect("base/sub 생성 실패");
+        symlink(&external_git, base.join(".git")).expect("심볼릭 base/.git 생성 실패");
+        let cwd = base.join("sub");
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()).as_deref(),
+            Some("external-branch"),
+            "심볼릭 .git이 walk-up 트리 밖 외부 repo를 가리켜도 추종 → external-branch. 표준 git 동작(git-consistent)이라 FP 아닌 정탐"
         );
     }
 }
