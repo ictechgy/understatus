@@ -672,11 +672,25 @@ fn e2e_codex_unmatched_degrades_to_bare_lterm() {
 fn oneline_lterm_git_subdir_shows_branch() {
     use std::io::Write;
     // create-before-spawn: 서브프로세스가 읽을 수 있도록 spawn 전에 `<root>/.git/HEAD` + `<root>/src`를 만든다.
-    let root = std::env::temp_dir().join(format!("understatus-lterm-subdir-{}", unique_token()));
+    let token = unique_token();
+    let root = std::env::temp_dir().join(format!("understatus-lterm-subdir-{token}"));
     let git_dir = root.join(".git");
     std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+    // 흔한 `main` 대신 고유 branch명(`wt-<short>`)을 써서 다른 소스의 `main` 누출로 인한 false-green을
+    // 차단한다(mutation 저항 강화). token(`<pid>-<nanos>-<counter>`)에서 파생한 짧은 8자리 hex 해시
+    // (`wt-<hash>`)를 branch명으로 쓴다(영숫자/하이픈만 포함 = git ref 규칙 적합).
+    let short = {
+        // 간단한 FNV-1a 64bit 해시(외부 의존 없이 token을 짧은 고유 hex로 압축).
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in token.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{:08x}", hash as u32)
+    };
+    let branch = format!("wt-{short}");
     let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
-    writeln!(file, "ref: refs/heads/main").expect("HEAD 쓰기 실패");
+    writeln!(file, "ref: refs/heads/{branch}").expect("HEAD 쓰기 실패");
     let subdir = root.join("src");
     std::fs::create_dir_all(&subdir).expect("하위 dir 생성 실패");
 
@@ -686,12 +700,26 @@ fn oneline_lterm_git_subdir_shows_branch() {
         r#"{{"source":"lterm","session":"codex","pane":"%3","agent":"codex","cwd":{cwd:?}}}"#
     );
 
-    let oneline_out = run_understatus(&["render", "--source", "lterm", "--oneline"], &stdin);
+    // 결정성 확보: 기본 max_width(80)에선 가변 네트워크 세그먼트(↓↑KB/s~MB/s) 폭에 따라 저우선 git
+    // 세그먼트가 enforce_width로 잘려 flaky해진다(특히 하위 dir의 추가 `· src` 세그먼트로 폭이 더 빡빡함).
+    // 넉넉한 max_width를 주입해 throughput 변동과 무관하게 git 세그먼트가 항상 유지되도록 고정한다.
+    let cfg_path = std::env::temp_dir()
+        .join(format!("understatus-subdir-cfg-{token}.toml"))
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(&cfg_path, "[display]\nmax_width = 500\n").expect("임시 config 작성 실패");
+
+    let oneline_out = run_understatus_with_config(
+        &["render", "--source", "lterm", "--oneline"],
+        &stdin,
+        &cfg_path,
+    );
     let oneline_text = String::from_utf8(oneline_out).expect("stdout는 UTF-8이어야 함");
     assert!(
-        oneline_text.contains("⎇ main"),
-        "repo 하위 dir cwd는 부모 walk-up으로 oneline에 ⎇ <branch>를 표시해야 함: {oneline_text:?}"
+        oneline_text.contains(&format!("⎇ {branch}")),
+        "repo 하위 dir cwd는 부모 walk-up으로 oneline에 고유 branch(⎇ {branch})를 표시해야 함: {oneline_text:?}"
     );
 
+    let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_dir_all(&root);
 }
