@@ -662,3 +662,36 @@ fn e2e_codex_unmatched_degrades_to_bare_lterm() {
     let _ = std::fs::remove_dir_all(&cache_home);
     let _ = std::fs::remove_file(&config);
 }
+
+/// repo 하위 dir(`<root>/src`)을 cwd로 준 lterm 세션은 부모 walk-up으로 branch를 표시해야 한다(W-A v2).
+///
+/// run_understatus는 서브프로세스이므로 stdin의 cwd가 실재해야 한다 → hermetic temp `<root>/.git/HEAD`와
+/// `<root>/src`를 **spawn 전에 디스크에 생성**한 뒤(create-before-spawn), cwd=`<root>/src`로 호출해
+/// oneline 출력에 git 세그먼트(⎇ <branch>)가 포함됨을 검증한다(oneline_lterm_git_cwd_shows_branch와 동형).
+#[test]
+fn oneline_lterm_git_subdir_shows_branch() {
+    use std::io::Write;
+    // create-before-spawn: 서브프로세스가 읽을 수 있도록 spawn 전에 `<root>/.git/HEAD` + `<root>/src`를 만든다.
+    let root = std::env::temp_dir().join(format!("understatus-lterm-subdir-{}", unique_token()));
+    let git_dir = root.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("임시 .git 생성 실패");
+    let mut file = std::fs::File::create(git_dir.join("HEAD")).expect("HEAD 생성 실패");
+    writeln!(file, "ref: refs/heads/main").expect("HEAD 쓰기 실패");
+    let subdir = root.join("src");
+    std::fs::create_dir_all(&subdir).expect("하위 dir 생성 실패");
+
+    // cwd를 repo 루트가 아닌 하위 `<root>/src`로 준다(부모 walk-up이 도출해야 정상).
+    let cwd = subdir.to_string_lossy().into_owned();
+    let stdin = format!(
+        r#"{{"source":"lterm","session":"codex","pane":"%3","agent":"codex","cwd":{cwd:?}}}"#
+    );
+
+    let oneline_out = run_understatus(&["render", "--source", "lterm", "--oneline"], &stdin);
+    let oneline_text = String::from_utf8(oneline_out).expect("stdout는 UTF-8이어야 함");
+    assert!(
+        oneline_text.contains("⎇ main"),
+        "repo 하위 dir cwd는 부모 walk-up으로 oneline에 ⎇ <branch>를 표시해야 함: {oneline_text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

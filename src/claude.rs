@@ -244,10 +244,10 @@ pub fn resolve_context_percent(
 /// 기본값으로 안전 저하한다(절대 패닉하지 않음, lenient — `parse_claude_input` 철학 동일).
 ///
 /// # 주의
-/// - `cwd`는 **표시용 + `<cwd>/.git` git 도출용**으로 매핑한다(cwd-only). `$PWD` 폴백은 추가하지
-///   않는다(spec §4.1/§6.2).
-/// - `git_branch`는 `cwd`가 유효 git repo일 때만 채워진다(조건부 — 절대 비활성이 아님). non-git
-///   cwd/detached HEAD/`.git` 부재면 `None`. 부모 walk-up은 하지 않는다([`derive_git_branch_from_cwd`]).
+/// - `cwd`는 **표시용 + git 도출용**으로 매핑한다. `$PWD` 폴백은 추가하지 않는다(spec §4.1/§6.2).
+/// - `git_branch`는 `cwd`(또는 그 조상)가 유효 git repo일 때만 채워진다(조건부 — 절대 비활성이 아님).
+///   non-git cwd/detached HEAD/조상 `.git` 부재면 `None`. canonical cwd 조상의 첫 `.git` 엔트리까지
+///   walk-up해 repo 루트 branch를 도출한다(W-A v2, [`derive_git_branch_from_cwd`]).
 /// - `session_key`는 캐시/펄스 격리용 안정 키다. 없으면 `"<session>/<pane>"`로 합성한다
 ///   (실제 경로 살균은 호출부 [`crate::chain::sanitize_session_key`]가 담당).
 /// - `version`은 `version` 필드로 읽되 Phase 1은 분기 없이 무시한다(forward-compat).
@@ -273,8 +273,8 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         .filter(|key| !key.is_empty())
         .or_else(|| session_label.clone());
 
-    // cwd에서 git 브랜치를 미리 도출한다(cwd-only, 부모 walk-up 없음). `as_deref()`는 불변 차용이라
-    // 이후 구조체의 `cwd: raw_input.cwd`(move)와 충돌하지 않는다.
+    // cwd(또는 그 조상)에서 git 브랜치를 미리 도출한다(canonical 조상의 첫 .git까지 walk-up, W-A v2).
+    // `as_deref()`는 불변 차용이라 이후 구조체의 `cwd: raw_input.cwd`(move)와 충돌하지 않는다.
     //
     // W-B(lterm payload에 `git_worktree` 필드 추가) 미채택 — lterm 레포 조사로 확정(블로커 해소):
     // lterm `Session.cwd`는 세션 시작 dir로 1회 고정되는 불변값이라 셸 `cd`를 추적하지 못한다
@@ -295,9 +295,9 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         context_used_percentage: None,
         // lterm 경로는 Claude context_window가 없다(ctx는 codex enrich 등 별도 경로).
         context_fallback_percentage: None,
-        // cwd는 표시용 + `<cwd>/.git` git 도출용으로 사용한다($PWD 폴백 없음).
+        // cwd는 표시용 + git 도출용으로 사용한다($PWD 폴백 없음).
         cwd: raw_input.cwd,
-        // cwd가 유효 git repo일 때만 채워진다(조건부 — 위에서 cwd-only 도출).
+        // cwd(또는 그 조상)가 유효 git repo일 때만 채워진다(조건부 — 위에서 walk-up 도출).
         git_branch,
         cost_usd: None,
         session_id: session_key,
@@ -387,6 +387,10 @@ fn is_safe_base_path(base_path: &str) -> bool {
 /// false-negative(빈 pill)를 택하는 방어적 상한이다(FP<FN).
 const MAX_BRANCH_LEN: usize = 256;
 
+/// walk-up 조상 순회 깊이 상한. 정상 repo 조상 깊이는 <20이라 64는 정상 회귀 0을 보장하면서
+/// mount loop·병적 깊이를 잘라내는 방어적 상한(초과=None, FP<FN). MAX_BRANCH_LEN과 동일 철학.
+const MAX_WALK_UP_DEPTH: usize = 64;
+
 /// 주어진 git 작업트리 경로에서 `.git/HEAD`를 읽어 현재 브랜치명을 추출한다.
 ///
 /// # 인자
@@ -416,6 +420,8 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     // `<base>/.git/HEAD` 탐색이 불가(ENOTDIR)해 canonicalize가 Err를 내고 None으로 안전 저하한다
     // (의도된 false-negative=branch 미표시). gitdir 추종은 임의 위치 파일 read를 열어 공격면을
     // 키우므로(추종을 추가하면 gitfile 내용이 신뢰 불가 입력이 되어 공격면이 열리므로) 의도적으로 미지원.
+    // 교차참조: walk-up([`find_git_root_dir`])이 그 위에서 첫 `.git` 엔트리(이 gitfile 포함) 정지로
+    // linked worktree/서브모듈 경계를 강제하므로, 부모 main repo branch로 새어 올라가지 않는다.
     let head_path = Path::new(base_path).join(".git").join("HEAD");
     // 외부 입력 경로 검증(심볼릭 차단): canonicalize로 심볼릭 링크/`.` 등을 해소한 실제
     // 경로가 여전히 `.git/HEAD`로 끝나는지 확인한다. 심볼릭 링크가 다른 파일을 가리키면
@@ -439,39 +445,81 @@ fn read_branch_from_git_dir(base_path: &str) -> Option<String> {
     }
 }
 
-/// lterm payload의 `cwd`에서 현재 git 브랜치를 파생한다(cwd-only 스코프).
+/// lterm payload의 `cwd`에서 현재 git 브랜치를 파생한다(FP-free walk-up, W-A v2).
 ///
 /// # 인자
 /// - `cwd`: lterm stdin payload의 `cwd`. 신뢰 불가 외부 입력 경계이므로 방어 검증을 거친다.
 ///
 /// # 반환
-/// `<cwd>/.git/HEAD`가 `ref: refs/heads/<branch>`이면 `Some("<branch>")`. traversal(`..`) cwd,
-/// detached HEAD, `.git` 부재, 외부향 심볼릭 HEAD 등은 모두 `None`으로 안전 저하한다(패닉 금지).
+/// canonical cwd 조상 중 첫 `.git` 엔트리를 가진 디렉터리의 `.git/HEAD`가 `ref: refs/heads/<branch>`이면
+/// `Some("<branch>")`. traversal(`..`) cwd, 상대경로 cwd, detached HEAD, 어떤 조상에도 `.git` 부재,
+/// 외부향 심볼릭 HEAD 등은 모두 `None`으로 안전 저하한다(패닉 금지).
 ///
 /// # 주의
-/// - **cwd-only 스코프**: 정확히 `<cwd>/.git/HEAD` 한 곳만 읽는다([`read_branch_from_git_dir`]의
-///   `<base>/.git/HEAD`-only 계약과 동형). **부모 디렉터리 walk-up은 하지 않는다.**
-/// - walk-up(부모로 `.git` 탐색)은 심볼릭 cwd에서 타 repo의 `.git/HEAD`를 확신에 차서 읽는
-///   false-positive(오정보) 위험이 있어 의도적으로 배제했다. status 표면은 빈 pill(false-negative)이
-///   틀린 branch(false-positive)보다 안전하다. 정탐률 보완은 false-positive-free 설계로 v2 이월.
-///   **후속 기여자는 무심코 부모 상승을 추가하지 말 것.**
-/// - 외부 입력 cwd traversal 방어는 [`is_safe_base_path`], 심볼릭 방어는 [`read_branch_from_git_dir`]의
-///   canonicalize 가드가 담당한다(기존 Claude 경로와 동일 검증 재사용 — 새 fs 순회 0).
+/// - **FP-free walk-up 허용(W-A v2)**: codex가 repo 하위 dir(예: `~/repo/src`)에서 시작해
+///   `<cwd>/.git`가 없어도 부모로 올라가 repo 루트 branch를 도출한다. 세 불변식으로 false-positive를 막는다.
+/// - 불변식① **canonicalize-once**: 루프 진입 전 cwd를 정확히 1회 canonicalize해 심볼릭 cwd/부모를
+///   실경로로 치환한다 → 심볼릭이 가리키는 타 repo를 순회하지 않는다(threat#1 단일 방어선).
+/// - 불변식② **첫 `.git` 정지**: [`find_git_root_dir`]이 `symlink_metadata`(lstat)로 첫 `.git` 엔트리
+///   (파일/디렉터리/심볼릭 무차별) 존재만 보고 정지한다 → linked worktree 경계를 넘어 main repo branch를
+///   표시하지 않는다. gitfile(`.git` 정규파일)은 여전히 미추종(첫 엔트리 정지 후 reader가 ENOTDIR→None으로
+///   흡수, Task3 No-go 보존).
+/// - 불변식③ **[`MAX_WALK_UP_DEPTH`] 상한**: 조상 순회를 64단계로 제한해 mount loop·병적 깊이를 차단한다.
+/// - **후속 기여자 경고**: "부모 상승 금지"가 아니라 위 세 불변식(canonicalize-first 1회 / 첫 `.git`
+///   정지 / depth cap)을 **제거하지 말 것**. 특히 ⓐ ancestors 루프 내 재canonicalize 금지(부모 심볼릭
+///   재해소로 symlink FP가 부활한다), ⓑ 정지 분기에 `symlink_metadata().is_dir()`/`.is_file()` 사용 금지
+///   (심볼릭 `.git` 디렉터리가 둘 다 false라 표준 git 추종이 깨진다 — 무조건 그 dir에 위임).
+/// - canonicalize가 심볼릭을 해소하므로 사용자가 '심볼릭 경로로 의도한' repo와 다른 실체 repo의 branch를
+///   볼 수 있으나, 이는 FP가 아니라 실제 디스크에 존재하는 repo의 정탐(git-consistent)이다.
+/// - 외부 입력 cwd traversal 방어는 [`is_safe_base_path`], 심볼릭 HEAD 방어는 [`read_branch_from_git_dir`]의
+///   canonicalize 가드가 담당한다(기존 Claude 경로와 동일 검증 재사용).
 /// - 상대경로 cwd는 거부한다(프로세스 cwd 기준 false-positive 방지). `"."`/`"repo"`처럼 `..`가
 ///   없어 traversal 검사를 통과해도, understatus 프로세스 cwd 기준으로 해석돼 엉뚱한 위치의
-///   branch를 도출하는 cwd-only 계약 위반이 되므로 절대경로만 허용한다.
+///   branch를 도출하므로 절대경로만 허용한다.
 fn derive_git_branch_from_cwd(cwd: &str) -> Option<String> {
-    // traversal 차단: `..`가 섞인 cwd는 임의 위치 `.git/HEAD` 탐색을 노릴 수 있어 거부한다.
+    // traversal 차단: `..`가 섞인 cwd는 임의 위치 `.git/HEAD` 탐색을 노릴 수 있어 거부한다(기존 가드).
     if !is_safe_base_path(cwd) {
         return None;
     }
     // 상대경로 거부: 프로세스 cwd 기준 해석으로 엉뚱한 repo branch를 도출하는 false-positive를 막는다.
-    // 대칭: worktree 경로(derive_git_branch)의 절대성 가드와 동일 — 한쪽 변경 시 양쪽 동기화.
     if !std::path::Path::new(cwd).is_absolute() {
         return None;
     }
-    // 부모 상승 없이 `<cwd>/.git/HEAD`만 1회 읽는다(cwd-only).
-    read_branch_from_git_dir(cwd)
+    // ★ 불변식①: canonicalize 정확히 1회, walk-up 루프 진입 전. 심볼릭 cwd/부모를 실경로로 치환한다.
+    let start = std::fs::canonicalize(cwd).ok()?;
+    find_git_root_dir(&start).and_then(|root| read_branch_from_git_dir(&root.to_string_lossy()))
+}
+
+/// canonical 조상을 [`MAX_WALK_UP_DEPTH`] 내 순회하며 첫 `.git` 엔트리를 가진 디렉터리를 반환한다.
+///
+/// # 인자
+/// - `start`: **canonicalize된 절대 실경로**(불변식 — 호출부가 루프 진입 전 1회 canonicalize). 루프
+///   내부에서 재canonicalize하지 않으므로 부모 심볼릭 재해소로 인한 symlink false-positive가 부활하지 않는다.
+///
+/// # 반환
+/// 첫 `.git` 엔트리가 존재하는 조상 디렉터리의 [`PathBuf`]. 깊이 상한 내 어떤 조상에도 `.git`이 없으면 `None`.
+///
+/// # 주의
+/// - `symlink_metadata`(lstat)로 `.git` 엔트리 **존재만** 판정한다(추종/읽기 아님). dir/file/심볼릭을
+///   구분하지 않고 첫 엔트리에서 정지한 뒤 그 디렉터리를 무조건 반환한다(분기 없음). `is_dir()`/`is_file()`
+///   분기를 쓰면 심볼릭 `.git` 디렉터리가 둘 다 false라 표준 git 추종이 깨지므로 절대 사용하지 않는다.
+/// - `ancestors()`는 루트에서 종료하고 `take(MAX_WALK_UP_DEPTH)`로 깊이가 유한하므로 무한 루프/패닉이 없다.
+fn find_git_root_dir(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    find_git_root_dir_capped(start, MAX_WALK_UP_DEPTH)
+}
+
+/// [`find_git_root_dir`]의 깊이 상한 주입 변형(테스트 전용 cap 검증용 — prod는 항상 [`MAX_WALK_UP_DEPTH`]).
+///
+/// 65단계 디렉터리 생성 비용 없이 depth cap 동작을 검증하기 위해 cap을 인자로 분리했다(prod 공개 API
+/// 오염 없음). 불변식·정지 규칙은 [`find_git_root_dir`]과 동일하다.
+fn find_git_root_dir_capped(start: &std::path::Path, cap: usize) -> Option<std::path::PathBuf> {
+    for dir in start.ancestors().take(cap) {
+        // 불변식②: lstat로 첫 `.git` 엔트리 존재만 판정 → 무조건 이 dir 반환(파일/디렉터리/심볼릭 무차별).
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
 }
 
 /// Claude Code stdin JSON의 중첩 구조를 그대로 받는 내부 역직렬화 타입.
@@ -1813,6 +1861,191 @@ mod tests {
             derive_git_branch(&ws),
             None,
             "gitfile 워크트리 미추종 → None(추종 구현 시 Some(sentinel-ws)로 깨짐)"
+        );
+    }
+
+    /// [P1 핵심] repo 하위 dir에서 시작해도 부모로 walk-up해 repo 루트 branch를 도출한다.
+    /// `<root>/.git/HEAD`=main + cwd=`<root>/src/deep` → Some("main").
+    #[test]
+    fn derive_from_cwd_walk_up_from_subdir_some() {
+        let root = unique_test_dir("walkup-subdir");
+        std::fs::create_dir_all(root.join(".git")).expect("root .git 생성 실패");
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("HEAD 쓰기 실패");
+        let deep = root.join("src").join("deep");
+        std::fs::create_dir_all(&deep).expect("하위 dir 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&deep.to_string_lossy()).as_deref(),
+            Some("main"),
+            "repo 하위 dir에서 부모 walk-up으로 루트 branch 도출(P1)"
+        );
+    }
+
+    /// walk-up은 첫 `.git` 디렉터리에서 정지한다(가장 가까운 repo 경계 존중).
+    /// `<root>/.git`(outer) + `<root>/inner/.git`(inner) + cwd=`<root>/inner/x` → Some("inner").
+    #[test]
+    fn derive_from_cwd_walk_up_stops_at_first_git_dir() {
+        let root = unique_test_dir("walkup-firststop");
+        std::fs::create_dir_all(root.join(".git")).expect("outer .git 생성 실패");
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/outer\n")
+            .expect("outer HEAD 쓰기 실패");
+        let inner = root.join("inner");
+        std::fs::create_dir_all(inner.join(".git")).expect("inner .git 생성 실패");
+        std::fs::write(inner.join(".git").join("HEAD"), "ref: refs/heads/inner\n")
+            .expect("inner HEAD 쓰기 실패");
+        let cwd = inner.join("x");
+        std::fs::create_dir_all(&cwd).expect("cwd 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()).as_deref(),
+            Some("inner"),
+            "가장 가까운 첫 .git에서 정지 — 부모 outer로 올라가지 않음"
+        );
+    }
+
+    /// [threat#2, 이중 mutation 저항] gitfile 정규파일 `.git` 경계에서 정지하되 미추종 → None.
+    /// `<main>/.git`(디렉터리, outer-main) + `<main>/wt/.git`=gitfile(gitdir에 sentinel-wt 실재) +
+    /// cwd=`<main>/wt/src` → None. gitfile 추종 추가 시 Some(sentinel-wt), 경계 무시 상승 추가 시
+    /// Some(outer-main)로 깨진다 = 양방향 mutation을 모두 포착한다.
+    #[test]
+    fn derive_from_cwd_walk_stops_at_gitfile_boundary_none() {
+        let main = unique_test_dir("walkup-gitfile-main");
+        std::fs::create_dir_all(main.join(".git")).expect("main .git 생성 실패");
+        std::fs::write(
+            main.join(".git").join("HEAD"),
+            "ref: refs/heads/outer-main\n",
+        )
+        .expect("main HEAD 쓰기 실패");
+        // 실재 gitdir + sentinel HEAD(추종 회귀가 도입되면 Some(sentinel-wt)로 깨지도록 실재화).
+        let gitdir = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&gitdir).expect("gitdir 생성 실패");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/sentinel-wt\n")
+            .expect("gitdir HEAD 쓰기 실패");
+        // linked worktree: `<main>/wt/.git`는 gitdir를 가리키는 정규파일.
+        let wt = main.join("wt");
+        std::fs::create_dir_all(wt.join("src")).expect("wt/src 생성 실패");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy()),
+        )
+        .expect(".git gitfile 생성 실패");
+        let cwd = wt.join("src");
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()),
+            None,
+            "gitfile 경계에서 정지+미추종 → None(추종 추가 시 Some(sentinel-wt), 경계 무시 상승 시 Some(outer-main)로 깨짐)"
+        );
+    }
+
+    /// 경계 `.git` 디렉터리에 HEAD가 부재해도 그 경계에서 정지한다(부모 real로 안 올라감) → None.
+    /// `<root>/.git`(HEAD=real) + `<root>/sub/.git`(HEAD 부재) + cwd=`<root>/sub` → None.
+    #[test]
+    fn derive_from_cwd_walk_stops_at_empty_git_dir() {
+        let root = unique_test_dir("walkup-emptygit");
+        std::fs::create_dir_all(root.join(".git")).expect("root .git 생성 실패");
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/real\n")
+            .expect("root HEAD 쓰기 실패");
+        let sub = root.join("sub");
+        // 하위 `.git` 디렉터리는 존재하나 HEAD가 없다(엔트리 존재 → 정지, reader가 None).
+        std::fs::create_dir_all(sub.join(".git")).expect("sub .git 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&sub.to_string_lossy()),
+            None,
+            "경계 .git이 HEAD 부재여도 정지 — 부모 real로 상승하지 않음"
+        );
+    }
+
+    /// [threat#1, mutation 저항] canonicalize-once 불변식①을 실제로 고정한다.
+    /// 구성: `<base>/repo/.git`(branch=leaked) 실재 + `<base>/repo/link`→`<base>/target` symlink +
+    /// 실타깃 `<base>/target/sub`(.git 없음) 실재. cwd=`<base>/repo/link/sub`.
+    /// canonicalize는 link를 `<base>/target`으로 해소하므로 그 조상(target/base)엔 `.git`이 없어 None.
+    /// ★ 핵심: lexical 부모 `<base>/repo`에 함정 repo(.git=leaked)를 둔다. canonicalize를 제거하거나
+    /// 루프 내 재canonicalize하면 lexical 조상 `<base>/repo/.git`을 만나 `Some("leaked")` = cross-repo
+    /// false-positive로 단언이 깨진다(불변식① mutation 포착). canonicalize-once일 때만 None.
+    #[test]
+    #[cfg(unix)]
+    fn derive_from_cwd_walk_up_symlink_cwd_no_cross_repo() {
+        use std::os::unix::fs::symlink;
+        let base = unique_test_dir("walkup-symlink");
+        // lexical 부모에 함정 repo(.git=leaked): 미-canonicalize walk-up이 잘못 귀속할 대상.
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo/.git 생성 실패");
+        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/leaked\n")
+            .expect("repo HEAD 쓰기 실패");
+        // 심볼릭 실타깃: `.git` 없는 별도 트리(canonical 실경로 조상).
+        std::fs::create_dir_all(base.join("target").join("sub")).expect("target/sub 생성 실패");
+        // `<base>/repo/link` → `<base>/target`. cwd=`<base>/repo/link/sub`(canonical=`<base>/target/sub`).
+        let link = repo.join("link");
+        symlink(base.join("target"), &link).expect("심볼릭 link 생성 실패");
+        let cwd = link.join("sub");
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()),
+            None,
+            "canonical 실경로(target, .git 없음) 조상만 순회 → None. \
+             canonicalize 제거/루프 내 재canonicalize 시 lexical repo/.git을 만나 Some(\"leaked\")로 깨짐(threat#1)"
+        );
+    }
+
+    /// [ATTACK P 정탐 확대 고정] 추적 안 되는 하위 dir이라도 부모 repo work tree 안이면 branch 표시.
+    /// `<repo>/.git/HEAD`=parent-main + cwd=`<repo>/untracked/sub` → Some("parent-main").
+    /// "=git branch와 동일한 git-consistent 정탐, FP 아님"을 고정한다.
+    #[test]
+    fn derive_from_cwd_walk_up_parent_repo_positive() {
+        let repo = unique_test_dir("walkup-parent-positive");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git 생성 실패");
+        std::fs::write(
+            repo.join(".git").join("HEAD"),
+            "ref: refs/heads/parent-main\n",
+        )
+        .expect("HEAD 쓰기 실패");
+        let cwd = repo.join("untracked").join("sub");
+        std::fs::create_dir_all(&cwd).expect("untracked/sub 생성 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&cwd.to_string_lossy()).as_deref(),
+            Some("parent-main"),
+            "추적 안 되는 하위 dir도 부모 work tree 안이면 branch 표시 = git-consistent 정탐(FP 아님)"
+        );
+    }
+
+    /// [cwd-only 회귀 0] cwd=`<root>` 자신(depth 0)이면 기존 cwd-only 동작과 동일하게 Some("main").
+    #[test]
+    fn derive_from_cwd_walk_up_root_repo_unchanged() {
+        let root = unique_test_dir("walkup-root-unchanged");
+        std::fs::create_dir_all(root.join(".git")).expect("root .git 생성 실패");
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("HEAD 쓰기 실패");
+        assert_eq!(
+            derive_git_branch_from_cwd(&root.to_string_lossy()).as_deref(),
+            Some("main"),
+            "depth 0(cwd 자신이 repo 루트) 동작은 기존 cwd-only와 동일"
+        );
+    }
+
+    /// [threat#3] depth cap 초과 깊이에서는 None(병적 깊이/mount loop 차단).
+    /// 65단계 fs 생성 비용을 회피하기 위해 작은 cap(3)을 `find_git_root_dir_capped`에 직접 주입해
+    /// cap 초과 조상의 `.git`이 발견되지 않음을 검증한다(prod는 MAX_WALK_UP_DEPTH 경유).
+    #[test]
+    fn derive_from_cwd_walk_up_depth_cap_none() {
+        let root = unique_test_dir("walkup-depthcap");
+        std::fs::create_dir_all(root.join(".git")).expect("root .git 생성 실패");
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("HEAD 쓰기 실패");
+        // root에서 4단계 아래(cap=3 초과)인 깊은 cwd. canonicalize 위해 실생성한다.
+        let deep = root.join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).expect("깊은 cwd 생성 실패");
+        let start = std::fs::canonicalize(&deep).expect("canonicalize 실패");
+        // cap=3: start(=d) → c → b 까지만 순회(root .git 미도달, root는 5단계 위).
+        assert_eq!(
+            find_git_root_dir_capped(&start, 3),
+            None,
+            "cap 초과 깊이의 .git은 미발견 → None(threat#3 mount loop·병적 깊이 차단)"
+        );
+        // 대조: 넉넉한 cap이면 root .git을 발견한다(cap이 유일 변수임을 고정).
+        // 깊이-인덱스 결합을 피해 canonical root와 직접 비교한다(deep 깊이 변경에 견고).
+        let canonical_root = std::fs::canonicalize(&*root).expect("root canonicalize 실패");
+        assert_eq!(
+            find_git_root_dir_capped(&start, MAX_WALK_UP_DEPTH),
+            Some(canonical_root),
+            "넉넉한 cap이면 root .git 발견(cap만이 차이를 만드는 변수)"
         );
     }
 }
