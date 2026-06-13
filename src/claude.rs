@@ -275,6 +275,15 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
 
     // cwd에서 git 브랜치를 미리 도출한다(cwd-only, 부모 walk-up 없음). `as_deref()`는 불변 차용이라
     // 이후 구조체의 `cwd: raw_input.cwd`(move)와 충돌하지 않는다.
+    //
+    // W-B(lterm payload에 `git_worktree` 필드 추가) 미채택 — lterm 레포 조사로 확정(블로커 해소):
+    // lterm `Session.cwd`는 세션 시작 dir로 1회 고정되는 불변값이라 셸 `cd`를 추적하지 못한다
+    // (비-Mutex String, create_session에서 1회 캡처 후 갱신 경로 부재 — OSC 7/proc cwd 폴링·cwd 갱신
+    // RPC 전무). 게다가 lterm엔 git 인지 자체가 없다(git_worktree 미도출). 따라서 lterm이 줄 수 있는
+    // git_worktree는 cwd와 동일한 부정확성을 공유하므로, false-positive를 빈 pill(관측 가능) 대신
+    // 외부 repo의 틀린 branch(관측 불가)로 이전(displace)할 뿐이다. lterm이 proc_pidinfo(
+    // PROC_PIDVNODEPATHINFO)로 live cwd를 실제 도출하도록 구현(lterm 측 별도 작업)하기 전까지는
+    // cwd-only가 FP<FN 원칙상 최선. **후속 기여자는 RawLtermInput에 git_worktree를 추가하지 말 것.**
     let git_branch = raw_input
         .cwd
         .as_deref()
