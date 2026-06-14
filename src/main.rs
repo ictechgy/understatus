@@ -587,6 +587,38 @@ fn resolve_claude_context(
     }
 }
 
+/// Claude rate-limit 카운트다운을 pre-resolve한다(in-place). 시간 산술·부패 방어를 render 진입 전에 끝낸다.
+///
+/// 내부 raw `resets_at`(epoch s)와 `now_ms`로 5h/7d 카운트다운 문자열을 도출해 `rate_*_countdown`에
+/// 기록한다(Option C: render는 pre-resolved 값만 포맷). 시간 산술·캐스팅·상한 방어는 claude.rs의
+/// 순수 함수 [`claude::compute_remaining_secs`]/[`claude::format_reset_countdown`]에 격리돼 있다.
+///
+/// # 인자
+/// - `claude_input`: in-place 갱신 대상. `internal_rate_*_resets_at_raw`를 읽어 `rate_*_countdown`을 채운다.
+/// - `now_ms`: 현재 시각(epoch ms). `0`(시계 이상)이면 순수 함수가 카운트다운을 생략한다.
+fn resolve_claude_rate_limits(claude_input: &mut claude::ClaudeInput, now_ms: u128) {
+    claude_input.rate_5h_countdown = resolve_one_countdown(
+        claude_input.internal_rate_5h_resets_at_raw,
+        now_ms,
+        claude::RATE_5H_MAX_REMAINING_SECS,
+    );
+    claude_input.rate_weekly_countdown = resolve_one_countdown(
+        claude_input.internal_rate_weekly_resets_at_raw,
+        now_ms,
+        claude::RATE_WEEKLY_MAX_REMAINING_SECS,
+    );
+}
+
+/// 단일 윈도우 raw `resets_at`(epoch 초) → 카운트다운 문자열. 부재/부패(비유한·과거·상한초과)면 `None`.
+fn resolve_one_countdown(
+    resets_at_raw: Option<f64>,
+    now_ms: u128,
+    max_secs: i64,
+) -> Option<String> {
+    let remaining = claude::compute_remaining_secs(resets_at_raw?, now_ms, max_secs)?;
+    claude::format_reset_countdown(remaining)
+}
+
 /// 세션 캐시에서 TTL(`ttl_seconds`) 내 직전 양수 native ctx%를 읽는다.
 ///
 /// I/O(세션 캐시 읽기)는 여기서 하고, TTL·파싱·유한성 판정은 순수 [`interpret_held_native_ctx`]에
@@ -699,6 +731,8 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
     //   lterm/codex 경로는 context_window가 없어 자연 no-op이므로 Claude로 게이팅한다.
     if source == Source::Claude {
         resolve_claude_context(&mut claude_input, &session_key, now_ms, &cfg.context);
+        // rate-limit 카운트다운을 render 진입 전에 pre-resolve한다(Option C: 시간 산술은 render에 0).
+        resolve_claude_rate_limits(&mut claude_input, now_ms);
     }
 
     // (6') --surface-format cmux-status: SGR 한 줄 대신 cmux pill JSON 1줄을 출력하고 종료한다.
@@ -1368,5 +1402,43 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// AC14–AC16: resolve_claude_rate_limits — 정상 raw → countdown 채움, 부재/과거/now=0 → None.
+    ///
+    /// AC17(소스 게이팅: source≠Claude → 리졸버 미호출)은 호출부(`if source == Source::Claude`)가
+    /// 구조적으로 보장하며 lterm 경로의 신규 필드 None은 claude.rs `parse_lterm_rate_limits_all_none`이 잠근다.
+    #[test]
+    fn resolve_claude_rate_limits_pre_resolves_countdown() {
+        let now_ms: u128 = 1_000_000_000_000;
+        let now_secs = 1_000_000_000_i64;
+
+        // AC14: 정상 raw resets → 5h/7d countdown pre-resolve.
+        let mut input = claude::ClaudeInput {
+            internal_rate_5h_resets_at_raw: Some((now_secs + 9000) as f64),
+            internal_rate_weekly_resets_at_raw: Some((now_secs + 360_000) as f64),
+            ..Default::default()
+        };
+        resolve_claude_rate_limits(&mut input, now_ms);
+        assert_eq!(input.rate_5h_countdown.as_deref(), Some("2h30m"));
+        assert_eq!(input.rate_weekly_countdown.as_deref(), Some("4d4h"));
+
+        // AC15: raw 부재(5h) / 과거(7d) → countdown None.
+        let mut edge = claude::ClaudeInput {
+            internal_rate_5h_resets_at_raw: None,
+            internal_rate_weekly_resets_at_raw: Some((now_secs - 100) as f64),
+            ..Default::default()
+        };
+        resolve_claude_rate_limits(&mut edge, now_ms);
+        assert_eq!(edge.rate_5h_countdown, None);
+        assert_eq!(edge.rate_weekly_countdown, None);
+
+        // AC16: now_ms == 0(시계 이상) → 둘 다 None.
+        let mut zero = claude::ClaudeInput {
+            internal_rate_5h_resets_at_raw: Some((now_secs + 9000) as f64),
+            ..Default::default()
+        };
+        resolve_claude_rate_limits(&mut zero, 0);
+        assert_eq!(zero.rate_5h_countdown, None);
     }
 }
