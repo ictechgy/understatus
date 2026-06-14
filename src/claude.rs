@@ -303,7 +303,7 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         session_id: session_key,
         // lterm 세션/페인 표시 라벨(status row에 cwd 앞 표시용).
         session_label,
-        // codex enrich는 호출부(main.rs)에서 Source::Lterm 한정으로 별도 수행한다(초기 None).
+        // codex enrich는 호출부(main.rs)에서 Source::Lterm·Codex 한정으로 별도 수행한다(초기 None).
         codex: None,
     }
 }
