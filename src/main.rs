@@ -85,16 +85,21 @@ fn has_extra_args(args: &[String]) -> bool {
     args.len() > 2
 }
 
-/// 렌더 입력 소스(spec §6.1). `--source <claude|lterm>`로 선택하며 기본은 claude.
+/// 렌더 입력 소스(spec §6.1). `--source <claude|lterm|codex>`로 선택하며 기본은 claude.
 ///
 /// - `Claude`: 기존 동작(Claude Code stdin JSON 파싱 + chain 가능).
 /// - `Lterm`: lterm 합성 JSON 파싱(git 비활성, chain 기본 off).
+/// - `Codex`: `Lterm`과 동일한 합성 JSON 파서를 공유하되, lterm 데몬 없이
+///   tmux status-line 등에서 직접 호출하는 용도다. codex enrich(`~/.codex` 직접 판독)가
+///   `Lterm`과 동일하게 활성화되어 model/ctx%/rate-limit를 채운다(stdin에 `agent`/`cwd`만 주면 됨).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     /// Claude Code stdin JSON(기본값).
     Claude,
     /// lterm 합성 JSON(`--source lterm`).
     Lterm,
+    /// lterm-free 직접 호출(`--source codex`). `Lterm`과 파서·enrich를 공유한다.
+    Codex,
 }
 
 /// 렌더 출력 표면(surface) 형식. `--surface-format <oneline|cmux-status>`로 선택하며 기본 Oneline.
@@ -117,7 +122,7 @@ enum SurfaceFormat {
 
 /// render 경로의 파싱된 플래그.
 struct RenderArgs {
-    /// `--source <claude|lterm>`. 미지정 시 [`Source::Claude`].
+    /// `--source <claude|lterm|codex>`. 미지정 시 [`Source::Claude`].
     source: Source,
     /// `--oneline`. true면 chain 미수행 + 후행 개행 없이 1행 출력(spec §6.3).
     oneline: bool,
@@ -154,9 +159,9 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
     while index < args.len() {
         match args[index].as_str() {
             "--source" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--source 뒤에 값이 필요합니다(claude|lterm).".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--source 뒤에 값이 필요합니다(claude|lterm|codex).".to_string()
+                })?;
                 source = parse_source(value)?;
                 index += 2;
             }
@@ -204,8 +209,9 @@ fn parse_source(value: &str) -> Result<Source, String> {
     match value {
         "claude" => Ok(Source::Claude),
         "lterm" => Ok(Source::Lterm),
+        "codex" => Ok(Source::Codex),
         other => Err(format!(
-            "알 수 없는 source '{other}'. 사용 가능: claude|lterm."
+            "알 수 없는 source '{other}'. 사용 가능: claude|lterm|codex."
         )),
     }
 }
@@ -641,7 +647,8 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
     // (2) 소스별 세션 정보 파싱(누락/null/깨진 JSON 안전). lterm은 git 비활성.
     let mut claude_input = match source {
         Source::Claude => claude::parse_claude_input(&raw_stdin),
-        Source::Lterm => claude::parse_lterm_input(&raw_stdin),
+        // lterm·codex는 동일 합성 JSON 파서를 공유한다(codex는 lterm 데몬 없이 tmux 등에서 직접 호출).
+        Source::Lterm | Source::Codex => claude::parse_lterm_input(&raw_stdin),
     };
 
     // 세션 캐시 격리 키를 한 곳에서 1회 살균한다(§11.3). session_id 부재/빈 값은 "default"로 폴백.
@@ -650,10 +657,11 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
     // (5) 설정 로드(부재/깨짐 시 기본값).
     let cfg = config::load_config();
 
-    // (5') Codex 세션 심층판독 enrich(spec §7). **Source::Lterm 한정**: Claude 경로에서 모델
+    // (5') Codex 세션 심층판독 enrich(spec §7). **Source::Lterm·Codex 한정**: Claude 경로에서 모델
     //   별칭이 우연히 codex 계열이어도 ~/.codex를 읽지 않도록 여기서 게이팅한다(비트 동일 보존).
+    //   `--source codex`는 lterm 데몬 없이 직접 호출하는 경로로, 같은 파서·enrich를 공유한다.
     //   enrich는 session_id를 바꾸지 않으므로 위 session_key 도출/이후 파이프라인에 영향 없다.
-    if source == Source::Lterm {
+    if matches!(source, Source::Lterm | Source::Codex) {
         codex::maybe_enrich(&mut claude_input, &cfg);
     }
 
@@ -776,7 +784,7 @@ fn print_help() {
          \x20 understatus --version      버전 출력\n\
          \n\
          render 옵션(understatus render 뒤에 사용):\n\
-         \x20 --source <s>          입력 소스(claude|lterm). 미지정 시 claude.\n\
+         \x20 --source <s>          입력 소스(claude|lterm|codex). 미지정 시 claude.\n\
          \x20 --oneline             chain 없이 코어 한 줄만 후행 개행 없이 출력(terse, status row용).\n\
          \x20 --surface-format <f>  출력 표면(oneline|cmux-status). 미지정 시 oneline.\n\
          \x20                       (--surface-format은 표면 선택, --oneline은 terse 여부 — 직교)\n\
@@ -859,6 +867,23 @@ mod tests {
         let parsed = parse_render_args(&render_argv(&["--source", "claude"])).expect("파싱 성공");
         assert_eq!(parsed.source, Source::Claude);
         assert!(!parsed.oneline);
+    }
+
+    /// `--source codex` → Codex 소스 + oneline 동시 지정 진입(lterm-free tmux 경로).
+    #[test]
+    fn parse_render_args_source_codex() {
+        let parsed = parse_render_args(&render_argv(&["--source", "codex", "--oneline"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Codex);
+        assert!(parsed.oneline);
+    }
+
+    /// `--source` 마지막 값이 codex여도 last-wins 계약이 유지되어야 한다.
+    #[test]
+    fn parse_render_args_duplicate_source_codex_last_wins() {
+        let parsed = parse_render_args(&render_argv(&["--source", "lterm", "--source", "codex"]))
+            .expect("파싱 성공");
+        assert_eq!(parsed.source, Source::Codex);
     }
 
     /// 미지 source 값은 에러(ExitCode::FAILURE로 이어짐).

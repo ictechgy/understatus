@@ -759,7 +759,7 @@ fn is_codex_model(model: &str) -> bool {
 /// Codex 세션을 판독해 [`ClaudeInput`]을 in-place로 enrich한다(spec §7 게이팅).
 ///
 /// # 게이팅(이중 + observability)
-/// - 호출부([`crate::main`])에서 **`Source::Lterm`으로 한정**해 호출한다(Claude 경로 오발동 차단).
+/// - 호출부([`crate::main`])에서 **`Source::Lterm`·`Source::Codex`로 한정**해 호출한다(Claude 경로 오발동 차단).
 /// - 추가로 `cfg.codex.enabled` && model이 codex 계열 && `input.cwd=Some` && `codex_home()` 존재.
 ///
 /// 단일 해소면 `model_display_name`/`context_used_percentage`/`codex`를 설정한다. 모호/없음/실패
