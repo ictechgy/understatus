@@ -216,6 +216,16 @@ fn parse_source(value: &str) -> Result<Source, String> {
     }
 }
 
+/// 해당 소스가 Codex 세션 심층판독(`~/.codex` 직접 판독) enrich를 수행해야 하는지 판정한다.
+///
+/// `Lterm`·`Codex`만 `true`다(둘 다 `parse_lterm_input` 기반 lterm 합성 JSON 경로).
+/// `Claude`는 `false` — Claude payload의 모델 별칭이 우연히 codex 계열이어도 `~/.codex`를
+/// 읽지 않도록 차단해 기존 Claude 경로를 **비트 단위로 보존**한다(회귀 0). 인라인 `matches!`를
+/// 순수 함수로 추출해 게이트 불변식을 단위 테스트로 고정한다(`should_enrich_codex_gate`).
+fn should_enrich_codex(source: Source) -> bool {
+    matches!(source, Source::Lterm | Source::Codex)
+}
+
 /// 설치 가능한 테마 기본값(미지정 + 비TTY/`--yes` 폴백).
 const DEFAULT_THEME: &str = "calm";
 /// 설치 가능한 갱신 주기 기본값(초).
@@ -661,7 +671,7 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
     //   별칭이 우연히 codex 계열이어도 ~/.codex를 읽지 않도록 여기서 게이팅한다(비트 동일 보존).
     //   `--source codex`는 lterm 데몬 없이 직접 호출하는 경로로, 같은 파서·enrich를 공유한다.
     //   enrich는 session_id를 바꾸지 않으므로 위 session_key 도출/이후 파이프라인에 영향 없다.
-    if matches!(source, Source::Lterm | Source::Codex) {
+    if should_enrich_codex(source) {
         codex::maybe_enrich(&mut claude_input, &cfg);
     }
 
@@ -890,6 +900,21 @@ mod tests {
     #[test]
     fn parse_render_args_rejects_unknown_source() {
         assert!(parse_render_args(&render_argv(&["--source", "bogus"])).is_err());
+    }
+
+    /// codex enrich 게이트 불변식(회귀 0 잠금): Lterm·Codex만 발화하고 Claude는 no-op.
+    ///
+    /// `run_render_pipeline`이 stdin/`~/.codex` I/O를 타 직접 테스트가 어려우므로, 게이트를
+    /// 순수 함수로 추출해 여기서 잠근다. 향후 게이트 리팩토링이 Claude 경로를 오발동시키면
+    /// (예: `_ => true`) 이 테스트가 즉시 실패한다.
+    #[test]
+    fn should_enrich_codex_gate() {
+        assert!(should_enrich_codex(Source::Lterm), "Lterm은 enrich 발화");
+        assert!(should_enrich_codex(Source::Codex), "Codex는 enrich 발화");
+        assert!(
+            !should_enrich_codex(Source::Claude),
+            "Claude는 enrich no-op(회귀 0)"
+        );
     }
 
     /// `--source` 값 누락은 에러여야 한다.
