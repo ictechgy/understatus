@@ -124,6 +124,11 @@ pub struct DisplayConfig {
     pub show_disk: bool,
     /// 네트워크 throughput(P2, getifaddrs 델타) 노출.
     pub show_network: bool,
+    /// Claude rate-limit(5h/7d 쿼터 % + 리셋 카운트다운) 세그먼트 노출. Claude 소스 전용.
+    pub show_rate_limit: bool,
+    /// rate-limit 경고 임계치(%). `Some(t)`이고 사용률 ≥ t이면 값에 경고색을 입힌다(opt-in).
+    /// 기본 `None`(무색, calm) — 임계 인지가 필요한 사용자만 활성화한다(M2 결정).
+    pub rate_limit_warn_threshold: Option<u32>,
 }
 
 /// `[color]` 섹션. NO_COLOR 환경변수가 있으면 아래와 무관하게 색상 비활성.
@@ -261,6 +266,9 @@ impl Default for DisplayConfig {
             show_battery: true,
             show_disk: true,
             show_network: true,
+            show_rate_limit: true,
+            // 기본 off: calm·codex 레이아웃 대칭 유지. 임계 인지는 사용자가 opt-in(M2).
+            rate_limit_warn_threshold: None,
         }
     }
 }
@@ -844,5 +852,21 @@ mod tests {
         let config = parse_config_str("");
         assert_eq!(config.context.hold_ttl_seconds, 180);
         assert_eq!(config.context.drop_tolerance, 12.0);
+    }
+
+    /// AC12/AC13: show_rate_limit 기본 true, false 명시 반영.
+    #[test]
+    fn display_show_rate_limit_toggle() {
+        assert!(parse_config_str("").display.show_rate_limit, "기본 true");
+        let off = parse_config_str("[display]\nshow_rate_limit = false\n");
+        assert!(!off.display.show_rate_limit);
+    }
+
+    /// AC23: rate_limit_warn_threshold 기본 None(warn off), 명시 시 Some.
+    #[test]
+    fn display_rate_limit_warn_threshold() {
+        assert_eq!(parse_config_str("").display.rate_limit_warn_threshold, None);
+        let on = parse_config_str("[display]\nrate_limit_warn_threshold = 80\n");
+        assert_eq!(on.display.rate_limit_warn_threshold, Some(80));
     }
 }

@@ -40,6 +40,30 @@ pub struct ClaudeInput {
     /// Codex 세션 심층판독으로 enrich된 추가 필드(5h/주간 한도·plan·effort). lterm/codex 소스 전용.
     /// Claude 경로는 항상 `None`(비트 동일 보장, spec §6). `crate::codex::maybe_enrich`가 채운다.
     pub codex: Option<CodexExtras>,
+    /// Claude rate-limit 5시간 윈도우 사용률 %(`rate_limits.five_hour.used_percentage`).
+    /// 표시 직전 [`clamp_rate_percent`]로 정수 양자화한다. 부재/`null`/드리프트 → `None`(세그먼트 생략).
+    /// `parse_claude_input`만 설정한다(I6). lterm/codex 경로는 `None`.
+    pub rate_5h_percent: Option<f64>,
+    /// Claude rate-limit 5시간 윈도우 리셋까지의 사람이 읽는 카운트다운(예 "2h30m").
+    /// main.rs `resolve_claude_rate_limits`가 pre-resolve로 채우며, parse 단계에선 항상 `None`이다.
+    /// 부재/과거/부패한 `resets_at` → `None`(percent만 표시). lterm/codex 경로는 `None`.
+    pub rate_5h_countdown: Option<String>,
+    /// Claude rate-limit 주간(7일) 윈도우 사용률 %(`rate_limits.seven_day.used_percentage`).
+    /// 표시 직전 [`clamp_rate_percent`]로 정수 양자화한다. 부재/`null`/드리프트 → `None`(세그먼트 생략).
+    /// `parse_claude_input`만 설정한다(I6). lterm/codex 경로는 `None`.
+    pub rate_weekly_percent: Option<f64>,
+    /// Claude rate-limit 주간(7일) 윈도우 리셋까지의 사람이 읽는 카운트다운(예 "4d4h").
+    /// main.rs `resolve_claude_rate_limits`가 pre-resolve로 채우며, parse 단계에선 항상 `None`이다.
+    /// 부재/과거/부패한 `resets_at` → `None`(percent만 표시). lterm/codex 경로는 `None`.
+    pub rate_weekly_countdown: Option<String>,
+    /// 5시간 윈도우 `resets_at`(Unix epoch 초) raw 값을 main.rs 리졸버까지 잠시 운반하는 내부 채널.
+    /// main.rs 리졸버 전용 — render는 절대 참조 금지(I7, AC24로 잠금). countdown 변환 후 미사용.
+    #[doc(hidden)]
+    pub internal_rate_5h_resets_at_raw: Option<f64>,
+    /// 주간(7일) 윈도우 `resets_at`(Unix epoch 초) raw 값을 main.rs 리졸버까지 잠시 운반하는 내부 채널.
+    /// main.rs 리졸버 전용 — render는 절대 참조 금지(I7, AC24로 잠금). countdown 변환 후 미사용.
+    #[doc(hidden)]
+    pub internal_rate_weekly_resets_at_raw: Option<f64>,
 }
 
 // CONTRACT: signature is frozen — implement body only, do not change this signature
@@ -88,6 +112,10 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
         None => (None, None),
     };
 
+    // rate_limits의 5h/7d 윈도우에서 percent와 raw resets_at를 추출한다(부재/한쪽만/null 안전).
+    // countdown은 여기서 채우지 않는다 — main.rs resolve_claude_rate_limits가 pre-resolve로 채운다.
+    let rate = ParsedRateLimits::from_raw(raw_input.rate_limits);
+
     ClaudeInput {
         model_display_name,
         context_used_percentage,
@@ -100,7 +128,138 @@ pub fn parse_claude_input(raw: &str) -> ClaudeInput {
         session_label: None,
         // Claude 경로는 Codex enrich 대상이 아니다(비트 동일 보장, spec §6).
         codex: None,
+        rate_5h_percent: rate.five_hour_percent,
+        // countdown은 parse 단계에서 항상 None(main.rs가 pre-resolve로 채움).
+        rate_5h_countdown: None,
+        rate_weekly_percent: rate.seven_day_percent,
+        rate_weekly_countdown: None,
+        internal_rate_5h_resets_at_raw: rate.five_hour_resets_at,
+        internal_rate_weekly_resets_at_raw: rate.seven_day_resets_at,
     }
+}
+
+/// raw `rate_limits`에서 추출한 percent·raw resets_at 묶음(parse → ClaudeInput 운반용).
+///
+/// 5h/7d 윈도우의 `used_percentage`와 `resets_at`(epoch 초)을 부재/한쪽만/`null` 안전하게 담는다.
+/// countdown은 main.rs 리졸버가 pre-resolve하므로 여기엔 없다.
+#[derive(Default)]
+struct ParsedRateLimits {
+    five_hour_percent: Option<f64>,
+    five_hour_resets_at: Option<f64>,
+    seven_day_percent: Option<f64>,
+    seven_day_resets_at: Option<f64>,
+}
+
+impl ParsedRateLimits {
+    /// raw `Option<RawRateLimits>`를 풀어 5h/7d 윈도우 값을 추출한다(부재/한쪽만/`null` 안전).
+    ///
+    /// # 인자
+    /// - `raw`: stdin `rate_limits` 객체. 부재/`null`이면 전부 `None`으로 저하한다.
+    ///
+    /// # 반환
+    /// 존재하는 윈도우의 percent·resets_at만 채운 [`ParsedRateLimits`]. 한쪽만 있으면 그쪽만 채운다.
+    fn from_raw(raw: Option<RawRateLimits>) -> Self {
+        let limits = raw.unwrap_or_default();
+        let (five_hour_percent, five_hour_resets_at) = unpack_rate_window(limits.five_hour);
+        let (seven_day_percent, seven_day_resets_at) = unpack_rate_window(limits.seven_day);
+        Self {
+            five_hour_percent,
+            five_hour_resets_at,
+            seven_day_percent,
+            seven_day_resets_at,
+        }
+    }
+}
+
+/// 단일 rate-limit 윈도우에서 `(used_percentage, resets_at)`를 꺼낸다(부재 안전).
+///
+/// # 인자
+/// - `window`: 5h 또는 7d 윈도우 객체. 부재면 `(None, None)`.
+///
+/// # 반환
+/// `(used_percentage, resets_at)` 쌍. 각 필드는 lenient 역직렬화 결과를 그대로 흘려보낸다.
+fn unpack_rate_window(window: Option<RawRateWindow>) -> (Option<f64>, Option<f64>) {
+    match window {
+        Some(w) => (w.used_percentage, w.resets_at),
+        None => (None, None),
+    }
+}
+
+/// 5시간 윈도우 카운트다운 상한(초). 윈도우 길이 18000s + 시계 여유 600s.
+///
+/// 부패한 `resets_at`(시계 스큐/inf 잔재)이 이 상한을 넘으면 카운트다운을 생략해 "19852d…" 같은
+/// garbage 표시를 막는다(5h 윈도우는 정상적으로 이보다 멀리 리셋될 수 없다).
+pub(crate) const RATE_5H_MAX_REMAINING_SECS: i64 = 18_000 + 600;
+
+/// 주간(7일) 윈도우 카운트다운 상한(초). 윈도우 길이 604800s + 시계 여유 3600s.
+pub(crate) const RATE_WEEKLY_MAX_REMAINING_SECS: i64 = 604_800 + 3_600;
+
+/// `resets_at`(Unix epoch 초)과 현재 `now_ms`(epoch 밀리초)로 리셋까지 잔여초를 도출한다(순수, 부패 방어).
+///
+/// # 인자
+/// - `resets_at`: 윈도우 리셋 절대시각(epoch 초). NaN/inf면 신뢰 불가.
+/// - `now_ms`: 현재 시각(epoch 밀리초). `0`이면 시계 이상(`now_millis`의 pre-epoch 저하)으로 본다.
+/// - `max_secs`: 윈도우별 잔여 상한([`RATE_5H_MAX_REMAINING_SECS`]/[`RATE_WEEKLY_MAX_REMAINING_SECS`]).
+///
+/// # 반환
+/// 신뢰 가능한 양수 잔여초 `Some(secs)`. 비유한/시계이상/과거/상한초과면 `None`(카운트다운 생략).
+///
+/// # 주의
+/// 클라이언트 wall-clock과 서버 발행 `resets_at`은 독립적이라 카운트다운 정확도는 시스템 시계
+/// 정확도(NTP 동기)에 묶인다. 큰 스큐/부패는 여기서 `None`으로 저하해 거짓 표시를 막는다.
+pub(crate) fn compute_remaining_secs(resets_at: f64, now_ms: u128, max_secs: i64) -> Option<i64> {
+    if !resets_at.is_finite() || now_ms == 0 {
+        return None;
+    }
+    // f64→i64 캐스팅은 saturating(범위 밖이면 포화). 비유한은 위에서 이미 제거됨.
+    // checked_sub: 거대 음수 resets_at(예 -1e300 → i64::MIN)에서 빼기 오버플로가 나도 패닉 대신
+    // None으로 저하한다(debug 패닉/release wrapping 분기 제거 — 부패는 항상 카운트다운 생략).
+    let remaining = (resets_at as i64).checked_sub((now_ms / 1000) as i64)?;
+    if remaining <= 0 || remaining > max_secs {
+        return None;
+    }
+    Some(remaining)
+}
+
+/// 잔여초를 사람이 읽는 카운트다운 문자열로 포맷한다(순수). `<1m`/`{m}m`/`{h}h{m}m`/`{d}d{h}h`.
+///
+/// # 인자
+/// - `remaining_secs`: [`compute_remaining_secs`]가 검증한 양수 잔여초.
+///
+/// # 반환
+/// `0<r<60`→`"<1m"`, `60≤r<1일`→`"{h}h{m}m"`(h=0이면 `"{m}m"`), `r≥1일`→`"{d}d{h}h"`(분 생략).
+/// `r≤0`이면 `None`(방어 중복, 무해).
+pub(crate) fn format_reset_countdown(remaining_secs: i64) -> Option<String> {
+    if remaining_secs <= 0 {
+        return None;
+    }
+    if remaining_secs < 60 {
+        return Some("<1m".to_string());
+    }
+    if remaining_secs >= 86_400 {
+        let (days, hours) = (remaining_secs / 86_400, (remaining_secs % 86_400) / 3_600);
+        return Some(format!("{days}d{hours}h"));
+    }
+    let (hours, mins) = (remaining_secs / 3_600, (remaining_secs % 3_600) / 60);
+    Some(if hours == 0 {
+        format!("{mins}m")
+    } else {
+        format!("{hours}h{mins}m")
+    })
+}
+
+/// rate-limit percent를 0..=100 정수로 클램프·양자화한다([`clamp_ctx_percent`] 미러, 정수 표시).
+///
+/// # 인자
+/// - `percent`: 상류(서버) `used_percentage`. NaN/inf/음수/100 초과 가능.
+///
+/// # 반환
+/// 비유한/0 이하면 `0`, 그 외 `round().min(100)`. `"NaN%"`/`"-3%"`/`"151%"` 렌더를 차단한다.
+pub(crate) fn clamp_rate_percent(percent: f64) -> u32 {
+    if !percent.is_finite() || percent <= 0.0 {
+        return 0;
+    }
+    percent.round().min(100.0) as u32
 }
 
 /// `context_window`의 토큰 정보로 컨텍스트 사용률% fallback을 계산한다(순수, 부재 안전).
@@ -305,6 +464,13 @@ pub fn parse_lterm_input(raw: &str) -> ClaudeInput {
         session_label,
         // codex enrich는 호출부(main.rs)에서 Source::Lterm·Codex 한정으로 별도 수행한다(초기 None).
         codex: None,
+        // Claude rate-limit은 Claude 경로 전용 — lterm 경로는 전부 None(비트 동일 보장, I4).
+        rate_5h_percent: None,
+        rate_5h_countdown: None,
+        rate_weekly_percent: None,
+        rate_weekly_countdown: None,
+        internal_rate_5h_resets_at_raw: None,
+        internal_rate_weekly_resets_at_raw: None,
     }
 }
 
@@ -551,6 +717,57 @@ struct RawClaudeInput {
     cost: Option<RawCost>,
     #[serde(default)]
     context_window: Option<RawContextWindow>,
+    // Pro/Max 한정으로 첫 API 응답 후에만 등장하는 5h/주간 쿼터. 부재/`null`/타입 드리프트에 안전(lenient).
+    #[serde(default, deserialize_with = "deserialize_lenient_rate_limits")]
+    rate_limits: Option<RawRateLimits>,
+}
+
+/// `rate_limits` 중첩 객체(`five_hour`/`seven_day` 윈도우). Pro/Max 한정·첫 API 응답 후만 등장.
+///
+/// 부재/`null`/한쪽만 존재 모두 안전하다. 각 윈도우는 lenient 역직렬화라 비객체(숫자 등) 드리프트가
+/// 와도 해당 윈도우만 `None`으로 흡수하고 전체 파싱을 깨지 않는다(AC3/I4).
+#[derive(Debug, Deserialize, Default)]
+struct RawRateLimits {
+    #[serde(default, deserialize_with = "deserialize_lenient_rate_window")]
+    five_hour: Option<RawRateWindow>,
+    #[serde(default, deserialize_with = "deserialize_lenient_rate_window")]
+    seven_day: Option<RawRateWindow>,
+}
+
+/// 단일 rate-limit 윈도우. `used_percentage`(0–100)와 `resets_at`(Unix epoch 초).
+///
+/// 두 수치 모두 [`deserialize_lenient_f64`]라, 문자열/객체/bool 등 타입 드리프트가 와도 해당 필드만
+/// `None`으로 흡수하고 전체 파싱을 깨지 않는다.
+#[derive(Debug, Deserialize, Default)]
+struct RawRateWindow {
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    used_percentage: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_lenient_f64")]
+    resets_at: Option<f64>,
+}
+
+/// `rate_limits` 객체가 통째로 다른 타입(숫자 등)으로 와도 전체 파싱을 깨지 않게 흡수하는 lenient
+/// 역직렬화기. 객체면 [`RawRateLimits`]로 best-effort 변환하고, 아니면 `None`
+/// ([`deserialize_lenient_current_usage`]와 같은 정신).
+fn deserialize_lenient_rate_limits<'de, D>(
+    deserializer: D,
+) -> Result<Option<RawRateLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// 단일 rate-limit 윈도우가 비객체(숫자 등)로 와도 해당 윈도우만 `None`으로 흡수하는 lenient 역직렬화기.
+fn deserialize_lenient_rate_window<'de, D>(
+    deserializer: D,
+) -> Result<Option<RawRateWindow>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// `model` 중첩 객체.
@@ -2218,5 +2435,172 @@ mod tests {
             Some("external-branch"),
             "심볼릭 .git이 walk-up 트리 밖 외부 repo를 가리켜도 추종 → external-branch. 표준 git 동작(git-consistent)이라 FP 아닌 정탐"
         );
+    }
+
+    // ===== rate_limits: 순수 함수 직접 단위테스트 (AC18/AC19/AC20) =====
+
+    /// AC18: compute_remaining_secs — 비유한/시계이상/과거/상한초과 → None, 정상 → Some.
+    #[test]
+    fn compute_remaining_secs_defends_corrupt_inputs() {
+        let now_ms: u128 = 1_000_000_000_000; // epoch ms → now_secs = 1_000_000_000
+        let now_secs = 1_000_000_000_i64;
+        // 정상: 5h 9000초 남음(상한 18600 이내).
+        assert_eq!(
+            compute_remaining_secs((now_secs + 9000) as f64, now_ms, RATE_5H_MAX_REMAINING_SECS),
+            Some(9000)
+        );
+        // 정상: 7d 360000초 남음(상한 608400 이내).
+        assert_eq!(
+            compute_remaining_secs(
+                (now_secs + 360_000) as f64,
+                now_ms,
+                RATE_WEEKLY_MAX_REMAINING_SECS
+            ),
+            Some(360_000)
+        );
+        // 상한초과: 5h 20000초(>18600) → None.
+        assert_eq!(
+            compute_remaining_secs(
+                (now_secs + 20_000) as f64,
+                now_ms,
+                RATE_5H_MAX_REMAINING_SECS
+            ),
+            None
+        );
+        // 상한초과: 7d 700000초(>608400) → None.
+        assert_eq!(
+            compute_remaining_secs(
+                (now_secs + 700_000) as f64,
+                now_ms,
+                RATE_WEEKLY_MAX_REMAINING_SECS
+            ),
+            None
+        );
+        // 스큐(과거): remaining ≤ 0 → None.
+        assert_eq!(
+            compute_remaining_secs((now_secs - 100) as f64, now_ms, RATE_5H_MAX_REMAINING_SECS),
+            None
+        );
+        // 비유한: NaN/inf → None.
+        assert_eq!(
+            compute_remaining_secs(f64::NAN, now_ms, RATE_5H_MAX_REMAINING_SECS),
+            None
+        );
+        assert_eq!(
+            compute_remaining_secs(f64::INFINITY, now_ms, RATE_5H_MAX_REMAINING_SECS),
+            None
+        );
+        // 거대 음수(부패): -1e300 → as i64 = i64::MIN → 빼기 오버플로를 checked_sub가 None으로 저하(패닉 금지).
+        assert_eq!(
+            compute_remaining_secs(-1e300, now_ms, RATE_5H_MAX_REMAINING_SECS),
+            None
+        );
+        // 시계이상: now_ms == 0(pre-epoch 저하) → None.
+        assert_eq!(
+            compute_remaining_secs((now_secs + 9000) as f64, 0, RATE_5H_MAX_REMAINING_SECS),
+            None
+        );
+    }
+
+    /// AC19: format_reset_countdown — 경계/포맷 명세.
+    #[test]
+    fn format_reset_countdown_boundaries() {
+        assert_eq!(format_reset_countdown(9000).as_deref(), Some("2h30m"));
+        assert_eq!(format_reset_countdown(0), None);
+        assert_eq!(format_reset_countdown(-5), None);
+        assert_eq!(format_reset_countdown(360_000).as_deref(), Some("4d4h"));
+        assert_eq!(format_reset_countdown(30).as_deref(), Some("<1m"));
+        assert_eq!(format_reset_countdown(60).as_deref(), Some("1m"));
+        assert_eq!(format_reset_countdown(86_400).as_deref(), Some("1d0h"));
+        assert_eq!(format_reset_countdown(3600).as_deref(), Some("1h0m"));
+    }
+
+    /// AC20: clamp_rate_percent — 비유한/음수/100초과 방어 + 반올림.
+    #[test]
+    fn clamp_rate_percent_guards() {
+        assert_eq!(clamp_rate_percent(f64::NAN), 0);
+        assert_eq!(clamp_rate_percent(f64::INFINITY), 0);
+        assert_eq!(clamp_rate_percent(-3.0), 0);
+        assert_eq!(clamp_rate_percent(0.0), 0);
+        assert_eq!(clamp_rate_percent(23.4), 23);
+        assert_eq!(clamp_rate_percent(23.6), 24);
+        assert_eq!(clamp_rate_percent(100.0), 100);
+        assert_eq!(clamp_rate_percent(151.0), 100);
+        assert_eq!(clamp_rate_percent(99.9), 100);
+    }
+
+    // ===== rate_limits: 파싱 (AC1–AC4, AC_I6) =====
+
+    /// AC1: rate_limits 전체 present → percent 2 + internal raw resets 2 채움, countdown은 parse 단계 None.
+    #[test]
+    fn parse_rate_limits_full_present() {
+        let raw = r#"{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1700000000},"seven_day":{"used_percentage":41.2,"resets_at":1700500000}}}"#;
+        let input = parse_claude_input(raw);
+        assert_eq!(input.rate_5h_percent, Some(23.5));
+        assert_eq!(input.internal_rate_5h_resets_at_raw, Some(1_700_000_000.0));
+        assert_eq!(input.rate_weekly_percent, Some(41.2));
+        assert_eq!(
+            input.internal_rate_weekly_resets_at_raw,
+            Some(1_700_500_000.0)
+        );
+        // countdown은 main.rs 리졸버가 채우므로 parse 단계에선 None.
+        assert_eq!(input.rate_5h_countdown, None);
+        assert_eq!(input.rate_weekly_countdown, None);
+    }
+
+    /// AC2: rate_limits 부재/null/한쪽만 → 해당 필드만 채움, 나머지 None.
+    #[test]
+    fn parse_rate_limits_absent_null_partial() {
+        // 부재.
+        let none = parse_claude_input(r#"{"model":{"display_name":"Opus"}}"#);
+        assert_eq!(none.rate_5h_percent, None);
+        assert_eq!(none.rate_weekly_percent, None);
+        // null.
+        let null = parse_claude_input(r#"{"rate_limits":null}"#);
+        assert_eq!(null.rate_5h_percent, None);
+        assert_eq!(null.internal_rate_weekly_resets_at_raw, None);
+        // five_hour만.
+        let only5 = parse_claude_input(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1}}}"#,
+        );
+        assert_eq!(only5.rate_5h_percent, Some(10.0));
+        assert_eq!(only5.rate_weekly_percent, None);
+        // seven_day만.
+        let only7 = parse_claude_input(
+            r#"{"rate_limits":{"seven_day":{"used_percentage":70,"resets_at":2}}}"#,
+        );
+        assert_eq!(only7.rate_weekly_percent, Some(70.0));
+        assert_eq!(only7.rate_5h_percent, None);
+    }
+
+    /// AC3: 타입 드리프트(string·숫자) → 해당 필드만 None, 전체 파싱은 성공(타 세그먼트 보존).
+    #[test]
+    fn parse_rate_limits_type_drift_isolated() {
+        // used_percentage/resets_at가 string → 해당 필드 None, 전체 파싱 OK.
+        let drift = parse_claude_input(
+            r#"{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":{"used_percentage":"bad","resets_at":"x"}}}"#,
+        );
+        assert_eq!(drift.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(drift.rate_5h_percent, None);
+        assert_eq!(drift.internal_rate_5h_resets_at_raw, None);
+        // five_hour가 객체가 아니라 숫자 → 5h None, seven_day와 model은 보존(전체 파싱 OK).
+        let nonobj = parse_claude_input(
+            r#"{"model":{"display_name":"Opus"},"rate_limits":{"five_hour":5,"seven_day":{"used_percentage":40,"resets_at":3}}}"#,
+        );
+        assert_eq!(nonobj.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(nonobj.rate_5h_percent, None);
+        assert_eq!(nonobj.rate_weekly_percent, Some(40.0));
+    }
+
+    /// AC4/AC_I6: parse_lterm_input(lterm/codex 경로)은 신규 6필드 모두 None(비트 동일, rate_*는 parse_claude_input만 설정).
+    #[test]
+    fn parse_lterm_rate_limits_all_none() {
+        let input = parse_lterm_input(r#"{"source":"lterm","agent":"codex","cwd":"/tmp/x"}"#);
+        assert_eq!(input.rate_5h_percent, None);
+        assert_eq!(input.rate_5h_countdown, None);
+        assert_eq!(input.rate_weekly_percent, None);
+        assert_eq!(input.rate_weekly_countdown, None);
+        assert_eq!(input.internal_rate_5h_resets_at_raw, None);
+        assert_eq!(input.internal_rate_weekly_resets_at_raw, None);
     }
 }

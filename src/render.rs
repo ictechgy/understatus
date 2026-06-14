@@ -320,6 +320,20 @@ fn collect_segments(
         }
     }
 
+    // Claude rate-limit(5h/7d 쿼터 % + 리셋 카운트다운). --source claude 전용(rate_*는 parse_claude_input만
+    // 설정). 시간 산술은 main.rs resolve_claude_rate_limits가 pre-resolve했으므로 여기선 포맷만(Option C).
+    // 라벨/값 무색(codex 5h/wk 레이아웃 대칭). 5h=49/7d=47(ctx=50 직하), countdown 부재면 percent만.
+    if cfg.display.show_rate_limit {
+        if let Some(percent) = input.rate_5h_percent {
+            let cd = input.rate_5h_countdown.as_deref();
+            segments.push(rate_limit_segment("5h", percent, cd, 49, cfg, color_on));
+        }
+        if let Some(percent) = input.rate_weekly_percent {
+            let cd = input.rate_weekly_countdown.as_deref();
+            segments.push(rate_limit_segment("7d", percent, cd, 47, cfg, color_on));
+        }
+    }
+
     // cwd/git 브랜치: git_branch 우선. git 마커 ⎇ dim + 브랜치명 값 색 없음.
     if cfg.display.show_git {
         if let Some(branch) = input.git_branch.as_deref() {
@@ -397,6 +411,55 @@ fn label_value_segment(
     Segment {
         plain: format!("{label} {value}"),
         colored: format!("{} {value}", dim_label(label, cfg, color_on)),
+        priority,
+        pill: None,
+    }
+}
+
+/// rate-limit 합본 세그먼트("5h 23% ↻2h30m")를 만든다. 라벨 dim, 값은 무색(기본) 또는 임계 시 경고색.
+///
+/// percent는 [`crate::claude::clamp_rate_percent`]로 정수 양자화하고, pre-resolved `countdown`이 있으면
+/// `↻`로 잇는다(시간 산술 없음 — Option C). `rate_limit_warn_threshold`가 설정되고 percent가 그 이상이면
+/// 값에 테마 critical 틴트를 입힌다(임계 인지, opt-in M2). 기본(None)은 codex 5h/wk와 동일하게 무색.
+fn rate_limit_segment(
+    label: &str,
+    percent: f64,
+    countdown: Option<&str>,
+    priority: u8,
+    cfg: &Config,
+    color_on: bool,
+) -> Segment {
+    let pct = crate::claude::clamp_rate_percent(percent);
+    let value = match countdown {
+        Some(cd) => format!("{pct}% ↻{cd}"),
+        None => format!("{pct}%"),
+    };
+    if !cfg
+        .display
+        .rate_limit_warn_threshold
+        .is_some_and(|t| pct >= t)
+    {
+        return label_value_segment(label, &value, priority, cfg, color_on);
+    }
+    warn_colored_segment(label, &value, priority, cfg, color_on)
+}
+
+/// 임계 초과 rate-limit 세그먼트: 라벨 dim + 값에 테마 critical 틴트(COLOR-ONCE 예외, opt-in).
+fn warn_colored_segment(
+    label: &str,
+    value: &str,
+    priority: u8,
+    cfg: &Config,
+    color_on: bool,
+) -> Segment {
+    let warn_color = band_tint(band_index(100.0, cfg), cfg);
+    Segment {
+        plain: format!("{label} {value}"),
+        colored: format!(
+            "{} {}",
+            dim_label(label, cfg, color_on),
+            tinted(value, warn_color, cfg, color_on)
+        ),
         priority,
         pill: None,
     }
@@ -830,6 +893,8 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             session_label: None,
             codex: None,
+            // rate-limit 신규 필드는 기본 None(이 fixture는 rate-limit 미검증 — 전용 테스트가 별도).
+            ..Default::default()
         }
     }
 
@@ -1562,5 +1627,135 @@ mod tests {
         let mut keys: Vec<&str> = out.pills.iter().map(|p| p.key.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["cpu", "mem"], "pill 없는 세그먼트는 제외");
+    }
+
+    // ===== rate_limits 세그먼트 렌더 (AC7–AC11, AC21, AC22, AC24) =====
+
+    /// rate-limit 전용 plain 렌더 헬퍼(mode=none, pulse off).
+    fn render_rate_plain(input: &ClaudeInput) -> String {
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        render(input, &sample_snap(10.0), &cfg, 1_000, false)
+    }
+
+    /// AC7: percent + countdown → "5h NN% ↻XhYm" 합본.
+    #[test]
+    fn rate_limit_renders_percent_and_countdown() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(23.0);
+        input.rate_5h_countdown = Some("2h30m".to_string());
+        input.rate_weekly_percent = Some(41.0);
+        input.rate_weekly_countdown = Some("4d4h".to_string());
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 23% ↻2h30m"), "{line:?}");
+        assert!(line.contains("7d 41% ↻4d4h"), "{line:?}");
+    }
+
+    /// AC8: countdown 부재(과거/부패) → percent만, ↻ 없음.
+    #[test]
+    fn rate_limit_omits_countdown_when_absent() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(23.0);
+        input.rate_5h_countdown = None;
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 23%"), "{line:?}");
+        assert!(!line.contains('↻'), "countdown 부재면 ↻ 없음: {line:?}");
+    }
+
+    /// AC9: percent 부재 → 세그먼트 전체 생략.
+    #[test]
+    fn rate_limit_segment_omitted_when_percent_absent() {
+        let input = sample_input(); // rate_5h_percent = None
+        let line = render_rate_plain(&input);
+        assert!(
+            !line.contains("5h "),
+            "percent 부재면 5h 세그먼트 없음: {line:?}"
+        );
+    }
+
+    /// AC10: show_rate_limit=false → 5h/7d 둘 다 생략.
+    #[test]
+    fn rate_limit_toggle_off_omits_both() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(23.0);
+        input.rate_weekly_percent = Some(41.0);
+        let mut cfg = Config::default();
+        cfg.color.mode = "none".to_string();
+        cfg.display.show_rate_limit = false;
+        let line = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
+        assert!(!line.contains("5h "), "{line:?}");
+        assert!(!line.contains("7d "), "{line:?}");
+    }
+
+    /// AC11: lterm/codex 경로(codex=Some, rate_*=None) → 신규 블록 미발화, 기존 codex 5h/wk 유지.
+    #[test]
+    fn rate_limit_codex_path_unaffected() {
+        let mut input = sample_input();
+        input.codex = Some(crate::codex::CodexExtras {
+            rate_5h_percent: Some(30.0),
+            rate_weekly_percent: Some(55.0),
+            plan: None,
+            effort: None,
+        });
+        // Claude rate 필드는 None(codex 경로).
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 30%"), "codex 5h 유지: {line:?}");
+        assert!(line.contains("wk 55%"), "codex wk 유지: {line:?}");
+        assert!(
+            !line.contains('↻'),
+            "codex 경로엔 카운트다운 없음: {line:?}"
+        );
+    }
+
+    /// AC22: clamp — 상류 percent가 151여도 0..=100으로 표시.
+    #[test]
+    fn rate_limit_clamps_percent() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(151.0);
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 100%"), "151→100 클램프: {line:?}");
+    }
+
+    /// AC24 (I7 잠금): internal raw resets가 있어도 countdown=None이면 render는 raw를 읽지 않아 ↻ 없음.
+    #[test]
+    fn rate_limit_render_ignores_internal_raw_resets() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(23.0);
+        // 먼 미래 raw resets가 있어도(=main.rs 리졸버 미경유 상태) render는 이를 무시한다(I7).
+        input.internal_rate_5h_resets_at_raw = Some(9_999_999_999.0);
+        input.rate_5h_countdown = None;
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 23%"), "{line:?}");
+        assert!(
+            !line.contains('↻'),
+            "render는 internal raw를 읽지 않음(I7): {line:?}"
+        );
+        assert!(!line.contains("999"), "raw epoch가 새지 않음: {line:?}");
+    }
+
+    /// AC21: warn threshold — pct≥t이면 값에 경고색(ESC↑), 미만이면 무색.
+    #[test]
+    fn rate_limit_warn_threshold_colors_value() {
+        let mut input = sample_input();
+        input.rate_5h_countdown = None;
+        let mut cfg = Config::default();
+        cfg.color.mode = "truecolor".to_string();
+        cfg.display.rate_limit_warn_threshold = Some(80);
+        // 임계 초과(92) → 값 경고색.
+        input.rate_5h_percent = Some(92.0);
+        let high = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
+        // 임계 미만(50) → 값 무색.
+        input.rate_5h_percent = Some(50.0);
+        let low = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
+        assert!(
+            high.matches('\x1b').count() > low.matches('\x1b').count(),
+            "임계 초과만 값 색칠: high={high:?} low={low:?}"
+        );
+        assert!(high.contains("92%") && low.contains("50%"));
+        // warn off(기본 None)면 92%여도 무색(low와 동일 ESC 수준).
+        cfg.display.rate_limit_warn_threshold = None;
+        input.rate_5h_percent = Some(92.0);
+        let off = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
+        assert!(off.matches('\x1b').count() < high.matches('\x1b').count());
     }
 }
