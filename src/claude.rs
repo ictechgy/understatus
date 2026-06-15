@@ -2500,6 +2500,23 @@ mod tests {
             compute_remaining_secs((now_secs + 9000) as f64, 0, RATE_5H_MAX_REMAINING_SECS),
             None
         );
+        // 상한 경계: 정확히 max_secs → 허용(`>`라 inclusive), max_secs+1 → None.
+        assert_eq!(
+            compute_remaining_secs(
+                (now_secs + RATE_5H_MAX_REMAINING_SECS) as f64,
+                now_ms,
+                RATE_5H_MAX_REMAINING_SECS
+            ),
+            Some(RATE_5H_MAX_REMAINING_SECS)
+        );
+        assert_eq!(
+            compute_remaining_secs(
+                (now_secs + RATE_5H_MAX_REMAINING_SECS + 1) as f64,
+                now_ms,
+                RATE_5H_MAX_REMAINING_SECS
+            ),
+            None
+        );
     }
 
     /// AC19: format_reset_countdown — 경계/포맷 명세.
@@ -2513,6 +2530,8 @@ mod tests {
         assert_eq!(format_reset_countdown(60).as_deref(), Some("1m"));
         assert_eq!(format_reset_countdown(86_400).as_deref(), Some("1d0h"));
         assert_eq!(format_reset_countdown(3600).as_deref(), Some("1h0m"));
+        // sub-day 최대 경계(86399=23h59m59s)와 일 단위 전환을 명시 잠금(휴먼 카운트다운 최빈 오류 지점).
+        assert_eq!(format_reset_countdown(86_399).as_deref(), Some("23h59m"));
     }
 
     /// AC20: clamp_rate_percent — 비유한/음수/100초과 방어 + 반올림.

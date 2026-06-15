@@ -1733,9 +1733,15 @@ mod tests {
         assert!(!line.contains("999"), "raw epoch가 새지 않음: {line:?}");
     }
 
-    /// AC21: warn threshold — pct≥t이면 값에 경고색(ESC↑), 미만이면 무색.
+    /// AC21: warn threshold — pct≥t이면 값에 경고색(ESC↑), 미만이면 무색, 경계(pct==t)는 inclusive 발화.
     #[test]
     fn rate_limit_warn_threshold_colors_value() {
+        // truecolor ESC 수를 세므로 process-global NO_COLOR과 격리한다(env 변경 테스트와의 병렬 경합 방지).
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: ENV_LOCK으로 직렬화된 단일 스레드 구간에서만 env를 만진다.
+        unsafe { std::env::remove_var("NO_COLOR") };
         let mut input = sample_input();
         input.rate_5h_countdown = None;
         let mut cfg = Config::default();
@@ -1752,10 +1758,26 @@ mod tests {
             "임계 초과만 값 색칠: high={high:?} low={low:?}"
         );
         assert!(high.contains("92%") && low.contains("50%"));
+        // 경계(pct==t=80) → inclusive(`>=`)로 발화. low(50)보다 ESC 많아야 한다.
+        input.rate_5h_percent = Some(80.0);
+        let at = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
+        assert!(
+            at.matches('\x1b').count() > low.matches('\x1b').count(),
+            "경계 pct==t는 inclusive 발화: at={at:?}"
+        );
         // warn off(기본 None)면 92%여도 무색(low와 동일 ESC 수준).
         cfg.display.rate_limit_warn_threshold = None;
         input.rate_5h_percent = Some(92.0);
         let off = render(&input, &sample_snap(10.0), &cfg, 1_000, false);
         assert!(off.matches('\x1b').count() < high.matches('\x1b').count());
+    }
+
+    /// AC9 보강: percent 존재하나 0%인 윈도우(fresh 쿼터)도 세그먼트를 낸다(presence 게이트, value 게이트 아님).
+    #[test]
+    fn rate_limit_zero_percent_still_renders() {
+        let mut input = sample_input();
+        input.rate_5h_percent = Some(0.0);
+        let line = render_rate_plain(&input);
+        assert!(line.contains("5h 0%"), "0%도 세그먼트 표시: {line:?}");
     }
 }
