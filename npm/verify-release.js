@@ -4,11 +4,13 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..');
 const SUPPORTED_TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin'];
 const CHECKSUMS_PATH = path.join(__dirname, 'checksums.json');
+const TAR = '/usr/bin/tar';
 
 function fail(message) {
   console.error('[understatus release verify] ' + message);
@@ -101,6 +103,63 @@ function requireFile(filePath, label) {
   }
 }
 
+function removeDirQuietly(dirPath) {
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  } catch (_) {
+    // best-effort cleanup
+  }
+}
+
+function verifyTarballLayout(filePath) {
+  const listResult = spawnSync(TAR, ['-tzf', filePath], {
+    encoding: 'utf8',
+  });
+  if (listResult.error) {
+    fail(`tar list failed to start for ${filePath}: ${listResult.error.message}`);
+  }
+  if (listResult.status !== 0) {
+    fail(`tar list failed for ${filePath} (${listResult.status}): ${listResult.stderr}`);
+  }
+
+  const entries = listResult.stdout
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.length !== 1 || entries[0] !== 'understatus') {
+    fail(
+      `tarball layout must contain exactly understatus: ${filePath} has ` +
+        (entries.length ? entries.join(', ') : '(no entries)')
+    );
+  }
+
+  const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-verify-release-'));
+  try {
+    const extractResult = spawnSync(TAR, ['-xzf', filePath, '-C', extractDir, 'understatus'], {
+      encoding: 'utf8',
+    });
+    if (extractResult.error) {
+      fail(`tar extract failed to start for ${filePath}: ${extractResult.error.message}`);
+    }
+    if (extractResult.status !== 0) {
+      fail(`tar extract failed for ${filePath} (${extractResult.status}): ${extractResult.stderr}`);
+    }
+
+    const extractedPath = path.join(extractDir, 'understatus');
+    let stat;
+    try {
+      stat = fs.lstatSync(extractedPath);
+    } catch (err) {
+      fail(`tarball did not extract understatus from ${filePath}: ${err.message}`);
+    }
+    if (!stat.isFile()) {
+      fail(`tarball understatus entry is not a regular file: ${filePath}`);
+    }
+  } finally {
+    removeDirQuietly(extractDir);
+  }
+}
+
 function readSidecarChecksum(filePath, expectedTarballName) {
   requireFile(filePath, 'expected release checksum sidecar');
   const line = fs.readFileSync(filePath, 'utf8').trim();
@@ -117,7 +176,7 @@ function readSidecarChecksum(filePath, expectedTarballName) {
 }
 
 function verifyPacklist() {
-  const result = spawnSync('npm', ['pack', '--dry-run', '--json'], {
+  const result = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
     cwd: __dirname,
     encoding: 'utf8',
   });
@@ -193,6 +252,14 @@ if (installMatch[1] !== expected) {
 const targetsToCheck = options.target ? [options.target] : SUPPORTED_TARGETS;
 let checksums = readJson(CHECKSUMS_PATH);
 
+if (options.tarballDir) {
+  for (const target of targetsToCheck) {
+    const artifactPath = tarballPath(expected, target, options.tarballDir);
+    requireFile(artifactPath, 'expected release artifact');
+    verifyTarballLayout(artifactPath);
+  }
+}
+
 if (options.verifySidecars) {
   for (const target of targetsToCheck) {
     const artifactName = tarballName(expected, target);
@@ -258,7 +325,7 @@ if (releaseChecksums || options.requireChecksums || options.writeChecksums) {
   checked.push('manifest');
 }
 if (options.tarballDir) {
-  checked.push('release artifacts');
+  checked.push('release artifacts', 'tarball layout');
 }
 if (options.verifySidecars) {
   checked.push('sha256 sidecars');

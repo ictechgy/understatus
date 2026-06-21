@@ -36,5 +36,8 @@ jobs:
         with:
           node-version: '22.x'
 
+      - name: Upgrade npm for packlist parity
+        run: npm install -g npm@11.5.1
+
       - name: npm test
         run: npm test --prefix npm

@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 'use strict';
 
-process.env.UNDERSTATUS_INSTALL_TEST = '1';
-
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');

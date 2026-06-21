@@ -8,6 +8,8 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+const TAR = '/usr/bin/tar';
+
 const repoRoot = path.resolve(__dirname, '..');
 const version = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
 const targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin'];
@@ -21,6 +23,23 @@ function sha256(filePath) {
   const hash = crypto.createHash('sha256');
   hash.update(fs.readFileSync(filePath));
   return hash.digest('hex');
+}
+
+function runTar(args) {
+  const result = spawnSync(TAR, args, { encoding: 'utf8' });
+  assert.strictEqual(result.status, 0, result.stderr || result.error && result.error.message);
+}
+
+function writeTarball(filePath, entries) {
+  const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-asset-build-'));
+  try {
+    for (const [name, content] of entries) {
+      fs.writeFileSync(path.join(buildDir, name), content);
+    }
+    runTar(['-czf', filePath, '-C', buildDir, ...entries.map(([name]) => name)]);
+  } finally {
+    fs.rmSync(buildDir, { recursive: true, force: true });
+  }
 }
 
 function runVerify(fixtureRoot, args) {
@@ -53,7 +72,7 @@ function makeAssets(fixtureRoot) {
   for (const target of targets) {
     const name = `understatus-${version}-${target}.tar.gz`;
     const filePath = path.join(assetDir, name);
-    fs.writeFileSync(filePath, `artifact:${target}\n`);
+    writeTarball(filePath, [['understatus', `artifact:${target}\n`]]);
     fs.writeFileSync(path.join(assetDir, `${name}.sha256`), `${sha256(filePath)}  ${name}\n`);
   }
   return assetDir;
@@ -107,13 +126,29 @@ try {
   assert.match(result.stderr, /sidecar mismatch/);
 
   makeAssets(fixtureRoot);
+  const changedTarball = path.join(assetDir, `understatus-${version}-x86_64-apple-darwin.tar.gz`);
+  writeTarball(changedTarball, [['understatus', 'tampered but installable\n']]);
   fs.writeFileSync(
-    path.join(assetDir, `understatus-${version}-x86_64-apple-darwin.tar.gz`),
-    'tampered\n'
+    `${changedTarball}.sha256`,
+    `${sha256(changedTarball)}  understatus-${version}-x86_64-apple-darwin.tar.gz\n`
   );
   result = runVerify(fixtureRoot, ['--tarball-dir', assetDir, '--require-checksums']);
   assert.notStrictEqual(result.status, 0, 'tarball/checksum mismatch should fail');
   assert.match(result.stderr, /checksum mismatch/);
+
+  makeAssets(fixtureRoot);
+  const malformedTarball = path.join(assetDir, `understatus-${version}-aarch64-apple-darwin.tar.gz`);
+  writeTarball(malformedTarball, [
+    ['understatus', 'ok\n'],
+    ['extra', 'not allowed\n'],
+  ]);
+  fs.writeFileSync(
+    `${malformedTarball}.sha256`,
+    `${sha256(malformedTarball)}  understatus-${version}-aarch64-apple-darwin.tar.gz\n`
+  );
+  result = runVerify(fixtureRoot, ['--tarball-dir', assetDir, '--verify-sidecars', '--write-checksums']);
+  assert.notStrictEqual(result.status, 0, 'malformed tarball layout should fail');
+  assert.match(result.stderr, /tarball layout must contain exactly understatus/);
 
   const pkgPath = path.join(fixtureRoot, 'npm', 'package.json');
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));

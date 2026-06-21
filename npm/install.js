@@ -23,17 +23,6 @@ const os = require('os');
 // release/publish guard가 Cargo.toml, npm/package.json, 이 값, git tag를 lockstep으로
 // 검증합니다. 새 네이티브 릴리스를 낼 때 네 버전을 함께 올리세요.
 const VERSION = '0.7.0';
-const INSTALL_TEST = process.env.UNDERSTATUS_INSTALL_TEST === '1';
-
-// 플랫폼 확인: macOS 전용 패키지
-if (!INSTALL_TEST && process.platform !== 'darwin') {
-  process.stdout.write(
-    '[understatus] macOS 전용 패키지입니다. 현재 플랫폼(' +
-      process.platform +
-      ')에서는 설치를 건너뜁니다.\n'
-  );
-  process.exit(0);
-}
 
 // CPU 아키텍처를 Rust 타겟 트리플로 매핑
 const archMap = {
@@ -41,20 +30,9 @@ const archMap = {
   x64: 'x86_64-apple-darwin',
 };
 
-const target = archMap[process.arch];
-if (!INSTALL_TEST && !target) {
-  process.stderr.write(
-    '[understatus] 지원하지 않는 아키텍처입니다: ' + process.arch + '\n' +
-    '[understatus] 지원 아키텍처: arm64 (Apple Silicon), x64 (Intel)\n'
-  );
-  process.exit(1);
-}
-
 // 다운로드 URL 구성
 const RELEASE_BASE =
   'https://github.com/ictechgy/understatus/releases/download/v' + VERSION + '/';
-const TARBALL_NAME = 'understatus-' + VERSION + '-' + target + '.tar.gz';
-const TARBALL_URL = RELEASE_BASE + TARBALL_NAME;
 
 // bin 디렉터리 경로
 const BIN_DIR = path.join(__dirname, 'bin');
@@ -238,6 +216,28 @@ function computeSha256(filePath) {
  * 순서: 고정 checksum 조회 → tarball 다운로드 → 체크섬 검증 → 안전 압축 해제 → chmod
  */
 async function main() {
+  // 플랫폼 확인: macOS 전용 패키지
+  if (process.platform !== 'darwin') {
+    process.stdout.write(
+      '[understatus] macOS 전용 패키지입니다. 현재 플랫폼(' +
+        process.platform +
+        ')에서는 설치를 건너뜁니다.\n'
+    );
+    return;
+  }
+
+  const target = archMap[process.arch];
+  if (!target) {
+    process.stderr.write(
+      '[understatus] 지원하지 않는 아키텍처입니다: ' + process.arch + '\n' +
+      '[understatus] 지원 아키텍처: arm64 (Apple Silicon), x64 (Intel)\n'
+    );
+    process.exit(1);
+  }
+
+  const tarballName = 'understatus-' + VERSION + '-' + target + '.tar.gz';
+  const tarballUrl = RELEASE_BASE + tarballName;
+
   // bin 디렉터리가 없으면 생성
   if (!fs.existsSync(BIN_DIR)) {
     fs.mkdirSync(BIN_DIR, { recursive: true });
@@ -255,12 +255,12 @@ async function main() {
   }
 
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-download-'));
-  const tarballPath = path.join(downloadDir, TARBALL_NAME);
+  const tarballPath = path.join(downloadDir, tarballName);
 
   // 2단계: tarball 다운로드
-  process.stdout.write('[understatus] 바이너리 다운로드 중: ' + TARBALL_URL + '\n');
+  process.stdout.write('[understatus] 바이너리 다운로드 중: ' + tarballUrl + '\n');
   try {
-    await download(TARBALL_URL, tarballPath);
+    await download(tarballUrl, tarballPath);
   } catch (err) {
     removeDirQuietly(downloadDir);
     process.stderr.write(
@@ -324,7 +324,7 @@ async function main() {
   );
 }
 
-if (INSTALL_TEST) {
+if (require.main !== module) {
   module.exports = {
     computeSha256,
     download,
