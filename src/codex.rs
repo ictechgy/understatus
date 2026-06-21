@@ -109,11 +109,20 @@ struct CandidateScan {
     fingerprint: CodexScanFingerprint,
     /// `MAX_CODEX_SCAN_ENTRIES`를 초과해 전체 후보 유일성을 증명할 수 없는 상태.
     budget_exceeded: bool,
+    /// read_dir/metadata 실패로 scan view가 완전하지 않은 상태.
+    scan_incomplete: bool,
 }
 
 struct RecentDayDirs {
     dirs: Vec<PathBuf>,
     budget_exceeded: bool,
+    scan_incomplete: bool,
+}
+
+struct BoundedSubdirs {
+    dirs: Vec<PathBuf>,
+    budget_exceeded: bool,
+    scan_incomplete: bool,
 }
 
 /// 캐시된 단일 후보가 여전히 "유일한 후보"인지 재검증하기 위한 경량 일자 지문.
@@ -508,18 +517,20 @@ fn scan_codex_candidates(
     freshness: u64,
     scan_days: usize,
 ) -> CandidateScan {
-    let (rollout_paths, fingerprint, budget_exceeded) = collect_rollout_scan(base, scan_days, true);
+    let (rollout_paths, fingerprint, budget_exceeded, scan_incomplete) =
+        collect_rollout_scan(base, scan_days, true);
     let freshness_secs = freshness.saturating_mul(60);
     let normalized_target_cwd = normalize_cwd_for_match(cwd);
     let mut candidates = Vec::new();
     let mut stale_same_cwd_rollouts = Vec::new();
 
-    if budget_exceeded {
+    if budget_exceeded || scan_incomplete {
         return CandidateScan {
             candidates,
             stale_same_cwd_rollouts,
             fingerprint,
             budget_exceeded,
+            scan_incomplete,
         };
     }
 
@@ -549,6 +560,7 @@ fn scan_codex_candidates(
         stale_same_cwd_rollouts,
         fingerprint,
         budget_exceeded,
+        scan_incomplete,
     }
 }
 
@@ -556,7 +568,7 @@ fn scan_codex_candidates(
 fn current_scan_fingerprint(base: &Path, scan_days: usize) -> Option<CodexScanFingerprint> {
     let sessions_dir = base.join("sessions");
     let recent = recent_day_dirs(&sessions_dir, scan_days);
-    if recent.budget_exceeded {
+    if recent.budget_exceeded || recent.scan_incomplete {
         return None;
     }
     let days = recent
@@ -575,31 +587,40 @@ fn collect_rollout_scan(
     base: &Path,
     scan_days: usize,
     collect_paths: bool,
-) -> (Vec<PathBuf>, CodexScanFingerprint, bool) {
+) -> (Vec<PathBuf>, CodexScanFingerprint, bool, bool) {
     let sessions_dir = base.join("sessions");
     let recent = recent_day_dirs(&sessions_dir, scan_days);
     let mut rollout_paths = Vec::new();
     let mut days = Vec::new();
     let mut entries_seen = 0usize;
     let mut budget_exceeded = recent.budget_exceeded;
+    let mut scan_incomplete = recent.scan_incomplete;
 
     for day_dir in recent.dirs {
         let day = CodexDayFingerprint {
             path: day_dir.to_string_lossy().into_owned(),
             mtime_ms: file_mtime_ms(&day_dir),
         };
-        if budget_exceeded {
+        if budget_exceeded || scan_incomplete {
             days.push(day);
             break;
         }
         let entries = match std::fs::read_dir(&day_dir) {
             Ok(entries) => entries,
             Err(_) => {
+                scan_incomplete = true;
                 days.push(day);
-                continue;
+                break;
             }
         };
-        for entry in entries.flatten() {
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(_) => {
+                    scan_incomplete = true;
+                    break;
+                }
+            };
             if entries_seen >= MAX_CODEX_SCAN_ENTRIES {
                 budget_exceeded = true;
                 break;
@@ -615,7 +636,7 @@ fn collect_rollout_scan(
             }
         }
         days.push(day);
-        if budget_exceeded {
+        if budget_exceeded || scan_incomplete {
             break;
         }
     }
@@ -624,6 +645,7 @@ fn collect_rollout_scan(
         rollout_paths,
         CodexScanFingerprint { days },
         budget_exceeded,
+        scan_incomplete,
     )
 }
 
@@ -637,35 +659,43 @@ fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> RecentDayDirs {
         return RecentDayDirs {
             dirs: result,
             budget_exceeded: false,
+            scan_incomplete: false,
         };
     }
     // 연도 디렉터리 내림차순.
-    let Some(year_dirs) = sorted_subdirs_desc_bounded(sessions_dir) else {
+    let year_dirs = sorted_subdirs_desc_bounded(sessions_dir);
+    if year_dirs.budget_exceeded || year_dirs.scan_incomplete {
         return RecentDayDirs {
             dirs: result,
-            budget_exceeded: true,
+            budget_exceeded: year_dirs.budget_exceeded,
+            scan_incomplete: year_dirs.scan_incomplete,
         };
-    };
-    for year_dir in year_dirs {
-        let Some(month_dirs) = sorted_subdirs_desc_bounded(&year_dir) else {
+    }
+    for year_dir in year_dirs.dirs {
+        let month_dirs = sorted_subdirs_desc_bounded(&year_dir);
+        if month_dirs.budget_exceeded || month_dirs.scan_incomplete {
             return RecentDayDirs {
                 dirs: result,
-                budget_exceeded: true,
+                budget_exceeded: month_dirs.budget_exceeded,
+                scan_incomplete: month_dirs.scan_incomplete,
             };
-        };
-        for month_dir in month_dirs {
-            let Some(day_dirs) = sorted_subdirs_desc_bounded(&month_dir) else {
+        }
+        for month_dir in month_dirs.dirs {
+            let day_dirs = sorted_subdirs_desc_bounded(&month_dir);
+            if day_dirs.budget_exceeded || day_dirs.scan_incomplete {
                 return RecentDayDirs {
                     dirs: result,
-                    budget_exceeded: true,
+                    budget_exceeded: day_dirs.budget_exceeded,
+                    scan_incomplete: day_dirs.scan_incomplete,
                 };
-            };
-            for day_dir in day_dirs {
+            }
+            for day_dir in day_dirs.dirs {
                 result.push(day_dir);
                 if result.len() >= scan_days {
                     return RecentDayDirs {
                         dirs: result,
                         budget_exceeded: false,
+                        scan_incomplete: false,
                     };
                 }
             }
@@ -674,32 +704,66 @@ fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> RecentDayDirs {
     RecentDayDirs {
         dirs: result,
         budget_exceeded: false,
+        scan_incomplete: false,
     }
 }
 
 /// 디렉터리의 하위 디렉터리를 이름 내림차순으로 반환한다(`2026` > `2025`, `06` > `05`).
 ///
 /// 이름이 zero-padded 날짜(`06`/`05`/`30`)라 문자열 desc 정렬이 곧 시간 desc와 일치한다.
-fn sorted_subdirs_desc_bounded(dir: &Path) -> Option<Vec<PathBuf>> {
+fn sorted_subdirs_desc_bounded(dir: &Path) -> BoundedSubdirs {
     let mut subdirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => {
             let mut subdirs = Vec::new();
-            for (entries_seen, entry) in entries.flatten().enumerate() {
+            for (entries_seen, entry_result) in entries.enumerate() {
                 if entries_seen >= MAX_CODEX_DATE_DIR_ENTRIES {
-                    return None;
+                    return BoundedSubdirs {
+                        dirs: Vec::new(),
+                        budget_exceeded: true,
+                        scan_incomplete: false,
+                    };
                 }
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        return BoundedSubdirs {
+                            dirs: Vec::new(),
+                            budget_exceeded: false,
+                            scan_incomplete: true,
+                        };
+                    }
+                };
                 let path = entry.path();
-                if path.is_dir() {
-                    subdirs.push(path);
+                match path.metadata() {
+                    Ok(meta) if meta.is_dir() => subdirs.push(path),
+                    Ok(_) => {}
+                    Err(_) => {
+                        return BoundedSubdirs {
+                            dirs: Vec::new(),
+                            budget_exceeded: false,
+                            scan_incomplete: true,
+                        };
+                    }
                 }
             }
             subdirs
         }
-        Err(_) => return Some(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => {
+            return BoundedSubdirs {
+                dirs: Vec::new(),
+                budget_exceeded: false,
+                scan_incomplete: true,
+            };
+        }
     };
     // 이름 내림차순(최신 우선). file_name 기준으로 비교한다.
     subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    Some(subdirs)
+    BoundedSubdirs {
+        dirs: subdirs,
+        budget_exceeded: false,
+        scan_incomplete: false,
+    }
 }
 
 /// 경로가 `rollout-*.jsonl` 형식인지 판정한다.
@@ -780,7 +844,7 @@ fn read_codex_session(
 
 /// 완료된 후보 스캔을 단일/모호/없음 해소 결과로 변환한다.
 fn resolution_from_scan(scan: &CandidateScan) -> Resolution {
-    if scan.budget_exceeded {
+    if scan.budget_exceeded || scan.scan_incomplete {
         return Resolution::Ambiguous;
     }
     match scan.candidates.len() {
@@ -1626,6 +1690,29 @@ mod tests {
             read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
             Resolution::Ambiguous,
             "date discovery 부분 스캔도 fail-safe로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// date discovery에서 `read_dir`가 실패하면 부분 view를 신뢰하지 않고 fail-safe로 저하한다.
+    #[test]
+    fn date_discovery_read_error_fails_safe() {
+        let base = unique_tmp("date-read-error");
+        let cwd = "/Users/me/projDateReadError";
+        let sessions_path = base.join("sessions");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&sessions_path, b"not a directory").unwrap();
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "date discovery read_dir 실패는 scan_incomplete로 기록되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "부분/불완전 스캔은 후보 없음으로 오판하지 않고 fail-safe"
         );
 
         let _ = std::fs::remove_dir_all(&base);
