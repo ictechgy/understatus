@@ -97,6 +97,9 @@ pub enum Resolution {
 struct CandidateScan {
     /// cwd/originator/freshness 선필터를 통과한 후보.
     candidates: Vec<PathBuf>,
+    /// 현재는 stale이라 후보에서 제외됐지만 cwd/originator가 같은 rollout. 나중에 fresh가
+    /// 되면 기존 단일 캐시를 재사용하면 안 되므로 cache hit에서 감시한다.
+    stale_same_cwd_rollouts: Vec<WatchedRollout>,
     /// 최근 일자 디렉터리 mtime 지문.
     fingerprint: CodexScanFingerprint,
     /// `MAX_CODEX_SCAN_ENTRIES`를 초과해 전체 후보 유일성을 증명할 수 없는 상태.
@@ -107,7 +110,8 @@ struct CandidateScan {
 ///
 /// 캐시 히트마다 rollout 파일들을 다시 순회하지는 않고, 최근 일자 디렉터리 mtime만 확인해
 /// 새 rollout 생성/삭제를 감지한다. 지문이 바뀌면 캐시를 바로 재사용하지 않고 후보 스캔으로
-/// 모호성을 다시 판정한다.
+/// 모호성을 다시 판정한다. 기존 stale 동일-cwd rollout이 fresh로 바뀌는 경우는 별도 watch-list로
+/// 감지한다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CodexScanFingerprint {
     days: Vec<CodexDayFingerprint>,
@@ -117,6 +121,11 @@ struct CodexScanFingerprint {
 struct CodexDayFingerprint {
     path: String,
     mtime_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WatchedRollout {
+    path: String,
 }
 
 /// session_meta(첫 줄)에서 추출한 매칭 근거.
@@ -493,21 +502,22 @@ fn scan_codex_candidates(
     let freshness_secs = freshness.saturating_mul(60);
     let normalized_target_cwd = normalize_cwd_for_match(cwd);
     let mut candidates = Vec::new();
+    let mut stale_same_cwd_rollouts = Vec::new();
 
     if budget_exceeded {
         return CandidateScan {
             candidates,
+            stale_same_cwd_rollouts,
             fingerprint,
             budget_exceeded,
         };
     }
 
     for path in rollout_paths {
-        // (2) cheap stat 선필터: mtime이 freshness 이내인 후보만.
-        if !is_fresh(&path, now, freshness_secs) {
-            continue;
-        }
+        let fresh = is_fresh(&path, now, freshness_secs);
         // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
+        // stale 동일-cwd 파일도 기록해 둔다. 기존 파일 append는 day-dir mtime을 바꾸지 않을 수 있어,
+        // 나중에 fresh가 됐을 때 캐시 히트가 새 모호성을 놓치지 않도록 하기 위함이다.
         if let Some(meta) = read_first_line_meta(&path) {
             let cwd_ok = meta
                 .cwd
@@ -515,13 +525,18 @@ fn scan_codex_candidates(
                 .map(|c| cwd_matches_normalized(c, &normalized_target_cwd))
                 .unwrap_or(false);
             let originator_ok = is_interactive_originator(meta.originator.as_deref());
-            if cwd_ok && originator_ok {
+            if fresh && cwd_ok && originator_ok {
                 candidates.push(path);
+            } else if !fresh && cwd_ok && originator_ok {
+                stale_same_cwd_rollouts.push(WatchedRollout {
+                    path: path.to_string_lossy().into_owned(),
+                });
             }
         }
     }
     CandidateScan {
         candidates,
+        stale_same_cwd_rollouts,
         fingerprint,
         budget_exceeded,
     }
@@ -747,6 +762,9 @@ struct CodexCacheEntry {
     /// 단일 후보를 확정했던 시점의 최근 rollout 트리 지문.
     #[serde(default)]
     scan_fingerprint: Option<CodexScanFingerprint>,
+    /// 캐시 생성 시 동일 cwd/originator였지만 stale이라 제외된 rollout들.
+    #[serde(default)]
+    stale_same_cwd_rollouts: Vec<WatchedRollout>,
     /// 캐시된 파싱 결과.
     session: CodexSession,
 }
@@ -789,6 +807,25 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
     elapsed_secs <= freshness_secs as u128
 }
 
+/// 캐시 생성 시 stale이라 제외됐던 동일 cwd rollout들이 여전히 stale인지 확인한다.
+///
+/// 기존 stale 파일이 append 등으로 fresh가 되면 parent day directory mtime은 바뀌지 않을 수 있다.
+/// 그 경우 캐시된 단일 후보를 그대로 쓰면 새 모호성을 놓치므로, 감시 대상 중 하나라도 fresh가
+/// 되면 캐시를 무시하고 풀 재해소로 떨어진다. stat 실패/삭제는 스캔해도 fresh 후보가 아니므로
+/// 보수적으로 "아직 재사용 가능"으로 취급한다.
+fn watched_rollouts_still_stale(
+    watched: &[WatchedRollout],
+    now: SystemTime,
+    freshness_secs: u64,
+) -> bool {
+    watched.iter().all(|rollout| {
+        let path = PathBuf::from(&rollout.path);
+        file_mtime_ms(&path)
+            .map(|mtime| !is_mtime_fresh(mtime, now, freshness_secs))
+            .unwrap_or(true)
+    })
+}
+
 /// 세션 데이터를 디스크 캐시에서 조회/갱신해 [`CodexSession`]을 반환한다(spec §8 매 틱 로직).
 ///
 /// 1) 캐시 히트 & rollout 트리 지문 불변 & 경로 mtime 불변 & **파일 mtime freshness 이내**
@@ -803,7 +840,9 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
 ///
 /// **모호성 재검증**: 캐시된 파일 자체가 그대로여도 같은 cwd의 새 rollout이 생기면 이전 단일
 /// 후보 판단은 무효다. 최근 rollout 트리 지문이 바뀌면 캐시를 바로 쓰지 않고 후보 스캔을 다시
-/// 수행해 새 모호성을 fail-safe로 반영한다.
+/// 수행해 새 모호성을 fail-safe로 반영한다. 또한 캐시 생성 당시 stale이었던 동일 cwd rollout이
+/// 이후 fresh가 되면 day-dir mtime이 유지될 수 있으므로, 해당 watch-list를 stat해 fresh 전환을
+/// 감지하고 재스캔한다.
 ///
 /// # 반환
 /// 단일 해소 시 `Some(session)`. 모호/없음 시 `None`(무변경 신호).
@@ -835,9 +874,15 @@ fn resolve_with_cache(
                         .as_ref()
                         .map(|cached| cached == &current_fingerprint)
                         .unwrap_or(false);
-                    if !fingerprint_stable {
+                    let watched_still_stale = watched_rollouts_still_stale(
+                        &entry.stale_same_cwd_rollouts,
+                        now,
+                        freshness_secs,
+                    );
+                    if !fingerprint_stable || !watched_still_stale {
                         // cwd는 같지만 최근 일자 디렉터리가 바뀌었다. 새 rollout 후보가 생겼을 수
-                        // 있으므로 캐시를 바로 쓰지 않고 아래 풀 해소로 폴백한다.
+                        // 있거나, 기존 stale 동일-cwd rollout이 fresh가 됐을 수 있으므로 캐시를
+                        // 바로 쓰지 않고 아래 풀 해소로 폴백한다.
                     } else {
                         let cached_path = PathBuf::from(&entry.path);
                         match file_mtime_ms(&cached_path) {
@@ -860,6 +905,9 @@ fn resolve_with_cache(
                                             mtime_ms: current_mtime,
                                             matched_cwd: Some(normalized_cwd_key.clone()),
                                             scan_fingerprint: Some(current_fingerprint.clone()),
+                                            stale_same_cwd_rollouts: entry
+                                                .stale_same_cwd_rollouts
+                                                .clone(),
                                             session: session.clone(),
                                         },
                                         now_ms,
@@ -890,6 +938,7 @@ fn resolve_with_cache(
                         mtime_ms: mtime,
                         matched_cwd: Some(normalized_cwd_key.clone()),
                         scan_fingerprint: Some(scan.fingerprint.clone()),
+                        stale_same_cwd_rollouts: scan.stale_same_cwd_rollouts.clone(),
                         session: session.clone(),
                     },
                     now_ms,
@@ -1925,6 +1974,79 @@ mod tests {
         assert_eq!(
             second, before,
             "새 같은-cwd 후보가 생긴 뒤에는 캐시 재사용 대신 Ambiguous로 안전 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 기존 stale 동일-cwd rollout이 append 등으로 fresh가 되면 day-dir mtime이 그대로여도
+    /// 캐시를 재사용하지 않고 재스캔해 Ambiguous로 안전 저하한다.
+    #[test]
+    fn cache_hit_rechecks_stale_same_cwd_rollout_becoming_fresh() {
+        let base = unique_tmp("cache-stale-watch");
+        let cache_base = unique_tmp("cache-stale-watch-cache");
+        let cwd = "/Users/me/projCacheStaleWatch";
+        let key = "cache-stale-watch-key";
+        let fresh_path = write_rollout(
+            &base,
+            "fresh",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let stale_path = write_rollout(
+            &base,
+            "stale-watch",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+        let day_dir = fresh_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(30);
+        let stale_time = SystemTime::now() - Duration::from_secs(5 * 3600);
+        set_file_mtime(&stale_path, stale_time);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        // 기존 stale 파일만 fresh로 바꾼다. parent day-dir mtime은 원래 지문과 같게 되돌려
+        // day-dir fingerprint만으로는 변화를 볼 수 없는 케이스를 박제한다.
+        set_file_mtime(&stale_path, SystemTime::now() + Duration::from_secs(1));
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "기존 stale 동일-cwd rollout이 fresh가 되면 cached 단일 세션 대신 Ambiguous로 저하"
         );
 
         let _ = std::fs::remove_dir_all(&base);
