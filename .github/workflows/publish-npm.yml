@@ -39,6 +39,9 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
+      - name: Verify release version contract
+        run: node npm/verify-release.js "${TAG#v}"
+
       - name: Setup Node + npm registry
         uses: actions/setup-node@v4
         with:
@@ -47,7 +50,7 @@ jobs:
 
       # Trusted Publishing(OIDC)은 npm CLI >= 11.5.1을 요구한다. Node 22 기본 npm은 10.x라 업그레이드.
       - name: Upgrade npm (OIDC 요구 버전)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       # 릴리스 바이너리(arm64/x64 tarball)가 올라올 때까지 대기(최대 ~10분).
       # release.yml과 같은 태그 push에 동시 트리거되므로, 보통 수십 초 내 충족된다.
