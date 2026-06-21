@@ -915,6 +915,60 @@ mod tests {
     /// env를 변경하는 테스트는 이 락을 잡아 직렬 실행한다.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 프로세스 환경변수의 이전 값을 저장했다가 scope 종료 시 복원하는 테스트용 RAII guard.
+    ///
+    /// 반드시 [`ENV_LOCK`]을 잡은 뒤 생성해야 한다. `Drop`도 락이 살아 있는 동안 실행되도록 테스트에서
+    /// lock guard보다 뒤에 바인딩한다.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: 호출자는 ENV_LOCK을 잡고 있으며, 이 guard가 drop될 때까지 lock guard가 살아 있다.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: 호출자는 ENV_LOCK을 잡고 있으며, 이 guard가 drop될 때까지 lock guard가 살아 있다.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: 테스트는 EnvVarGuard를 ENV_LOCK guard보다 뒤에 바인딩하므로 drop도 lock 내부에서
+            // 실행된다. 이전 값 복원/삭제는 테스트 전역 환경을 원상복구하기 위한 단일 스레드 구간이다.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn env_var_guard_restores_previous_value() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _outer = EnvVarGuard::set("NO_COLOR", "preexisting");
+        {
+            let _inner = EnvVarGuard::remove("NO_COLOR");
+            assert_eq!(std::env::var_os("NO_COLOR"), None);
+        }
+        assert_eq!(
+            std::env::var_os("NO_COLOR"),
+            Some(std::ffi::OsString::from("preexisting"))
+        );
+    }
+
     #[test]
     fn render_no_color_env_has_no_escape_bytes() {
         let _guard = ENV_LOCK
@@ -923,10 +977,8 @@ mod tests {
         // NO_COLOR이 설정되면 truecolor 모드라도 ANSI를 일절 출력하지 않아야 한다.
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
-        // SAFETY: ENV_LOCK으로 직렬화된 단일 스레드 구간에서만 env를 변경한다.
-        unsafe { std::env::set_var("NO_COLOR", "1") };
+        let _env = EnvVarGuard::set("NO_COLOR", "1");
         let line = render(&sample_input(), &sample_snap(95.0), &cfg, 1_000, true);
-        unsafe { std::env::remove_var("NO_COLOR") };
         assert!(
             !line.contains('\x1b'),
             "NO_COLOR 설정 시 ANSI ESC 바이트가 없어야 함: {line:?}"
@@ -953,7 +1005,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         let mut snap = sample_snap(95.0);
@@ -982,7 +1034,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // NO_COLOR이 다른 테스트에서 새지 않도록 보장.
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         let line = render(&sample_input(), &sample_snap(95.0), &cfg, 1_000, true);
@@ -1015,7 +1067,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         // 글리프 틴트는 밴드2(#86a0b4) truecolor 시퀀스로 시작해야 한다.
@@ -1038,7 +1090,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         let line = render(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
@@ -1060,7 +1112,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         let line = render(&sample_input(), &sample_snap(10.0), &cfg, 0, false);
@@ -1076,7 +1128,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         // (cpu%, 기대 글리프, 기대 밴드 틴트 truecolor 프리픽스).
@@ -1104,7 +1156,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut cfg = Config::default();
         cfg.color.mode = "truecolor".to_string();
         // wave=0(phase=0.75, 22500ms) → high 테라코타 #b87848.
@@ -1740,8 +1792,7 @@ mod tests {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: ENV_LOCK으로 직렬화된 단일 스레드 구간에서만 env를 만진다.
-        unsafe { std::env::remove_var("NO_COLOR") };
+        let _env = EnvVarGuard::remove("NO_COLOR");
         let mut input = sample_input();
         input.rate_5h_countdown = None;
         let mut cfg = Config::default();
