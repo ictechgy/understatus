@@ -40,6 +40,11 @@ const TAIL_READ_BYTES: u64 = 256 * 1024;
 /// 저하한다. 그래야 큰 `sessions` 트리에서 statusline hot path가 무한히 파일을 stat/read하지
 /// 않고, 부분 스캔으로 잘못된 단일 세션을 표시하는 fail-wrong도 피한다.
 const MAX_CODEX_SCAN_ENTRIES: usize = 1024;
+/// `sessions/<year>/<month>/<day>` discovery에서 한 디렉터리 레벨마다 검사할 엔트리 상한.
+///
+/// 후보 파일 스캔 예산 전에 year/month/day discovery가 거대한 가짜 트리에 끌려가지 않도록
+/// 별도 상한을 둔다. 초과 시 단일 후보를 확정하지 않고 fail-safe로 저하한다.
+const MAX_CODEX_DATE_DIR_ENTRIES: usize = 512;
 /// 디스크 캐시 파일명(세션별 격리, chain.rs 인프라 재사용, spec §8).
 const CODEX_CACHE_FILE: &str = "codex_session";
 /// 대화형(TUI) originator 화이트리스트 prefix. `codex_exec` 등 비대화형은 제외(spec §5).
@@ -103,6 +108,11 @@ struct CandidateScan {
     /// 최근 일자 디렉터리 mtime 지문.
     fingerprint: CodexScanFingerprint,
     /// `MAX_CODEX_SCAN_ENTRIES`를 초과해 전체 후보 유일성을 증명할 수 없는 상태.
+    budget_exceeded: bool,
+}
+
+struct RecentDayDirs {
+    dirs: Vec<PathBuf>,
     budget_exceeded: bool,
 }
 
@@ -543,16 +553,21 @@ fn scan_codex_candidates(
 }
 
 /// 후보 본문/파일 엔트리를 읽지 않고 최근 일자 디렉터리의 캐시 검증용 지문만 계산한다.
-fn current_scan_fingerprint(base: &Path, scan_days: usize) -> CodexScanFingerprint {
+fn current_scan_fingerprint(base: &Path, scan_days: usize) -> Option<CodexScanFingerprint> {
     let sessions_dir = base.join("sessions");
-    let days = recent_day_dirs(&sessions_dir, scan_days)
+    let recent = recent_day_dirs(&sessions_dir, scan_days);
+    if recent.budget_exceeded {
+        return None;
+    }
+    let days = recent
+        .dirs
         .into_iter()
         .map(|day_dir| CodexDayFingerprint {
             path: day_dir.to_string_lossy().into_owned(),
             mtime_ms: file_mtime_ms(&day_dir),
         })
         .collect();
-    CodexScanFingerprint { days }
+    Some(CodexScanFingerprint { days })
 }
 
 /// 최근 일자 디렉터리의 rollout 파일 경로(선택)와 스캔 지문을 수집한다.
@@ -562,17 +577,21 @@ fn collect_rollout_scan(
     collect_paths: bool,
 ) -> (Vec<PathBuf>, CodexScanFingerprint, bool) {
     let sessions_dir = base.join("sessions");
-    let day_dirs = recent_day_dirs(&sessions_dir, scan_days);
+    let recent = recent_day_dirs(&sessions_dir, scan_days);
     let mut rollout_paths = Vec::new();
     let mut days = Vec::new();
     let mut entries_seen = 0usize;
-    let mut budget_exceeded = false;
+    let mut budget_exceeded = recent.budget_exceeded;
 
-    for day_dir in day_dirs {
+    for day_dir in recent.dirs {
         let day = CodexDayFingerprint {
             path: day_dir.to_string_lossy().into_owned(),
             mtime_ms: file_mtime_ms(&day_dir),
         };
+        if budget_exceeded {
+            days.push(day);
+            break;
+        }
         let entries = match std::fs::read_dir(&day_dir) {
             Ok(entries) => entries,
             Err(_) => {
@@ -612,40 +631,75 @@ fn collect_rollout_scan(
 ///
 /// 연도 desc → 월 desc → 일 desc로 정렬해 최신부터 `scan_days`개만 취한다(전체 풀스캔 회피, spec §5).
 /// 폴더는 세션 시작시각 기준이라 scan_days 밖 장기 활성 세션은 미발견(알려진 한계, spec §10 S1).
-fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> Vec<PathBuf> {
+fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> RecentDayDirs {
     let mut result = Vec::new();
     if scan_days == 0 {
-        return result;
+        return RecentDayDirs {
+            dirs: result,
+            budget_exceeded: false,
+        };
     }
     // 연도 디렉터리 내림차순.
-    for year_dir in sorted_subdirs_desc(sessions_dir) {
-        for month_dir in sorted_subdirs_desc(&year_dir) {
-            for day_dir in sorted_subdirs_desc(&month_dir) {
+    let Some(year_dirs) = sorted_subdirs_desc_bounded(sessions_dir) else {
+        return RecentDayDirs {
+            dirs: result,
+            budget_exceeded: true,
+        };
+    };
+    for year_dir in year_dirs {
+        let Some(month_dirs) = sorted_subdirs_desc_bounded(&year_dir) else {
+            return RecentDayDirs {
+                dirs: result,
+                budget_exceeded: true,
+            };
+        };
+        for month_dir in month_dirs {
+            let Some(day_dirs) = sorted_subdirs_desc_bounded(&month_dir) else {
+                return RecentDayDirs {
+                    dirs: result,
+                    budget_exceeded: true,
+                };
+            };
+            for day_dir in day_dirs {
                 result.push(day_dir);
                 if result.len() >= scan_days {
-                    return result;
+                    return RecentDayDirs {
+                        dirs: result,
+                        budget_exceeded: false,
+                    };
                 }
             }
         }
     }
-    result
+    RecentDayDirs {
+        dirs: result,
+        budget_exceeded: false,
+    }
 }
 
 /// 디렉터리의 하위 디렉터리를 이름 내림차순으로 반환한다(`2026` > `2025`, `06` > `05`).
 ///
 /// 이름이 zero-padded 날짜(`06`/`05`/`30`)라 문자열 desc 정렬이 곧 시간 desc와 일치한다.
-fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
+fn sorted_subdirs_desc_bounded(dir: &Path) -> Option<Vec<PathBuf>> {
     let mut subdirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(_) => return Vec::new(),
+        Ok(entries) => {
+            let mut subdirs = Vec::new();
+            for (entries_seen, entry) in entries.flatten().enumerate() {
+                if entries_seen >= MAX_CODEX_DATE_DIR_ENTRIES {
+                    return None;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    subdirs.push(path);
+                }
+            }
+            subdirs
+        }
+        Err(_) => return Some(Vec::new()),
     };
     // 이름 내림차순(최신 우선). file_name 기준으로 비교한다.
     subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    subdirs
+    Some(subdirs)
 }
 
 /// 경로가 `rollout-*.jsonl` 형식인지 판정한다.
@@ -872,7 +926,8 @@ fn resolve_with_cache(
                     let fingerprint_stable = entry
                         .scan_fingerprint
                         .as_ref()
-                        .map(|cached| cached == &current_fingerprint)
+                        .zip(current_fingerprint.as_ref())
+                        .map(|(cached, current)| cached == current)
                         .unwrap_or(false);
                     let watched_still_stale = watched_rollouts_still_stale(
                         &entry.stale_same_cwd_rollouts,
@@ -904,7 +959,7 @@ fn resolve_with_cache(
                                             path: cached_path.to_string_lossy().into_owned(),
                                             mtime_ms: current_mtime,
                                             matched_cwd: Some(normalized_cwd_key.clone()),
-                                            scan_fingerprint: Some(current_fingerprint.clone()),
+                                            scan_fingerprint: current_fingerprint.clone(),
                                             stale_same_cwd_rollouts: entry
                                                 .stale_same_cwd_rollouts
                                                 .clone(),
@@ -1545,6 +1600,32 @@ mod tests {
         assert_eq!(
             read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
             Resolution::None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// year/month/day discovery 자체도 예산 초과 시 단일 후보를 확정하지 않는다.
+    #[test]
+    fn date_discovery_budget_exceeded_fails_safe() {
+        let base = unique_tmp("date-budget");
+        let cwd = "/Users/me/projDateBudget";
+        let sessions_dir = base.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        for idx in 0..=MAX_CODEX_DATE_DIR_ENTRIES {
+            std::fs::create_dir_all(sessions_dir.join(format!("{idx:04}"))).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "date discovery 엔트리 상한을 넘으면 budget_exceeded가 기록되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "date discovery 부분 스캔도 fail-safe로 저하"
         );
 
         let _ = std::fs::remove_dir_all(&base);
