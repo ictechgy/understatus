@@ -9,6 +9,9 @@ on:
       tag:
         description: 'Tag to build and upload (e.g. v0.7.0)'
         required: true
+      commit:
+        description: 'Full commit SHA that refs/tags/<tag> must point to'
+        required: true
 
 permissions:
   contents: write
@@ -27,6 +30,7 @@ jobs:
           - x86_64-apple-darwin
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      EXPECTED_COMMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.commit || github.sha }}
     steps:
       - name: Checkout (tag)
         uses: actions/checkout@v6
@@ -41,11 +45,20 @@ jobs:
             echo "Invalid release tag: $TAG" >&2
             exit 1
           fi
+          if ! printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Invalid expected commit SHA: $EXPECTED_COMMIT" >&2
+            exit 1
+          fi
           git fetch --force --tags origin "refs/tags/$TAG:refs/tags/$TAG"
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+          tag_commit="$(git rev-parse "refs/tags/$TAG^{commit}" | tr '[:upper:]' '[:lower:]')"
+          expected_commit="$(printf '%s' "$EXPECTED_COMMIT" | tr '[:upper:]' '[:lower:]')"
           if [ "$head_commit" != "$tag_commit" ]; then
             echo "Checked out $head_commit but refs/tags/$TAG points to $tag_commit" >&2
+            exit 1
+          fi
+          if [ "$tag_commit" != "$expected_commit" ]; then
+            echo "refs/tags/$TAG points to $tag_commit but expected $expected_commit" >&2
             exit 1
           fi
 
@@ -74,6 +87,17 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf understatus-${VERSION}-${{ matrix.target }}.tar.gz understatus
           shasum -a 256 understatus-${VERSION}-${{ matrix.target }}.tar.gz > understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256
+          SHA256="$(cut -d ' ' -f 1 "understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256")"
+          COMMIT="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+          cat > understatus-${VERSION}-${{ matrix.target }}.tar.gz.provenance.json <<EOF
+          {
+            "tag": "${TAG}",
+            "commit": "${COMMIT}",
+            "target": "${{ matrix.target }}",
+            "asset": "understatus-${VERSION}-${{ matrix.target }}.tar.gz",
+            "sha256": "${SHA256}"
+          }
+          EOF
 
       - name: Verify generated checksum sidecar
         run: |
@@ -88,4 +112,5 @@ jobs:
           files: |
             target/${{ matrix.target }}/release/understatus-*-${{ matrix.target }}.tar.gz
             target/${{ matrix.target }}/release/understatus-*-${{ matrix.target }}.tar.gz.sha256
+            target/${{ matrix.target }}/release/understatus-*-${{ matrix.target }}.tar.gz.provenance.json
           fail_on_unmatched_files: true

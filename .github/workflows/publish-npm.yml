@@ -22,6 +22,9 @@ on:
       tag:
         description: 'Tag to publish (e.g. v0.7.1)'
         required: true
+      commit:
+        description: 'Full commit SHA that refs/tags/<tag> must point to'
+        required: true
 
 permissions:
   id-token: write   # OIDC 토큰 발급에 필수
@@ -33,6 +36,7 @@ jobs:
     # environment: release   # npm 폼에 Environment name을 넣었다면 주석 해제(동일 값)
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      EXPECTED_COMMIT: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.commit || github.sha }}
     steps:
       - name: Checkout (tag)
         uses: actions/checkout@v6
@@ -47,11 +51,20 @@ jobs:
             echo "Invalid release tag: $TAG" >&2
             exit 1
           fi
+          if ! printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "Invalid expected commit SHA: $EXPECTED_COMMIT" >&2
+            exit 1
+          fi
           git fetch --force --tags origin "refs/tags/$TAG:refs/tags/$TAG"
-          head_commit="$(git rev-parse HEAD)"
-          tag_commit="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+          tag_commit="$(git rev-parse "refs/tags/$TAG^{commit}" | tr '[:upper:]' '[:lower:]')"
+          expected_commit="$(printf '%s' "$EXPECTED_COMMIT" | tr '[:upper:]' '[:lower:]')"
           if [ "$head_commit" != "$tag_commit" ]; then
             echo "Checked out $head_commit but refs/tags/$TAG points to $tag_commit" >&2
+            exit 1
+          fi
+          if [ "$tag_commit" != "$expected_commit" ]; then
+            echo "refs/tags/$TAG points to $tag_commit but expected $expected_commit" >&2
             exit 1
           fi
 
@@ -81,8 +94,10 @@ jobs:
             names="$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)"
             if printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz" \
                && printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz.sha256" \
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz.provenance.json" \
                && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz" \
-               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz.sha256"; then
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz.sha256" \
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz.provenance.json"; then
               echo "릴리스 에셋 확인됨 ($TAG)"
               exit 0
             fi
@@ -111,14 +126,21 @@ jobs:
             gh release download "$TAG" \
               --dir "$ASSET_DIR" \
               --pattern "understatus-${VER}-${target}.tar.gz.sha256"
+            gh release download "$TAG" \
+              --dir "$ASSET_DIR" \
+              --pattern "understatus-${VER}-${target}.tar.gz.provenance.json"
           done
           node npm/verify-release.js "$VER" \
             --tarball-dir "$ASSET_DIR" \
             --verify-sidecars \
+            --verify-provenance \
+            --expected-commit "$EXPECTED_COMMIT" \
             --write-checksums \
             --verify-packlist
           node npm/verify-release.js "$VER" \
             --tarball-dir "$ASSET_DIR" \
+            --verify-provenance \
+            --expected-commit "$EXPECTED_COMMIT" \
             --require-checksums \
             --verify-packlist
 

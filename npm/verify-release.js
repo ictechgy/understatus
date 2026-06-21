@@ -21,7 +21,8 @@ function usage() {
   fail(
     'usage: node npm/verify-release.js <semver-without-v> ' +
       '[--target <rust-target>] [--tarball-dir <directory>] ' +
-      '[--require-checksums] [--write-checksums] [--verify-sidecars] [--verify-packlist]'
+      '[--require-checksums] [--write-checksums] [--verify-sidecars] [--verify-provenance] ' +
+      '[--expected-commit <sha>] [--verify-packlist]'
   );
 }
 
@@ -34,6 +35,8 @@ function parseArgs(argv) {
     requireChecksums: false,
     writeChecksums: false,
     verifySidecars: false,
+    verifyProvenance: false,
+    expectedCommit: null,
     verifyPacklist: false,
   };
 
@@ -57,6 +60,14 @@ function parseArgs(argv) {
       options.writeChecksums = true;
     } else if (arg === '--verify-sidecars') {
       options.verifySidecars = true;
+    } else if (arg === '--verify-provenance') {
+      options.verifyProvenance = true;
+    } else if (arg === '--expected-commit') {
+      if (!argv[i + 1] || argv[i + 1].startsWith('--')) {
+        usage();
+      }
+      options.expectedCommit = argv[i + 1];
+      i += 1;
     } else if (arg === '--verify-packlist') {
       options.verifyPacklist = true;
     } else {
@@ -95,6 +106,10 @@ function tarballPath(version, target, tarballDir) {
 
 function sidecarPath(version, target, tarballDir) {
   return path.join(tarballDir, `${tarballName(version, target)}.sha256`);
+}
+
+function provenancePath(version, target, tarballDir) {
+  return path.join(tarballDir, `${tarballName(version, target)}.provenance.json`);
 }
 
 function requireFile(filePath, label) {
@@ -175,6 +190,41 @@ function readSidecarChecksum(filePath, expectedTarballName) {
   return match[1];
 }
 
+
+function verifyProvenance(version, target, tarballDir, expectedCommit) {
+  const artifactName = tarballName(version, target);
+  const artifactPath = tarballPath(version, target, tarballDir);
+  const expectedTag = `v${version}`;
+  const normalizedExpectedCommit = expectedCommit.toLowerCase();
+  const provenanceFile = provenancePath(version, target, tarballDir);
+  requireFile(provenanceFile, 'expected release provenance');
+  const provenance = readJson(provenanceFile);
+
+  if (provenance.tag !== expectedTag) {
+    fail(`provenance tag mismatch for ${artifactName}: ${provenance.tag} != ${expectedTag}`);
+  }
+  if ((provenance.commit || '').toLowerCase() !== normalizedExpectedCommit) {
+    fail(
+      `provenance commit mismatch for ${artifactName}: ` +
+        `${provenance.commit || '(missing)'} != ${normalizedExpectedCommit}`
+    );
+  }
+  if (provenance.target !== target) {
+    fail(`provenance target mismatch for ${artifactName}: ${provenance.target} != ${target}`);
+  }
+  if (provenance.asset !== artifactName) {
+    fail(`provenance asset mismatch for ${artifactName}: ${provenance.asset} != ${artifactName}`);
+  }
+
+  const actualChecksum = computeSha256(artifactPath);
+  if (provenance.sha256 !== actualChecksum) {
+    fail(
+      `provenance sha256 mismatch for ${artifactName}: ` +
+        `${provenance.sha256 || '(missing)'} != ${actualChecksum}`
+    );
+  }
+}
+
 function verifyPacklist() {
   const result = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
     cwd: __dirname,
@@ -212,8 +262,14 @@ if (options.target && !SUPPORTED_TARGETS.includes(options.target)) {
   fail(`unsupported target ${options.target}; expected one of ${SUPPORTED_TARGETS.join(', ')}`);
 }
 
-if ((options.writeChecksums || options.verifySidecars) && !options.tarballDir) {
-  fail('--write-checksums and --verify-sidecars require --tarball-dir');
+if ((options.writeChecksums || options.verifySidecars || options.verifyProvenance) && !options.tarballDir) {
+  fail('--write-checksums, --verify-sidecars, and --verify-provenance require --tarball-dir');
+}
+if (options.expectedCommit && !/^[0-9a-fA-F]{40}$/.test(options.expectedCommit)) {
+  fail('--expected-commit must be a full 40-character hex commit SHA');
+}
+if (options.verifyProvenance && !options.expectedCommit) {
+  fail('--verify-provenance requires --expected-commit');
 }
 if (options.writeChecksums && options.requireChecksums) {
   fail('--write-checksums generates a package manifest; run --require-checksums in a separate verify step');
@@ -257,6 +313,12 @@ if (options.tarballDir) {
     const artifactPath = tarballPath(expected, target, options.tarballDir);
     requireFile(artifactPath, 'expected release artifact');
     verifyTarballLayout(artifactPath);
+  }
+}
+
+if (options.verifyProvenance) {
+  for (const target of targetsToCheck) {
+    verifyProvenance(expected, target, options.tarballDir, options.expectedCommit);
   }
 }
 
@@ -329,6 +391,9 @@ if (options.tarballDir) {
 }
 if (options.verifySidecars) {
   checked.push('sha256 sidecars');
+}
+if (options.verifyProvenance) {
+  checked.push('provenance');
 }
 if (options.verifyPacklist) {
   checked.push('npm packlist');

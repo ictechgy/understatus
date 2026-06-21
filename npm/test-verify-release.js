@@ -13,6 +13,7 @@ const TAR = '/usr/bin/tar';
 const repoRoot = path.resolve(__dirname, '..');
 const version = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
 const targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin'];
+const expectedCommit = '0123456789abcdef0123456789abcdef01234567';
 
 function copyFile(src, dest) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -73,7 +74,18 @@ function makeAssets(fixtureRoot) {
     const name = `understatus-${version}-${target}.tar.gz`;
     const filePath = path.join(assetDir, name);
     writeTarball(filePath, [['understatus', `artifact:${target}\n`]]);
-    fs.writeFileSync(path.join(assetDir, `${name}.sha256`), `${sha256(filePath)}  ${name}\n`);
+    const checksum = sha256(filePath);
+    fs.writeFileSync(path.join(assetDir, `${name}.sha256`), `${checksum}  ${name}\n`);
+    fs.writeFileSync(
+      path.join(assetDir, `${name}.provenance.json`),
+      JSON.stringify({
+        tag: `v${version}`,
+        commit: expectedCommit,
+        target,
+        asset: name,
+        sha256: checksum,
+      }, null, 2) + '\n'
+    );
   }
   return assetDir;
 }
@@ -86,6 +98,9 @@ try {
     '--tarball-dir',
     assetDir,
     '--verify-sidecars',
+    '--verify-provenance',
+    '--expected-commit',
+    expectedCommit,
     '--write-checksums',
     '--verify-packlist',
   ]);
@@ -94,8 +109,11 @@ try {
   let result2 = runVerify(fixtureRoot, [
     '--tarball-dir',
     assetDir,
+    '--verify-provenance',
+    '--expected-commit',
+    expectedCommit,
     '--require-checksums',
-    '--verify-packlist',
+    '--verify-packlist'
   ]);
   assert.strictEqual(result2.status, 0, result2.stderr || result2.stdout);
 
@@ -115,6 +133,24 @@ try {
       sha256(path.join(assetDir, `understatus-${version}-${target}.tar.gz`))
     );
   }
+
+  makeAssets(fixtureRoot);
+  const badProvenance = path.join(
+    assetDir,
+    `understatus-${version}-aarch64-apple-darwin.tar.gz.provenance.json`
+  );
+  const badProvenancePayload = JSON.parse(fs.readFileSync(badProvenance, 'utf8'));
+  badProvenancePayload.commit = 'f'.repeat(40);
+  fs.writeFileSync(badProvenance, JSON.stringify(badProvenancePayload, null, 2) + '\n');
+  result = runVerify(fixtureRoot, [
+    '--tarball-dir',
+    assetDir,
+    '--verify-provenance',
+    '--expected-commit',
+    expectedCommit,
+  ]);
+  assert.notStrictEqual(result.status, 0, 'provenance commit mismatch should fail');
+  assert.match(result.stderr, /provenance commit mismatch/);
 
   const corruptedSidecar = path.join(
     assetDir,
