@@ -1038,38 +1038,43 @@ fn resolve_with_cache(
                         // 바로 쓰지 않고 아래 풀 해소로 폴백한다.
                     } else {
                         let cached_path = PathBuf::from(&entry.path);
-                        match file_mtime_ms(&cached_path) {
-                            // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
-                            // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
-                            Some(current_mtime)
-                                if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
-                            // (1) 트리 지문/경로 mtime 불변 & fresh → 재사용(후보 본문 재독해 없음).
-                            Some(current_mtime) if current_mtime == entry.mtime_ms => {
-                                return Some(entry.session);
-                            }
-                            // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
-                            Some(current_mtime) => {
-                                if let Some(session) = extract_from_file(&cached_path) {
-                                    write_cache_entry(
-                                        cache_base,
-                                        session_key,
-                                        CodexCacheEntry {
-                                            path: cached_path.to_string_lossy().into_owned(),
-                                            mtime_ms: current_mtime,
-                                            matched_cwd: Some(normalized_cwd_key.clone()),
-                                            scan_fingerprint: current_fingerprint.clone(),
-                                            stale_same_cwd_rollouts: entry
-                                                .stale_same_cwd_rollouts
-                                                .clone(),
-                                            session: session.clone(),
-                                        },
-                                        now_ms,
-                                    );
-                                    return Some(session);
+                        if !matches!(is_rollout_file(&cached_path), Ok(true)) {
+                            // 캐시 경로가 더 이상 regular rollout 파일이 아니면 mtime이 같아도
+                            // cached session을 신뢰하지 않는다. 아래 풀 스캔으로 폴백한다.
+                        } else {
+                            match file_mtime_ms(&cached_path) {
+                                // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
+                                // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
+                                Some(current_mtime)
+                                    if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
+                                // (1) 트리 지문/경로 mtime 불변 & fresh → 재사용(후보 본문 재독해 없음).
+                                Some(current_mtime) if current_mtime == entry.mtime_ms => {
+                                    return Some(entry.session);
                                 }
+                                // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
+                                Some(current_mtime) => {
+                                    if let Some(session) = extract_from_file(&cached_path) {
+                                        write_cache_entry(
+                                            cache_base,
+                                            session_key,
+                                            CodexCacheEntry {
+                                                path: cached_path.to_string_lossy().into_owned(),
+                                                mtime_ms: current_mtime,
+                                                matched_cwd: Some(normalized_cwd_key.clone()),
+                                                scan_fingerprint: current_fingerprint.clone(),
+                                                stale_same_cwd_rollouts: entry
+                                                    .stale_same_cwd_rollouts
+                                                    .clone(),
+                                                session: session.clone(),
+                                            },
+                                            now_ms,
+                                        );
+                                        return Some(session);
+                                    }
+                                }
+                                // 경로 소실 → 풀 재해소로 폴백.
+                                None => {}
                             }
-                            // 경로 소실 → 풀 재해소로 폴백.
-                            None => {}
                         }
                     }
                 }
@@ -2612,6 +2617,69 @@ mod tests {
         assert_eq!(
             second, before,
             "day-dir mtime 불확실성은 cached 단일 세션 재사용 대신 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시된 rollout 경로가 더 이상 regular 파일이 아니면 동일 mtime이어도 재사용하지 않는다.
+    #[test]
+    fn cache_hit_rejects_cached_path_file_type_change() {
+        let base = unique_tmp("cache-file-type");
+        let cache_base = unique_tmp("cache-file-type-cache");
+        let cwd = "/Users/me/projCacheFileType";
+        let key = "cache-file-type-key";
+        let rollout_path = write_rollout(
+            &base,
+            "filetype",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+        let stable_rollout_mtime = SystemTime::now() - Duration::from_secs(30);
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(20);
+        set_file_mtime(&rollout_path, stable_rollout_mtime);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        std::fs::remove_file(&rollout_path).unwrap();
+        std::fs::create_dir(&rollout_path).unwrap();
+        set_file_mtime(&rollout_path, stable_rollout_mtime);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "cached path가 directory로 바뀌면 mtime이 같아도 cached Codex session을 재사용하면 안 됨"
         );
 
         let _ = std::fs::remove_dir_all(&base);
