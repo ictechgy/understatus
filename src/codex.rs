@@ -579,17 +579,12 @@ fn scan_codex_candidates(
 
 /// 후보 본문/파일 엔트리를 읽지 않고 최근 일자 디렉터리의 캐시 검증용 지문만 계산한다.
 fn current_scan_fingerprint(base: &Path, scan_days: usize) -> Option<CodexScanFingerprint> {
-    let sessions_dir = base.join("sessions");
-    let recent = recent_day_dirs(&sessions_dir, scan_days);
-    if recent.budget_exceeded || recent.scan_incomplete {
+    let (_rollout_paths, fingerprint, budget_exceeded, scan_incomplete) =
+        collect_rollout_scan(base, scan_days, false);
+    if budget_exceeded || scan_incomplete {
         return None;
     }
-    let mut days = Vec::new();
-    for day_dir in recent.dirs {
-        let day = codex_day_fingerprint_checked(&day_dir).ok()?;
-        days.push(day);
-    }
-    Some(CodexScanFingerprint { days })
+    Some(fingerprint)
 }
 
 /// 최근 일자 디렉터리의 rollout 파일 경로(선택)와 스캔 지문을 수집한다.
@@ -2680,6 +2675,72 @@ mod tests {
         assert_eq!(
             second, before,
             "cached path가 directory로 바뀌면 mtime이 같아도 cached Codex session을 재사용하면 안 됨"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시 히트에서도 현재 scan budget을 재검증해 부분 visibility에서 재사용하지 않는다.
+    #[test]
+    fn cache_hit_rechecks_scan_budget_even_when_day_mtime_stable() {
+        let base = unique_tmp("cache-hit-budget");
+        let cache_base = unique_tmp("cache-hit-budget-cache");
+        let cwd = "/Users/me/projCacheHitBudget";
+        let key = "cache-hit-budget-key";
+        let rollout_path = write_rollout(
+            &base,
+            "hitbudget",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(20);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        for idx in 0..MAX_CODEX_SCAN_ENTRIES {
+            let path = day_dir.join(format!("noise-cache-hit-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+        set_file_mtime(&day_dir, stable_day_mtime);
+        assert!(
+            current_scan_fingerprint(&base, 3).is_none(),
+            "cache-hit fingerprint probe must fail closed when current scan budget is exceeded"
+        );
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "day mtime이 안정적이어도 current scan budget 초과 시 cached 단일 세션을 재사용하면 안 됨"
         );
 
         let _ = std::fs::remove_dir_all(&base);
