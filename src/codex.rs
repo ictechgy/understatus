@@ -21,7 +21,7 @@ use crate::claude::ClaudeInput;
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -517,7 +517,7 @@ fn scan_codex_candidates(
     freshness: u64,
     scan_days: usize,
 ) -> CandidateScan {
-    let (rollout_paths, fingerprint, budget_exceeded, scan_incomplete) =
+    let (rollout_paths, fingerprint, budget_exceeded, mut scan_incomplete) =
         collect_rollout_scan(base, scan_days, true);
     let freshness_secs = freshness.saturating_mul(60);
     let normalized_target_cwd = normalize_cwd_for_match(cwd);
@@ -535,23 +535,36 @@ fn scan_codex_candidates(
     }
 
     for path in rollout_paths {
-        let fresh = is_fresh(&path, now, freshness_secs);
         // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
         // stale 동일-cwd 파일도 기록해 둔다. 기존 파일 append는 day-dir mtime을 바꾸지 않을 수 있어,
         // 나중에 fresh가 됐을 때 캐시 히트가 새 모호성을 놓치지 않도록 하기 위함이다.
-        if let Some(meta) = read_first_line_meta(&path) {
-            let cwd_ok = meta
-                .cwd
-                .as_deref()
-                .map(|c| cwd_matches_normalized(c, &normalized_target_cwd))
-                .unwrap_or(false);
-            let originator_ok = is_interactive_originator(meta.originator.as_deref());
-            if fresh && cwd_ok && originator_ok {
-                candidates.push(path);
-            } else if !fresh && cwd_ok && originator_ok {
-                stale_same_cwd_rollouts.push(WatchedRollout {
-                    path: path.to_string_lossy().into_owned(),
-                });
+        let fresh = match is_fresh_checked(&path, now, freshness_secs) {
+            Ok(fresh) => fresh,
+            Err(_) => {
+                scan_incomplete = true;
+                break;
+            }
+        };
+        match read_first_line_meta_checked(&path) {
+            Ok(Some(meta)) => {
+                let cwd_ok = meta
+                    .cwd
+                    .as_deref()
+                    .map(|c| cwd_matches_normalized(c, &normalized_target_cwd))
+                    .unwrap_or(false);
+                let originator_ok = is_interactive_originator(meta.originator.as_deref());
+                if fresh && cwd_ok && originator_ok {
+                    candidates.push(path);
+                } else if !fresh && cwd_ok && originator_ok {
+                    stale_same_cwd_rollouts.push(WatchedRollout {
+                        path: path.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                scan_incomplete = true;
+                break;
             }
         }
     }
@@ -628,11 +641,13 @@ fn collect_rollout_scan(
             entries_seen += 1;
 
             let path = entry.path();
-            if !is_rollout_file(&path) {
-                continue;
-            }
-            if collect_paths {
-                rollout_paths.push(path);
+            match is_rollout_file(&path) {
+                Ok(true) if collect_paths => rollout_paths.push(path),
+                Ok(_) => {}
+                Err(_) => {
+                    scan_incomplete = true;
+                    break;
+                }
             }
         }
         days.push(day);
@@ -767,53 +782,56 @@ fn sorted_subdirs_desc_bounded(dir: &Path) -> BoundedSubdirs {
 }
 
 /// 경로가 `rollout-*.jsonl` 형식인지 판정한다.
-fn is_rollout_file(path: &Path) -> bool {
+fn is_rollout_file(path: &Path) -> std::io::Result<bool> {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name,
-        None => return false,
+        None => return Ok(false),
     };
     if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
-        return false;
+        return Ok(false);
     }
-    path.is_file()
+    path.metadata().map(|meta| meta.is_file())
 }
 
-/// 파일 mtime이 `now`로부터 `freshness_secs` 이내인지 판정한다(cheap stat 선필터).
-///
-/// 시계 이상/메타데이터 부재 시 보수적으로 `false`(제외). 미래 mtime(now보다 나중)은 fresh로 본다.
-fn is_fresh(path: &Path, now: SystemTime, freshness_secs: u64) -> bool {
-    let modified = match path.metadata().and_then(|m| m.modified()) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
+/// 파일 freshness의 fallible variant. 후보 스캔에서는 stat/mtime 실패를 단순 stale로 숨기지 않고
+/// scan_incomplete로 전파해 fail-safe Ambiguous로 저하시킨다.
+fn is_fresh_checked(path: &Path, now: SystemTime, freshness_secs: u64) -> std::io::Result<bool> {
+    let modified = path.metadata().and_then(|m| m.modified())?;
     match now.duration_since(modified) {
         // mtime이 과거: 경과가 freshness 이내면 fresh.
-        Ok(elapsed) => elapsed.as_secs() <= freshness_secs,
+        Ok(elapsed) => Ok(elapsed.as_secs() <= freshness_secs),
         // mtime이 미래(now보다 나중): 동시 쓰기 등 → fresh로 본다.
-        Err(_) => true,
+        Err(_) => Ok(true),
     }
 }
 
 /// rollout 파일의 첫 줄(session_meta)만 읽어 cwd/originator를 파싱한다(매칭 선필터용).
 ///
 /// 첫 줄은 inline `base_instructions` 때문에 실측 ~33KB에 달하므로([`FIRST_LINE_READ_BYTES`]
-/// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. 개행 미발견(상한 내
-/// 첫 줄 미완결)이면 부분 JSON을 파싱하지 않고 `None`(무패닉, 보수적 제외). 읽기/파싱 실패도 `None`.
+/// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. legacy bool API는
+/// 읽기/상한 실패를 `None`으로 숨기지만, 후보 스캔은 fallible variant로 scan_incomplete를 보존한다.
+#[cfg(test)]
 fn read_first_line_meta(path: &Path) -> Option<SessionMeta> {
-    let file = File::open(path).ok()?;
+    read_first_line_meta_checked(path).ok().flatten()
+}
+
+/// [`read_first_line_meta`]의 fallible variant. 파일 IO 실패 또는 상한 안에 완결 개행이 없는
+/// partial 첫 줄은 후보 없음으로 숨기지 않고 scan_incomplete로 전파한다.
+fn read_first_line_meta_checked(path: &Path) -> Result<Option<SessionMeta>, ()> {
+    let file = File::open(path).map_err(|_| ())?;
     let reader = BufReader::new(file);
     // `read_until`은 개행을 만날 때까지만 버퍼를 키운다. 이전처럼 후보마다 고정 128KiB를
     // 선할당하지 않으므로 다수 후보 스캔에서 불필요한 메모리 churn을 줄인다.
     let mut limited = reader.take(FIRST_LINE_READ_BYTES);
     let mut buf = Vec::with_capacity(4 * 1024);
-    let bytes_read = limited.read_until(b'\n', &mut buf).ok()?;
+    let bytes_read = limited.read_until(b'\n', &mut buf).map_err(|_| ())?;
     if bytes_read == 0 {
-        return None;
+        return Ok(None);
     }
     let has_newline = buf.last() == Some(&b'\n');
     if !has_newline && bytes_read as u64 >= FIRST_LINE_READ_BYTES {
         // 상한에 걸린 미완성 JSON은 파싱하지 않는다(부분 라인 신뢰 금지).
-        return None;
+        return Err(());
     }
     if has_newline {
         buf.pop();
@@ -822,7 +840,7 @@ fn read_first_line_meta(path: &Path) -> Option<SessionMeta> {
         }
     }
     let first_line = String::from_utf8_lossy(&buf);
-    parse_session_meta(&first_line)
+    Ok(parse_session_meta(&first_line))
 }
 
 /// 후보를 스캔하고 모호성을 판정해 [`Resolution`]으로 해소한다(spec §5).
@@ -889,11 +907,15 @@ struct CodexCacheEntry {
 
 /// 파일 mtime을 epoch ms로 반환한다(캐시 무효화 키). 실패 시 `None`.
 fn file_mtime_ms(path: &Path) -> Option<u128> {
-    let modified = path.metadata().and_then(|m| m.modified()).ok()?;
+    file_mtime_ms_checked(path).ok()
+}
+
+fn file_mtime_ms_checked(path: &Path) -> std::io::Result<u128> {
+    let modified = path.metadata().and_then(|m| m.modified())?;
     modified
         .duration_since(UNIX_EPOCH)
-        .ok()
         .map(|d| d.as_millis())
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "mtime precedes unix epoch"))
 }
 
 /// 캐시 히트 시 해소된 파일의 mtime(epoch ms)이 여전히 freshness 이내인지 판정한다(spec §5/§8).
@@ -929,8 +951,8 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
 ///
 /// 기존 stale 파일이 append 등으로 fresh가 되면 parent day directory mtime은 바뀌지 않을 수 있다.
 /// 그 경우 캐시된 단일 후보를 그대로 쓰면 새 모호성을 놓치므로, 감시 대상 중 하나라도 fresh가
-/// 되면 캐시를 무시하고 풀 재해소로 떨어진다. stat 실패/삭제는 스캔해도 fresh 후보가 아니므로
-/// 보수적으로 "아직 재사용 가능"으로 취급한다.
+/// 되면 캐시를 무시하고 풀 재해소로 떨어진다. 삭제는 더 이상 후보가 아니므로 안전하지만,
+/// broken symlink/권한/race 등 stat 실패가 path 존재와 함께 관찰되면 캐시 재사용을 금지한다.
 fn watched_rollouts_still_stale(
     watched: &[WatchedRollout],
     now: SystemTime,
@@ -938,9 +960,13 @@ fn watched_rollouts_still_stale(
 ) -> bool {
     watched.iter().all(|rollout| {
         let path = PathBuf::from(&rollout.path);
-        file_mtime_ms(&path)
-            .map(|mtime| !is_mtime_fresh(mtime, now, freshness_secs))
-            .unwrap_or(true)
+        match file_mtime_ms_checked(&path) {
+            Ok(mtime) => !is_mtime_fresh(mtime, now, freshness_secs),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                std::fs::symlink_metadata(&path).is_err()
+            }
+            Err(_) => false,
+        }
     })
 }
 
@@ -1514,6 +1540,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 회귀: 상한까지 읽어도 개행이 없는 첫 줄은 부분 JSON으로 파싱하지 않고 제외한다.
+    #[test]
+    fn find_candidates_rejects_unterminated_over_limit_first_line() {
+        let base = unique_tmp("bigmeta-no-newline");
+        let cwd = "/Users/me/projBigMetaNoNewline";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-05T20-40-45-bigmeta-no-newline.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            r#"{{"timestamp":"2026-06-05T11:41:50.379Z","type":"session_meta","payload":{{"id":"abc","cwd":"{cwd}","originator":"codex-tui","base_instructions":{{"text":""#
+        )
+        .unwrap();
+        write!(file, "{}", "A".repeat(FIRST_LINE_READ_BYTES as usize)).unwrap();
+        file.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&path).is_none(),
+            "개행 없이 상한에 걸린 첫 줄은 부분 session_meta로 파싱하면 안 됨"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "미완결 과대 첫 줄은 후보 없음이 아니라 불완전 스캔으로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "미완결 과대 첫 줄은 실제 해소 경로에서 fail-safe"
+        );
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(
+            found.len(),
+            0,
+            "미완결 과대 첫 줄은 cwd/originator 후보에서 제외"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rollout 이름 엔트리의 metadata를 확인할 수 없으면 단일 후보를 표시하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn rollout_metadata_error_fails_safe() {
+        let base = unique_tmp("rollout-metadata-error");
+        let cwd = "/Users/me/projRolloutMetadataError";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let candidate_path = day_dir.join("rollout-2026-06-05T20-40-45-candidate.jsonl");
+        let mut candidate = std::fs::File::create(&candidate_path).unwrap();
+        for line in [
+            session_meta_line(cwd, "codex-tui"),
+            turn_context_line("gpt-5.5", "high"),
+            token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+        ] {
+            writeln!(candidate, "{line}").unwrap();
+        }
+
+        let broken = day_dir.join("rollout-2026-06-05T20-40-45-broken.jsonl");
+        std::os::unix::fs::symlink(day_dir.join("missing-target.jsonl"), &broken).unwrap();
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "rollout-*.jsonl metadata 실패는 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "metadata 실패가 있는 부분 스캔에서 본 단일 후보를 표시하면 안 됨"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// AC-X1: 동일 cwd·fresh 후보 2개 → Ambiguous → enrich 생략(ctx/rate 미표시).
     #[test]
     fn ambiguous_two_same_cwd_candidates() {
@@ -1612,6 +1714,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 예산 초과 전에 단일 후보를 찾았더라도 전체 유일성을 증명할 수 없으면 fail-safe다.
+    #[test]
+    fn scan_budget_with_prior_candidate_still_fails_safe() {
+        let base = unique_tmp("scan-budget-prior-candidate");
+        let cache_base = unique_tmp("scan-budget-prior-candidate-cache");
+        let cwd = "/Users/me/projBudgetPriorCandidate";
+        let newest_day = base.join("sessions").join("2026").join("06").join("06");
+        let older_day = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&newest_day).unwrap();
+        std::fs::create_dir_all(&older_day).unwrap();
+
+        let candidate_path = newest_day.join("rollout-2026-06-06T20-40-45-candidate.jsonl");
+        let mut candidate = std::fs::File::create(&candidate_path).unwrap();
+        for line in [
+            session_meta_line(cwd, "codex-tui"),
+            turn_context_line("gpt-5.5", "high"),
+            token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+        ] {
+            writeln!(candidate, "{line}").unwrap();
+        }
+
+        for idx in 0..MAX_CODEX_SCAN_ENTRIES {
+            let path = older_day.join(format!("noise-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "후보를 먼저 발견했더라도 뒤따른 디렉터리 엔트리 폭증은 budget_exceeded여야 함"
+        );
+        assert!(
+            scan.candidates.is_empty(),
+            "예산 초과 시에는 이미 존재하는 valid 후보도 신뢰 가능한 단일 후보로 노출하지 않음"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "부분 스캔에서 본 단일 후보를 표시하지 않고 Ambiguous로 저하"
+        );
+
+        let mut input = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some("scan-budget-prior-candidate-key".to_string()),
+            ..Default::default()
+        };
+        let before = input.clone();
+        maybe_enrich_in(
+            &mut input,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            input, before,
+            "budget_exceeded 상태에서는 이미 발견한 단일 후보로도 enrich하지 않아야 함"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
     }
 
     /// non-rollout 엔트리도 총 스캔 예산에 포함해 hot path 디렉터리 순회를 제한한다.
@@ -2215,6 +2380,81 @@ mod tests {
         assert_eq!(
             second, before,
             "기존 stale 동일-cwd rollout이 fresh가 되면 cached 단일 세션 대신 Ambiguous로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// watched stale rollout의 stat 실패는 "아직 stale"이 아니라 cache reuse 금지로 처리한다.
+    #[cfg(unix)]
+    #[test]
+    fn cache_hit_rejects_watched_rollout_stat_failure() {
+        let base = unique_tmp("cache-watch-stat-failure");
+        let cache_base = unique_tmp("cache-watch-stat-failure-cache");
+        let cwd = "/Users/me/projCacheWatchStatFailure";
+        let key = "cache-watch-stat-failure-key";
+        let fresh_path = write_rollout(
+            &base,
+            "watchfresh",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let stale_path = write_rollout(
+            &base,
+            "watchbroken",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+        let day_dir = fresh_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(30);
+        set_file_mtime(
+            &stale_path,
+            SystemTime::now() - Duration::from_secs(5 * 3600),
+        );
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        std::fs::remove_file(&stale_path).unwrap();
+        std::os::unix::fs::symlink(day_dir.join("missing-watch-target.jsonl"), &stale_path)
+            .unwrap();
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "watched rollout stat 실패는 cached 단일 세션 재사용 대신 fail-safe로 저하"
         );
 
         let _ = std::fs::remove_dir_all(&base);
