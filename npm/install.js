@@ -23,9 +23,10 @@ const os = require('os');
 // release/publish guard가 Cargo.toml, npm/package.json, 이 값, git tag를 lockstep으로
 // 검증합니다. 새 네이티브 릴리스를 낼 때 네 버전을 함께 올리세요.
 const VERSION = '0.7.0';
+const INSTALL_TEST = process.env.UNDERSTATUS_INSTALL_TEST === '1';
 
 // 플랫폼 확인: macOS 전용 패키지
-if (process.platform !== 'darwin') {
+if (!INSTALL_TEST && process.platform !== 'darwin') {
   process.stdout.write(
     '[understatus] macOS 전용 패키지입니다. 현재 플랫폼(' +
       process.platform +
@@ -41,7 +42,7 @@ const archMap = {
 };
 
 const target = archMap[process.arch];
-if (!target) {
+if (!INSTALL_TEST && !target) {
   process.stderr.write(
     '[understatus] 지원하지 않는 아키텍처입니다: ' + process.arch + '\n' +
     '[understatus] 지원 아키텍처: arm64 (Apple Silicon), x64 (Intel)\n'
@@ -323,7 +324,17 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  process.stderr.write('[understatus] 예기치 않은 오류: ' + err.message + '\n');
-  process.exit(1);
-});
+if (INSTALL_TEST) {
+  module.exports = {
+    computeSha256,
+    download,
+    expectedChecksum,
+    extractValidatedBinary,
+    removeDirQuietly,
+  };
+} else {
+  main().catch((err) => {
+    process.stderr.write('[understatus] 예기치 않은 오류: ' + err.message + '\n');
+    process.exit(1);
+  });
+}

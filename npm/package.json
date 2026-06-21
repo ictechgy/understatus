@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "postinstall": "node install.js",
-    "test": "node test-verify-release.js"
+    "test": "node test-verify-release.js && node test-install.js"
   },
   "files": [
     "install.js",

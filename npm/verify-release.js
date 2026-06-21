@@ -156,6 +156,9 @@ if (options.target && !SUPPORTED_TARGETS.includes(options.target)) {
 if ((options.writeChecksums || options.verifySidecars) && !options.tarballDir) {
   fail('--write-checksums and --verify-sidecars require --tarball-dir');
 }
+if (options.writeChecksums && options.requireChecksums) {
+  fail('--write-checksums generates a package manifest; run --require-checksums in a separate verify step');
+}
 
 if (options.tarballDir) {
   options.tarballDir = path.resolve(options.tarballDir);

@@ -30,3 +30,11 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: npm test
+        run: npm test --prefix npm

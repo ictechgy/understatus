@@ -68,10 +68,26 @@ try {
     assetDir,
     '--verify-sidecars',
     '--write-checksums',
-    '--require-checksums',
     '--verify-packlist',
   ]);
   assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+
+  let result2 = runVerify(fixtureRoot, [
+    '--tarball-dir',
+    assetDir,
+    '--require-checksums',
+    '--verify-packlist',
+  ]);
+  assert.strictEqual(result2.status, 0, result2.stderr || result2.stdout);
+
+  result2 = runVerify(fixtureRoot, [
+    '--tarball-dir',
+    assetDir,
+    '--write-checksums',
+    '--require-checksums',
+  ]);
+  assert.notStrictEqual(result2.status, 0, 'write+require combination should fail');
+  assert.match(result2.stderr, /separate verify step/);
 
   const generated = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'npm', 'checksums.json'), 'utf8'));
   for (const target of targets) {
