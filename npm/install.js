@@ -38,6 +38,7 @@ const RELEASE_BASE =
 const BIN_DIR = path.join(__dirname, 'bin');
 const BINARY_PATH = path.join(BIN_DIR, 'understatus');
 const TAR = '/usr/bin/tar';
+const DOWNLOAD_TIMEOUT_MS = 30000;
 
 /**
  * HTTP(S) GET 요청으로 URL에서 데이터를 다운로드합니다.
@@ -54,56 +55,63 @@ function download(url, destPath, maxRedirects = 10) {
       return reject(new Error('너무 많은 리디렉션이 발생했습니다: ' + url));
     }
 
-    https
-      .get(url, (response) => {
-        // 리디렉션 처리
-        if (
-          [301, 302, 307, 308].includes(response.statusCode) &&
-          response.headers.location
-        ) {
-          response.resume(); // 현재 응답 본문 소비
-          let nextUrl;
-          try {
-            nextUrl = new URL(response.headers.location, url);
-          } catch (err) {
-            return reject(new Error('잘못된 리디렉션 URL: ' + response.headers.location));
-          }
-          if (nextUrl.protocol !== 'https:') {
-            return reject(new Error('HTTPS가 아닌 리디렉션 거부: ' + nextUrl.toString()));
-          }
-          return resolve(download(nextUrl.toString(), destPath, maxRedirects - 1));
-        }
+    function rejectWithCleanup(err) {
+      if (destPath) {
+        fs.unlink(destPath, () => {});
+      }
+      reject(err);
+    }
 
-        if (response.statusCode !== 200) {
-          response.resume();
-          return reject(
-            new Error(
-              'HTTP ' + response.statusCode + ' 오류: ' + url + '\n' +
-              '릴리즈가 존재하는지 확인하세요: ' +
-              'https://github.com/ictechgy/understatus/releases'
-            )
-          );
+    const request = https.get(url, (response) => {
+      // 리디렉션 처리
+      if (
+        [301, 302, 307, 308].includes(response.statusCode) &&
+        response.headers.location
+      ) {
+        response.resume(); // 현재 응답 본문 소비
+        let nextUrl;
+        try {
+          nextUrl = new URL(response.headers.location, url);
+        } catch (err) {
+          return rejectWithCleanup(new Error('잘못된 리디렉션 URL: ' + response.headers.location));
         }
+        if (nextUrl.protocol !== 'https:') {
+          return rejectWithCleanup(new Error('HTTPS가 아닌 리디렉션 거부: ' + nextUrl.toString()));
+        }
+        return resolve(download(nextUrl.toString(), destPath, maxRedirects - 1));
+      }
 
-        if (destPath) {
-          // 파일로 저장
-          const fileStream = fs.createWriteStream(destPath);
-          response.pipe(fileStream);
-          fileStream.on('finish', () => fileStream.close(resolve));
-          fileStream.on('error', (err) => {
-            fs.unlink(destPath, () => {}); // 실패 시 임시 파일 삭제
-            reject(err);
-          });
-          response.on('error', reject);
-        } else {
-          // Buffer로 수집
-          const chunks = [];
-          response.on('data', (chunk) => chunks.push(chunk));
-          response.on('end', () => resolve(Buffer.concat(chunks)));
-          response.on('error', reject);
-        }
-      })
-      .on('error', reject);
+      if (response.statusCode !== 200) {
+        response.resume();
+        return rejectWithCleanup(
+          new Error(
+            'HTTP ' + response.statusCode + ' 오류: ' + url + '\n' +
+            '릴리즈가 존재하는지 확인하세요: ' +
+            'https://github.com/ictechgy/understatus/releases'
+          )
+        );
+      }
+
+      if (destPath) {
+        // 파일로 저장
+        const fileStream = fs.createWriteStream(destPath);
+        response.pipe(fileStream);
+        fileStream.on('finish', () => fileStream.close(resolve));
+        fileStream.on('error', rejectWithCleanup);
+        response.on('error', rejectWithCleanup);
+      } else {
+        // Buffer로 수집
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => resolve(Buffer.concat(chunks)));
+        response.on('error', rejectWithCleanup);
+      }
+    });
+
+    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      request.destroy(new Error('다운로드 시간 초과: ' + url));
+    });
+    request.on('error', rejectWithCleanup);
   });
 }
 
