@@ -46,7 +46,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify release source contract
-        run: node npm/verify-release.js "${TAG#v}"
+        run: node npm/verify-release.js "${TAG#v}" --verify-packlist
 
       # Trusted Publishing(OIDC)은 npm CLI >= 11.5.1을 요구한다. Node 22 기본 npm은 10.x라 업그레이드.
       - name: Upgrade npm (OIDC 요구 버전)
@@ -63,7 +63,9 @@ jobs:
           for i in $(seq 1 60); do
             names="$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)"
             if printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz" \
-               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz"; then
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-aarch64-apple-darwin.tar.gz.sha256" \
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz" \
+               && printf '%s\n' "$names" | grep -qx "understatus-${VER}-x86_64-apple-darwin.tar.gz.sha256"; then
               echo "릴리스 에셋 확인됨 ($TAG)"
               exit 0
             fi
@@ -86,8 +88,16 @@ jobs:
             gh release download "$TAG" \
               --dir "$ASSET_DIR" \
               --pattern "understatus-${VER}-${target}.tar.gz"
+            gh release download "$TAG" \
+              --dir "$ASSET_DIR" \
+              --pattern "understatus-${VER}-${target}.tar.gz.sha256"
           done
-          node npm/verify-release.js "$VER" --tarball-dir "$ASSET_DIR"
+          node npm/verify-release.js "$VER" \
+            --tarball-dir "$ASSET_DIR" \
+            --verify-sidecars \
+            --write-checksums \
+            --require-checksums \
+            --verify-packlist
 
       # 래퍼 서브디렉터리(./npm)를 publish. Trusted Publishing 사용 시 NODE_AUTH_TOKEN 불필요,
       # provenance는 자동 생성된다. understatus는 unscoped 패키지라 기본 public.

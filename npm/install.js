@@ -18,12 +18,10 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const path = require('path');
 const os = require('os');
-const checksums = require('./checksums.json');
 
 // 네이티브 바이너리를 받아오는 GitHub 릴리스 태그.
-// npm 래퍼 패키지 버전(package.json)과는 분리되어 있습니다 —
-// 래퍼(이 스크립트/런처)만 패치 게시될 수 있으므로, 바이너리는 항상
-// 아래 고정된 릴리스에서 받습니다. 새 바이너리 릴리스를 낼 때 이 값을 올리세요.
+// release/publish guard가 Cargo.toml, npm/package.json, 이 값, git tag를 lockstep으로
+// 검증합니다. 새 네이티브 릴리스를 낼 때 네 버전을 함께 올리세요.
 const VERSION = '0.7.0';
 
 // 플랫폼 확인: macOS 전용 패키지
@@ -149,6 +147,7 @@ function removeDirQuietly(dirPath) {
 }
 
 function expectedChecksum(version, releaseTarget) {
+  const checksums = require('./checksums.json');
   const releaseChecksums = checksums[version];
   const checksum = releaseChecksums && releaseChecksums[releaseTarget];
   if (!checksum || !/^[0-9a-f]{64}$/.test(checksum)) {

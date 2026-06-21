@@ -39,7 +39,7 @@ jobs:
           node-version: '22.x'
 
       - name: Verify release source contract
-        run: node npm/verify-release.js "${TAG#v}"
+        run: node npm/verify-release.js "${TAG#v}" --verify-packlist
 
       - name: Rust toolchain (+ target)
         uses: dtolnay/rust-toolchain@stable
@@ -56,11 +56,11 @@ jobs:
           tar czf understatus-${VERSION}-${{ matrix.target }}.tar.gz understatus
           shasum -a 256 understatus-${VERSION}-${{ matrix.target }}.tar.gz > understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256
 
-      - name: Verify packaged checksum manifest
+      - name: Verify generated checksum sidecar
         run: |
-          node npm/verify-release.js "${TAG#v}" \
-            --target "${{ matrix.target }}" \
-            --tarball-dir "target/${{ matrix.target }}/release"
+          VERSION=${TAG#v}
+          cd target/${{ matrix.target }}/release
+          shasum -a 256 -c "understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
