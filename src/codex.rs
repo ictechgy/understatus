@@ -20,7 +20,7 @@ use crate::claude::ClaudeInput;
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,12 @@ const FIRST_LINE_READ_BYTES: u64 = 128 * 1024;
 /// tail(뒷부분) 읽기 상한. 마지막 token_count + 최신 turn_context용(실측 gap max 14KB,
 /// 단일 라인 max 132KB → 256KB 안전마진, spec §8.1).
 const TAIL_READ_BYTES: u64 = 256 * 1024;
+/// 최근 일자 디렉터리에서 한 번의 해소가 검사할 rollout 파일 총량 상한.
+///
+/// 상한을 넘기면 단일 후보를 확정하지 않고 fail-safe(ambiguous와 동일하게 enrich 생략)로
+/// 저하한다. 그래야 큰 `sessions` 트리에서 statusline hot path가 무한히 파일을 stat/read하지
+/// 않고, 부분 스캔으로 잘못된 단일 세션을 표시하는 fail-wrong도 피한다.
+const MAX_ROLLOUT_SCAN_FILES: usize = 1024;
 /// 디스크 캐시 파일명(세션별 격리, chain.rs 인프라 재사용, spec §8).
 const CODEX_CACHE_FILE: &str = "codex_session";
 /// 대화형(TUI) originator 화이트리스트 prefix. `codex_exec` 등 비대화형은 제외(spec §5).
@@ -83,6 +89,35 @@ pub enum Resolution {
     Ambiguous,
     /// 후보 없음: enrich 생략.
     None,
+}
+
+/// 후보 스캔 결과와 캐시 재사용 안전성을 판정하기 위한 최근 rollout 트리 지문.
+#[derive(Debug, Clone, PartialEq)]
+struct CandidateScan {
+    /// cwd/originator/freshness 선필터를 통과한 후보.
+    candidates: Vec<PathBuf>,
+    /// 스캔한 최근 일자 디렉터리의 파일 수/mtime 지문.
+    fingerprint: CodexScanFingerprint,
+}
+
+/// 캐시된 단일 후보가 여전히 "유일한 후보"인지 재검증하기 위한 경량 지문.
+///
+/// 각 캐시 히트마다 rollout JSON 본문을 다시 읽지는 않지만, 최근 일자 디렉터리의 rollout 파일
+/// 개수와 mtime 집계를 확인해 새 rollout 추가/삭제/수정을 감지한다. 지문이 바뀌면 캐시를
+/// 바로 재사용하지 않고 후보 스캔으로 모호성을 다시 판정한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexScanFingerprint {
+    days: Vec<CodexDayFingerprint>,
+    /// `MAX_ROLLOUT_SCAN_FILES`를 초과해 전체 후보 유일성을 증명할 수 없는 상태.
+    budget_exceeded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexDayFingerprint {
+    path: String,
+    mtime_ms: Option<u128>,
+    rollout_files_seen: usize,
+    rollout_mtime_sum_ms: u128,
 }
 
 /// session_meta(첫 줄)에서 추출한 매칭 근거.
@@ -282,16 +317,24 @@ fn is_interactive_originator(originator: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// cwd 비교용 정규화. 존재 경로는 canonicalize하고, 부재 경로는 trailing slash만 제거한다.
+fn normalize_cwd_for_match(cwd: &str) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd.trim_end_matches('/')))
+}
+
+/// 반복 후보 스캔에서 target cwd canonicalize를 매 후보마다 반복하지 않기 위한 비교 헬퍼.
+fn cwd_matches_normalized(candidate_cwd: &str, normalized_target_cwd: &Path) -> bool {
+    normalize_cwd_for_match(candidate_cwd) == normalized_target_cwd
+}
+
 /// 두 cwd 문자열이 같은 디렉터리를 가리키는지 비교한다(정규화: canonicalize 실패 시 trim 비교).
 ///
 /// 외부 입력(payload.cwd)은 **비교에만** 쓰고 파일경로 구성엔 쓰지 않는다(traversal 무관, spec §5).
 /// trailing slash 등 표기 차이를 흡수하기 위해 canonicalize를 시도하고, 실패(부재 경로 등) 시
 /// trim된 문자열 동치로 폴백한다.
+#[cfg(test)]
 fn cwd_matches(candidate_cwd: &str, target_cwd: &str) -> bool {
-    let normalize = |p: &str| -> PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p.trim_end_matches('/')))
-    };
-    normalize(candidate_cwd) == normalize(target_cwd)
+    cwd_matches_normalized(candidate_cwd, &normalize_cwd_for_match(target_cwd))
 }
 
 // ============================== 발견/IO(spec §5/§8.1) ==============================
@@ -425,6 +468,7 @@ fn extract_from_file(path: &Path) -> Option<CodexSession> {
 /// # 반환
 /// 부합 후보 경로들. 1) 최근 scan_days 일자만(전체 4400+ 회피) 2) mtime freshness 선필터
 /// 3) 첫 줄 cwd 정규화 일치 AND originator 화이트리스트. 외부 cwd는 비교에만 사용한다.
+#[cfg(test)]
 fn find_codex_candidates(
     base: &Path,
     cwd: &str,
@@ -432,40 +476,119 @@ fn find_codex_candidates(
     freshness: u64,
     scan_days: usize,
 ) -> Vec<PathBuf> {
+    scan_codex_candidates(base, cwd, now, freshness, scan_days).candidates
+}
+
+/// 후보 스캔 + rollout 트리 지문 계산을 한 번에 수행한다.
+///
+/// 지문은 캐시 히트 시 새 rollout 추가/삭제/수정 여부를 확인하는 데 쓰이고, `budget_exceeded`
+/// 는 부분 스캔으로 단일 후보를 확정하지 않도록 fail-safe 판정에 쓰인다.
+fn scan_codex_candidates(
+    base: &Path,
+    cwd: &str,
+    now: SystemTime,
+    freshness: u64,
+    scan_days: usize,
+) -> CandidateScan {
+    let (rollout_paths, fingerprint) = collect_rollout_scan(base, scan_days, true);
+    let freshness_secs = freshness.saturating_mul(60);
+    let normalized_target_cwd = normalize_cwd_for_match(cwd);
+    let mut candidates = Vec::new();
+
+    if fingerprint.budget_exceeded {
+        return CandidateScan {
+            candidates,
+            fingerprint,
+        };
+    }
+
+    for path in rollout_paths {
+        // (2) cheap stat 선필터: mtime이 freshness 이내인 후보만.
+        if !is_fresh(&path, now, freshness_secs) {
+            continue;
+        }
+        // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
+        if let Some(meta) = read_first_line_meta(&path) {
+            let cwd_ok = meta
+                .cwd
+                .as_deref()
+                .map(|c| cwd_matches_normalized(c, &normalized_target_cwd))
+                .unwrap_or(false);
+            let originator_ok = is_interactive_originator(meta.originator.as_deref());
+            if cwd_ok && originator_ok {
+                candidates.push(path);
+            }
+        }
+    }
+    CandidateScan {
+        candidates,
+        fingerprint,
+    }
+}
+
+/// 후보 본문을 읽지 않고 최근 rollout 트리의 캐시 검증용 지문만 계산한다.
+fn current_scan_fingerprint(base: &Path, scan_days: usize) -> CodexScanFingerprint {
+    collect_rollout_scan(base, scan_days, false).1
+}
+
+/// 최근 일자 디렉터리의 rollout 파일 경로(선택)와 스캔 지문을 수집한다.
+fn collect_rollout_scan(
+    base: &Path,
+    scan_days: usize,
+    collect_paths: bool,
+) -> (Vec<PathBuf>, CodexScanFingerprint) {
     let sessions_dir = base.join("sessions");
     let day_dirs = recent_day_dirs(&sessions_dir, scan_days);
+    let mut rollout_paths = Vec::new();
+    let mut days = Vec::new();
+    let mut files_seen = 0usize;
+    let mut budget_exceeded = false;
 
-    let freshness_secs = freshness.saturating_mul(60);
-    let mut candidates = Vec::new();
     for day_dir in day_dirs {
+        let mut day = CodexDayFingerprint {
+            path: day_dir.to_string_lossy().into_owned(),
+            mtime_ms: file_mtime_ms(&day_dir),
+            rollout_files_seen: 0,
+            rollout_mtime_sum_ms: 0,
+        };
         let entries = match std::fs::read_dir(&day_dir) {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(_) => {
+                days.push(day);
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if !is_rollout_file(&path) {
                 continue;
             }
-            // (2) cheap stat 선필터: mtime이 freshness 이내인 후보만.
-            if !is_fresh(&path, now, freshness_secs) {
-                continue;
+            if files_seen >= MAX_ROLLOUT_SCAN_FILES {
+                budget_exceeded = true;
+                break;
             }
-            // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
-            if let Some(meta) = read_first_line_meta(&path) {
-                let cwd_ok = meta
-                    .cwd
-                    .as_deref()
-                    .map(|c| cwd_matches(c, cwd))
-                    .unwrap_or(false);
-                let originator_ok = is_interactive_originator(meta.originator.as_deref());
-                if cwd_ok && originator_ok {
-                    candidates.push(path);
-                }
+            files_seen += 1;
+            day.rollout_files_seen += 1;
+            if let Some(mtime) = file_mtime_ms(&path) {
+                day.rollout_mtime_sum_ms = day.rollout_mtime_sum_ms.wrapping_add(mtime);
+            }
+            if collect_paths {
+                rollout_paths.push(path);
             }
         }
+        days.push(day);
+        if budget_exceeded {
+            break;
+        }
     }
-    candidates
+
+    (
+        rollout_paths,
+        CodexScanFingerprint {
+            days,
+            budget_exceeded,
+        },
+    )
 }
 
 /// `sessions/<year>/<month>/<day>` 트리에서 최근 `scan_days`개 일자 디렉터리를 내림차순으로 모은다.
@@ -542,18 +665,29 @@ fn is_fresh(path: &Path, now: SystemTime, freshness_secs: u64) -> bool {
 /// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. 개행 미발견(상한 내
 /// 첫 줄 미완결)이면 부분 JSON을 파싱하지 않고 `None`(무패닉, 보수적 제외). 읽기/파싱 실패도 `None`.
 fn read_first_line_meta(path: &Path) -> Option<SessionMeta> {
-    let mut file = File::open(path).ok()?;
-    // 첫 줄은 base_instructions로 커지므로(실측 ~33KB) 별도의 넉넉한 상한까지 읽는다.
-    let mut buf = vec![0u8; FIRST_LINE_READ_BYTES as usize];
-    read_exact_lossy(&mut file, &mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    // 개행으로 완결된 첫 줄만 신뢰한다(부분 라인 파싱 금지). 파일 전체가 한 줄(개행 부재)이고
-    // 상한 미만이면 그 전체를 첫 줄로 본다(작은 파일 안전 처리).
-    let first_line = match text.split_once('\n') {
-        Some((line, _)) => line,
-        None => text.as_ref(),
-    };
-    parse_session_meta(first_line)
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    // `read_until`은 개행을 만날 때까지만 버퍼를 키운다. 이전처럼 후보마다 고정 128KiB를
+    // 선할당하지 않으므로 다수 후보 스캔에서 불필요한 메모리 churn을 줄인다.
+    let mut limited = reader.take(FIRST_LINE_READ_BYTES);
+    let mut buf = Vec::with_capacity(4 * 1024);
+    let bytes_read = limited.read_until(b'\n', &mut buf).ok()?;
+    if bytes_read == 0 {
+        return None;
+    }
+    let has_newline = buf.last() == Some(&b'\n');
+    if !has_newline && bytes_read as u64 >= FIRST_LINE_READ_BYTES {
+        // 상한에 걸린 미완성 JSON은 파싱하지 않는다(부분 라인 신뢰 금지).
+        return None;
+    }
+    if has_newline {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    let first_line = String::from_utf8_lossy(&buf);
+    parse_session_meta(&first_line)
 }
 
 /// 후보를 스캔하고 모호성을 판정해 [`Resolution`]으로 해소한다(spec §5).
@@ -569,11 +703,19 @@ fn read_codex_session(
     freshness: u64,
     scan_days: usize,
 ) -> Resolution {
-    let candidates = find_codex_candidates(base, cwd, now, freshness, scan_days);
-    match candidates.len() {
+    let scan = scan_codex_candidates(base, cwd, now, freshness, scan_days);
+    resolution_from_scan(&scan)
+}
+
+/// 완료된 후보 스캔을 단일/모호/없음 해소 결과로 변환한다.
+fn resolution_from_scan(scan: &CandidateScan) -> Resolution {
+    if scan.fingerprint.budget_exceeded {
+        return Resolution::Ambiguous;
+    }
+    match scan.candidates.len() {
         0 => Resolution::None,
         1 => {
-            let path = &candidates[0];
+            let path = &scan.candidates[0];
             match extract_from_file(path) {
                 Some(session) => Resolution::Single(session, path.clone()),
                 None => Resolution::None,
@@ -596,6 +738,9 @@ struct CodexCacheEntry {
     path: String,
     /// 그 파일의 mtime(epoch ms). 불변이면 재파싱 없이 재사용.
     mtime_ms: u128,
+    /// 단일 후보를 확정했던 시점의 최근 rollout 트리 지문.
+    #[serde(default)]
+    scan_fingerprint: Option<CodexScanFingerprint>,
     /// 캐시된 파싱 결과.
     session: CodexSession,
 }
@@ -640,13 +785,19 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
 
 /// 세션 데이터를 디스크 캐시에서 조회/갱신해 [`CodexSession`]을 반환한다(spec §8 매 틱 로직).
 ///
-/// 1) 캐시 히트 & 경로 mtime 불변 & **파일 mtime freshness 이내** → 재사용(스캔 0, stat 1회).
+/// 1) 캐시 히트 & rollout 트리 지문 불변 & 경로 mtime 불변 & **파일 mtime freshness 이내**
+///    → 재사용(후보 본문 재독해 없음).
 /// 2) 캐시 히트 & mtime 변동 & **파일 mtime freshness 이내** → 그 파일만 tail 재독 → 캐시 갱신.
-/// 3) 미스/경로 stale/**파일 mtime stale**/없음 → 풀 후보스캔 재해소. **Ambiguous는 캐시하지 않는다**.
+/// 3) 미스/트리 지문 변동/경로 stale/**파일 mtime stale**/없음 → 풀 후보스캔 재해소.
+///    **Ambiguous는 캐시하지 않는다**.
 ///
 /// **파일 freshness 재검증(spec §5 일관성)**: 캐시 신선도는 기록 시각 기준이라, 캐시 히트 시
 /// 해소된 파일의 mtime이 여전히 freshness 이내인지([`is_mtime_fresh`]) 추가 검증한다. stale이면
 /// 캐시를 무시하고 (3) 풀 재해소로 떨어진다 — 종료된 세션은 freshness 경과 후 더는 표시되지 않는다.
+///
+/// **모호성 재검증**: 캐시된 파일 자체가 그대로여도 같은 cwd의 새 rollout이 생기면 이전 단일
+/// 후보 판단은 무효다. 최근 rollout 트리 지문이 바뀌면 캐시를 바로 쓰지 않고 후보 스캔을 다시
+/// 수행해 새 모호성을 fail-safe로 반영한다.
 ///
 /// # 반환
 /// 단일 해소 시 `Some(session)`. 모호/없음 시 `None`(무변경 신호).
@@ -668,42 +819,61 @@ fn resolve_with_cache(
     {
         if is_named_cache_fresh(written_ms, now_ms, freshness_secs) {
             if let Ok(entry) = serde_json::from_str::<CodexCacheEntry>(&payload) {
-                let cached_path = PathBuf::from(&entry.path);
-                match file_mtime_ms(&cached_path) {
-                    // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
-                    // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
-                    Some(current_mtime) if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
-                    // (1) 경로 mtime 불변 & fresh → 재사용(stat 1회).
-                    Some(current_mtime) if current_mtime == entry.mtime_ms => {
-                        return Some(entry.session);
-                    }
-                    // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
-                    Some(current_mtime) => {
-                        if let Some(session) = extract_from_file(&cached_path) {
-                            write_cache_entry(
-                                cache_base,
-                                session_key,
-                                &cached_path,
-                                current_mtime,
-                                &session,
-                                now_ms,
-                            );
-                            return Some(session);
+                let current_fingerprint = current_scan_fingerprint(base, scan_days);
+                let fingerprint_stable = entry
+                    .scan_fingerprint
+                    .as_ref()
+                    .map(|cached| cached == &current_fingerprint)
+                    .unwrap_or(false);
+                if fingerprint_stable && !current_fingerprint.budget_exceeded {
+                    let cached_path = PathBuf::from(&entry.path);
+                    match file_mtime_ms(&cached_path) {
+                        // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
+                        // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
+                        Some(current_mtime)
+                            if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
+                        // (1) 트리 지문/경로 mtime 불변 & fresh → 재사용(후보 본문 재독해 없음).
+                        Some(current_mtime) if current_mtime == entry.mtime_ms => {
+                            return Some(entry.session);
                         }
+                        // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
+                        Some(current_mtime) => {
+                            if let Some(session) = extract_from_file(&cached_path) {
+                                write_cache_entry(
+                                    cache_base,
+                                    session_key,
+                                    &cached_path,
+                                    current_mtime,
+                                    &session,
+                                    &current_fingerprint,
+                                    now_ms,
+                                );
+                                return Some(session);
+                            }
+                        }
+                        // 경로 소실 → 풀 재해소로 폴백.
+                        None => {}
                     }
-                    // 경로 소실 → 풀 재해소로 폴백.
-                    None => {}
                 }
             }
         }
     }
 
     // (3) 미스/stale/경로 소실 → 풀 후보스캔 재해소.
-    match read_codex_session(base, cwd, now, freshness, scan_days) {
+    let scan = scan_codex_candidates(base, cwd, now, freshness, scan_days);
+    match resolution_from_scan(&scan) {
         Resolution::Single(session, path) => {
             // 단일 해소만 캐시한다(모호는 비캐시 — TTL 고착 차단).
             if let Some(mtime) = file_mtime_ms(&path) {
-                write_cache_entry(cache_base, session_key, &path, mtime, &session, now_ms);
+                write_cache_entry(
+                    cache_base,
+                    session_key,
+                    &path,
+                    mtime,
+                    &session,
+                    &scan.fingerprint,
+                    now_ms,
+                );
             }
             Some(session)
         }
@@ -722,11 +892,13 @@ fn write_cache_entry(
     path: &Path,
     mtime_ms: u128,
     session: &CodexSession,
+    scan_fingerprint: &CodexScanFingerprint,
     now_ms: u128,
 ) {
     let entry = CodexCacheEntry {
         path: path.to_string_lossy().into_owned(),
         mtime_ms,
+        scan_fingerprint: Some(scan_fingerprint.clone()),
         session: session.clone(),
     };
     if let Ok(payload) = serde_json::to_string(&entry) {
@@ -1240,6 +1412,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 스캔 파일 총량 상한을 넘으면 부분 결과를 단일 후보로 신뢰하지 않고 fail-safe로 저하한다.
+    #[test]
+    fn scan_budget_exceeded_fails_safe() {
+        let base = unique_tmp("scan-budget");
+        let cwd = "/Users/me/projBudget";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        for idx in 0..=MAX_ROLLOUT_SCAN_FILES {
+            let path = day_dir.join(format!("rollout-2026-06-05T20-40-45-{idx:04}.jsonl"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.fingerprint.budget_exceeded,
+            "rollout 파일이 상한을 넘으면 지문에 budget_exceeded가 기록되어야 함"
+        );
+        let resolution = read_codex_session(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(
+            resolution,
+            Resolution::Ambiguous,
+            "부분 스캔으로 단일/없음을 확정하지 않고 enrich 생략 경로로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// AC-X5: codex_exec(비대화형 originator)는 제외된다.
     #[test]
     fn exec_originator_excluded() {
@@ -1543,6 +1743,73 @@ mod tests {
             "정상상태는 캐시 재사용(재스캔 없이 stat 1회)"
         );
         // cache_base 격리로 캐시는 temp 하위에만 존재하므로 실캐시 청소가 불필요하다.
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시 히트라도 같은 cwd의 새 fresh rollout이 생기면 이전 단일 후보를 재사용하지 않는다.
+    ///
+    /// 1회차 단일 후보로 캐시를 채운 뒤 2회차 전에 같은 cwd 후보를 추가한다. 캐시가 rollout
+    /// 트리 지문 변화를 무시하면 stale 단일 세션을 계속 표시하지만, 올바른 동작은 재스캔 후
+    /// Ambiguous로 안전 저하되어 input을 그대로 두는 것이다.
+    #[test]
+    fn cache_hit_rechecks_new_same_cwd_rollout_before_reuse() {
+        let base = unique_tmp("cache-amb");
+        let cache_base = unique_tmp("cache-amb-cache");
+        let cwd = "/Users/me/projCacheAmb";
+        let key = "cache-amb-key";
+        write_rollout(
+            &base,
+            "cacheamb1",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        write_rollout(
+            &base,
+            "cacheamb2",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "새 같은-cwd 후보가 생긴 뒤에는 캐시 재사용 대신 Ambiguous로 안전 저하"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&cache_base);
     }
