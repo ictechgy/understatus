@@ -829,15 +829,13 @@ fn read_first_line_meta_checked(path: &Path) -> Result<Option<SessionMeta>, ()> 
         return Ok(None);
     }
     let has_newline = buf.last() == Some(&b'\n');
-    if !has_newline && bytes_read as u64 >= FIRST_LINE_READ_BYTES {
-        // 상한에 걸린 미완성 JSON은 파싱하지 않는다(부분 라인 신뢰 금지).
+    if !has_newline {
+        // newline으로 완결되지 않은 첫 줄은 길이와 무관하게 부분 라인으로 본다.
         return Err(());
     }
-    if has_newline {
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
         buf.pop();
-        if buf.last() == Some(&b'\r') {
-            buf.pop();
-        }
     }
     let first_line = String::from_utf8_lossy(&buf);
     Ok(parse_session_meta(&first_line))
@@ -1577,6 +1575,45 @@ mod tests {
             0,
             "미완결 과대 첫 줄은 cwd/originator 후보에서 제외"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 회귀: 짧은 첫 줄도 개행으로 완결되지 않았으면 부분 라인으로 보고 fail-safe 처리한다.
+    #[test]
+    fn short_unterminated_first_line_fails_safe() {
+        let base = unique_tmp("short-no-newline");
+        let cwd = "/Users/me/projShortNoNewline";
+        write_rollout(
+            &base,
+            "short-valid",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        let partial_path = day_dir.join("rollout-2026-06-05T20-40-45-short-partial.jsonl");
+        let mut partial = std::fs::File::create(&partial_path).unwrap();
+        write!(partial, "{}", session_meta_line(cwd, "codex-tui")).unwrap();
+        partial.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&partial_path).is_none(),
+            "짧더라도 개행 없는 첫 줄은 legacy API에서 후보 없음으로 보임"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "짧은 미완결 첫 줄도 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "다른 valid 후보가 있어도 부분 라인 rollout이 있으면 fail-safe"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
