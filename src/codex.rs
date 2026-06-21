@@ -584,14 +584,11 @@ fn current_scan_fingerprint(base: &Path, scan_days: usize) -> Option<CodexScanFi
     if recent.budget_exceeded || recent.scan_incomplete {
         return None;
     }
-    let days = recent
-        .dirs
-        .into_iter()
-        .map(|day_dir| CodexDayFingerprint {
-            path: day_dir.to_string_lossy().into_owned(),
-            mtime_ms: file_mtime_ms(&day_dir),
-        })
-        .collect();
+    let mut days = Vec::new();
+    for day_dir in recent.dirs {
+        let day = codex_day_fingerprint_checked(&day_dir).ok()?;
+        days.push(day);
+    }
     Some(CodexScanFingerprint { days })
 }
 
@@ -610,9 +607,15 @@ fn collect_rollout_scan(
     let mut scan_incomplete = recent.scan_incomplete;
 
     for day_dir in recent.dirs {
-        let day = CodexDayFingerprint {
-            path: day_dir.to_string_lossy().into_owned(),
-            mtime_ms: file_mtime_ms(&day_dir),
+        let day = match codex_day_fingerprint_checked(&day_dir) {
+            Ok(day) => day,
+            Err(_) => {
+                scan_incomplete = true;
+                CodexDayFingerprint {
+                    path: day_dir.to_string_lossy().into_owned(),
+                    mtime_ms: None,
+                }
+            }
         };
         if budget_exceeded || scan_incomplete {
             days.push(day);
@@ -662,6 +665,13 @@ fn collect_rollout_scan(
         budget_exceeded,
         scan_incomplete,
     )
+}
+
+fn codex_day_fingerprint_checked(day_dir: &Path) -> std::io::Result<CodexDayFingerprint> {
+    Ok(CodexDayFingerprint {
+        path: day_dir.to_string_lossy().into_owned(),
+        mtime_ms: Some(file_mtime_ms_checked(day_dir)?),
+    })
 }
 
 /// `sessions/<year>/<month>/<day>` 트리에서 최근 `scan_days`개 일자 디렉터리를 내림차순으로 모은다.
@@ -838,7 +848,7 @@ fn read_first_line_meta_checked(path: &Path) -> Result<Option<SessionMeta>, ()> 
         buf.pop();
     }
     let first_line = String::from_utf8_lossy(&buf);
-    Ok(parse_session_meta(&first_line))
+    parse_session_meta(&first_line).map(Some).ok_or(())
 }
 
 /// 후보를 스캔하고 모호성을 판정해 [`Resolution`]으로 해소한다(spec §5).
@@ -1612,6 +1622,45 @@ mod tests {
             read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
             Resolution::Ambiguous,
             "다른 valid 후보가 있어도 부분 라인 rollout이 있으면 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 회귀: 개행은 있어도 session_meta로 파싱되지 않는 첫 줄은 후보 없음이 아니라 불완전 스캔이다.
+    #[test]
+    fn malformed_first_line_fails_safe() {
+        let base = unique_tmp("malformed-first-line");
+        let cwd = "/Users/me/projMalformedFirstLine";
+        write_rollout(
+            &base,
+            "malformed-valid",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        let malformed_path = day_dir.join("rollout-2026-06-05T20-40-45-malformed.jsonl");
+        let mut malformed = std::fs::File::create(&malformed_path).unwrap();
+        writeln!(malformed, "{{not json").unwrap();
+        malformed.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&malformed_path).is_none(),
+            "legacy parser API는 malformed first line을 None으로 노출"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "malformed first line은 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "다른 valid 후보가 있어도 malformed rollout이 있으면 fail-safe"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -2498,6 +2547,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_base);
     }
 
+    /// day directory mtime을 증명할 수 없으면 cache fingerprint도, full scan도 fail-safe 처리한다.
+    #[cfg(unix)]
+    #[test]
+    fn day_dir_mtime_error_invalidates_cache_and_scan() {
+        let base = unique_tmp("cache-day-mtime-error");
+        let cache_base = unique_tmp("cache-day-mtime-error-cache");
+        let cwd = "/Users/me/projCacheDayMtimeError";
+        let key = "cache-day-mtime-error-key";
+        let rollout_path = write_rollout(
+            &base,
+            "daymtime",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        set_file_mtime_before_epoch(&day_dir);
+        assert!(
+            current_scan_fingerprint(&base, 3).is_none(),
+            "day-dir mtime 불확실성은 cache fingerprint 재사용을 금지해야 함"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "day-dir mtime 불확실성은 full scan에서도 scan_incomplete여야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "mtime 불확실성이 있으면 valid 후보가 있어도 fail-safe"
+        );
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "day-dir mtime 불확실성은 cached 단일 세션 재사용 대신 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
     /// M2: 캐시 히트라도 해소된 파일 mtime이 freshness를 넘기면 캐시를 무시하고 재해소한다.
     ///
     /// 캐시 신선도는 기록 시각 기준이라, 세션 종료 후 파일 mtime이 고정돼도 마지막 캐시 write로부터
@@ -2595,5 +2715,24 @@ mod tests {
         unsafe {
             libc::utimes(c_path.as_ptr(), times.as_ptr());
         }
+    }
+
+    /// 파일/디렉터리 mtime을 UNIX_EPOCH 이전으로 설정해 `file_mtime_ms_checked` 실패를 재현한다.
+    #[cfg(unix)]
+    fn set_file_mtime_before_epoch(path: &Path) {
+        let times = [
+            libc::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+        ];
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: 유효한 경로/timeval 포인터로 utimes 호출한다. 테스트 픽스처이므로 실패 시 즉시 실패.
+        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "pre-epoch mtime 설정 실패");
     }
 }
