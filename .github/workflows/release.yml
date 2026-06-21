@@ -33,7 +33,12 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Verify release version contract
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Verify release source contract
         run: node npm/verify-release.js "${TAG#v}"
 
       - name: Rust toolchain (+ target)
@@ -50,6 +55,12 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf understatus-${VERSION}-${{ matrix.target }}.tar.gz understatus
           shasum -a 256 understatus-${VERSION}-${{ matrix.target }}.tar.gz > understatus-${VERSION}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Verify packaged checksum manifest
+        run: |
+          node npm/verify-release.js "${TAG#v}" \
+            --target "${{ matrix.target }}" \
+            --tarball-dir "target/${{ matrix.target }}/release"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3

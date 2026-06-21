@@ -60,6 +60,7 @@ const TARBALL_URL = RELEASE_BASE + TARBALL_NAME;
 // bin 디렉터리 경로
 const BIN_DIR = path.join(__dirname, 'bin');
 const BINARY_PATH = path.join(BIN_DIR, 'understatus');
+const TAR = '/usr/bin/tar';
 
 /**
  * HTTP(S) GET 요청으로 URL에서 데이터를 다운로드합니다.
@@ -136,6 +137,17 @@ function download(url, destPath, maxRedirects = 10) {
  * @param {string} releaseTarget - Rust 타겟 트리플
  * @returns {string} 소문자 16진수 SHA-256 해시
  */
+function removeDirQuietly(dirPath) {
+  if (!dirPath) {
+    return;
+  }
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  } catch (_) {
+    // cleanup best effort
+  }
+}
+
 function expectedChecksum(version, releaseTarget) {
   const releaseChecksums = checksums[version];
   const checksum = releaseChecksums && releaseChecksums[releaseTarget];
@@ -154,7 +166,7 @@ function expectedChecksum(version, releaseTarget) {
  * @returns {string} temp dir 안에 압축 해제된 understatus 바이너리 경로
  */
 function extractValidatedBinary(tarballPath) {
-  const listResult = spawnSync('tar', ['-tzf', tarballPath], {
+  const listResult = spawnSync(TAR, ['-tzf', tarballPath], {
     encoding: 'utf8',
   });
   if (listResult.error) {
@@ -174,26 +186,32 @@ function extractValidatedBinary(tarballPath) {
     );
   }
 
-  const extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-extract-'));
-  const extractResult = spawnSync('tar', ['-xzf', tarballPath, '-C', extractDir, 'understatus'], {
+  const extractDir = fs.mkdtempSync(path.join(BIN_DIR, '.understatus-extract-'));
+  const extractResult = spawnSync(TAR, ['-xzf', tarballPath, '-C', extractDir, 'understatus'], {
     stdio: 'pipe',
     encoding: 'utf8',
   });
   if (extractResult.error) {
-    fs.rmSync(extractDir, { recursive: true, force: true });
+    removeDirQuietly(extractDir);
     throw new Error('tar 압축 해제 오류: ' + extractResult.error.message);
   }
   if (extractResult.status !== 0) {
-    fs.rmSync(extractDir, { recursive: true, force: true });
+    removeDirQuietly(extractDir);
     throw new Error(
       'tar 압축 해제 실패 (종료 코드 ' + extractResult.status + '): ' + extractResult.stderr
     );
   }
 
   const extractedBinary = path.join(extractDir, 'understatus');
-  const stat = fs.lstatSync(extractedBinary);
+  let stat;
+  try {
+    stat = fs.lstatSync(extractedBinary);
+  } catch (err) {
+    removeDirQuietly(extractDir);
+    throw new Error('압축 해제된 understatus를 찾을 수 없습니다: ' + err.message);
+  }
   if (!stat.isFile()) {
-    fs.rmSync(extractDir, { recursive: true, force: true });
+    removeDirQuietly(extractDir);
     throw new Error('압축 해제된 understatus가 regular file이 아닙니다.');
   }
   return extractedBinary;
@@ -225,9 +243,6 @@ async function main() {
     fs.mkdirSync(BIN_DIR, { recursive: true });
   }
 
-  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-download-'));
-  const tarballPath = path.join(downloadDir, TARBALL_NAME);
-
   process.stdout.write('[understatus] 설치 중... (버전 ' + VERSION + ', 타겟 ' + target + ')\n');
 
   // 1단계: npm 패키지에 고정된 SHA-256 체크섬 조회
@@ -239,11 +254,15 @@ async function main() {
     process.exit(1);
   }
 
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-download-'));
+  const tarballPath = path.join(downloadDir, TARBALL_NAME);
+
   // 2단계: tarball 다운로드
   process.stdout.write('[understatus] 바이너리 다운로드 중: ' + TARBALL_URL + '\n');
   try {
     await download(TARBALL_URL, tarballPath);
   } catch (err) {
+    removeDirQuietly(downloadDir);
     process.stderr.write(
       '[understatus] tarball 다운로드 실패:\n  ' + err.message + '\n'
     );
@@ -256,13 +275,13 @@ async function main() {
   try {
     actualHash = await computeSha256(tarballPath);
   } catch (err) {
-    fs.rm(downloadDir, { recursive: true, force: true }, () => {});
+    removeDirQuietly(downloadDir);
     process.stderr.write('[understatus] 체크섬 계산 실패: ' + err.message + '\n');
     process.exit(1);
   }
 
   if (actualHash !== expectedHash) {
-    fs.rm(downloadDir, { recursive: true, force: true }, () => {});
+    removeDirQuietly(downloadDir);
     process.stderr.write(
       '[understatus] SHA-256 체크섬 불일치! 다운로드가 손상되었을 수 있습니다.\n' +
       '  기대값: ' + expectedHash + '\n' +
@@ -280,17 +299,16 @@ async function main() {
   try {
     extractedBinary = extractValidatedBinary(tarballPath);
     fs.renameSync(extractedBinary, BINARY_PATH);
-    fs.rmSync(path.dirname(extractedBinary), { recursive: true, force: true });
+    removeDirQuietly(path.dirname(extractedBinary));
   } catch (err) {
+    if (extractedBinary) {
+      removeDirQuietly(path.dirname(extractedBinary));
+    }
     process.stderr.write('[understatus] 압축 해제 실패: ' + err.message + '\n');
     process.exit(1);
   } finally {
     // tarball 임시 파일 삭제
-    try {
-      fs.rmSync(downloadDir, { recursive: true, force: true });
-    } catch (_) {
-      // 삭제 실패는 무시
-    }
+    removeDirQuietly(downloadDir);
   }
 
   // 5단계: 실행 권한 부여
