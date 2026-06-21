@@ -17,6 +17,12 @@ extern "C" {
     fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
 }
 
+/// 렌더 핫패스에서 허용하는 CPU 더블샘플 대기 상한(ms).
+///
+/// 기본 25ms 동작은 그대로 보존하되, config가 비정상적으로 큰 값을 지정해 statusline 렌더를 오래
+/// 블록하지 못하게 한다. 100ms는 노이즈 완화 여지를 남기면서 한 프레임 지연 예산을 유한하게 만든다.
+const MAX_CPU_SAMPLE_WINDOW_MS: u64 = 100;
+
 /// 한 번의 렌더에서 측정한 시스템 상태 스냅샷.
 ///
 /// 각 항목은 best-effort이며 실패/부재 시 안전 저하한다(배터리는 `Option`).
@@ -123,6 +129,11 @@ fn sample_cpu_loadavg_fallback() -> f64 {
     loadavg_to_percent(loads[0], cpu_count())
 }
 
+/// 사용자 설정 CPU sample window를 렌더 핫패스 예산 안으로 정규화한다.
+fn bounded_cpu_sample_window_ms(sample_window_ms: u64) -> u64 {
+    sample_window_ms.min(MAX_CPU_SAMPLE_WINDOW_MS)
+}
+
 /// 전 코어 busy/total 틱 합계를 담는 한 번의 더블샘플 스냅샷.
 struct CpuTickTotals {
     /// busy 틱(user + system + nice) 전 코어 합.
@@ -197,6 +208,8 @@ fn snapshot_cpu_ticks() -> Option<CpuTickTotals> {
 /// 커널 CPU 틱 델타로 계산한다. 더블샘플 실패 시 loadavg 정규화로 저하하며,
 /// 폴백 공식은 0–100 클램프 `min(load1/hw.ncpu*100, 100)`이다(AC3, 패닉 금지).
 pub fn sample_cpu_reactive(sample_window_ms: u64) -> f64 {
+    let sample_window_ms = bounded_cpu_sample_window_ms(sample_window_ms);
+
     // 1차 스냅샷 → sample_window_ms 만큼 대기 → 2차 스냅샷. 어느 한쪽이라도 실패하면
     // loadavg 폴백으로 저하한다.
     let first = match snapshot_cpu_ticks() {
@@ -760,6 +773,25 @@ mod tests {
     #[test]
     fn loadavg_to_percent_zero_ncpu() {
         assert_eq!(loadavg_to_percent(5.0, 0), 0.0);
+    }
+
+    /// CPU double-sample window는 기본/정상 값은 보존하고 비정상 큰 값만 렌더 예산 안으로 제한한다.
+    #[test]
+    fn cpu_sample_window_is_capped_for_hot_path() {
+        assert_eq!(bounded_cpu_sample_window_ms(0), 0);
+        assert_eq!(bounded_cpu_sample_window_ms(25), 25);
+        assert_eq!(
+            bounded_cpu_sample_window_ms(MAX_CPU_SAMPLE_WINDOW_MS),
+            MAX_CPU_SAMPLE_WINDOW_MS
+        );
+        assert_eq!(
+            bounded_cpu_sample_window_ms(MAX_CPU_SAMPLE_WINDOW_MS + 1),
+            MAX_CPU_SAMPLE_WINDOW_MS
+        );
+        assert_eq!(
+            bounded_cpu_sample_window_ms(u64::MAX),
+            MAX_CPU_SAMPLE_WINDOW_MS
+        );
     }
 
     /// 실측 더블샘플/메모리 경로가 항상 0..=100 범위를 지키는지 무패닉으로 확인한다.

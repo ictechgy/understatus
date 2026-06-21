@@ -22,6 +22,12 @@ mod themes;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
+/// 렌더 핫패스에서 허용하는 stdin 최대 크기.
+///
+/// Claude/lterm/codex statusline payload는 보통 한 줄의 작은 JSON이다. 파이프가 비정상적으로 큰 입력을
+/// 밀어 넣어도 렌더가 무제한 메모리와 chain 전달 비용을 쓰지 않도록 1MiB에서 끊고 빈 입력으로 안전 저하한다.
+const MAX_RENDER_STDIN_BYTES: usize = 1024 * 1024;
+
 /// 진입점: 서브커맨드를 디스패치한다.
 ///
 /// # 반환
@@ -794,9 +800,25 @@ fn run_render_pipeline(source: Source, oneline: bool, surface_format: SurfaceFor
 /// # 반환
 /// stdin 전체 내용. 읽기 실패 시 빈 문자열로 안전 저하한다(파이프라인은 빈 입력에도 무패닉, AC1).
 fn read_stdin() -> String {
-    let mut buffer = String::new();
-    let _ = std::io::stdin().read_to_string(&mut buffer);
-    buffer
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    read_to_string_limited(&mut reader, MAX_RENDER_STDIN_BYTES)
+}
+
+/// `max_bytes`를 초과하지 않는 범위에서 UTF-8 입력을 읽는다.
+///
+/// 초과/읽기 실패/UTF-8 오류는 모두 빈 문자열로 안전 저하한다. 호출부는 빈 입력도 무패닉으로 처리하므로
+/// 악의적·손상 stdin이 렌더 핫패스를 장시간 점유하거나 chain 자식으로 그대로 전파되지 않는다.
+fn read_to_string_limited<R: Read>(reader: &mut R, max_bytes: usize) -> String {
+    let mut bytes = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    if reader.take(limit).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    if bytes.len() > max_bytes {
+        return String::new();
+    }
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// 현재 시각을 UNIX epoch 기준 밀리초(ms)로 반환한다.
@@ -850,6 +872,37 @@ fn print_version() {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// 렌더 stdin 제한 헬퍼는 한도 이하 정상 JSON을 바이트 손실 없이 보존해야 한다.
+    #[test]
+    fn read_to_string_limited_preserves_payload_within_limit() {
+        let mut reader = Cursor::new(br#"{"session_id":"ok"}"#.to_vec());
+        assert_eq!(
+            read_to_string_limited(&mut reader, MAX_RENDER_STDIN_BYTES),
+            r#"{"session_id":"ok"}"#
+        );
+    }
+
+    /// 정확히 한도 크기인 입력은 허용한다(초과 판정 off-by-one 방지).
+    #[test]
+    fn read_to_string_limited_allows_exact_limit() {
+        let mut reader = Cursor::new(b"abcd".to_vec());
+        assert_eq!(read_to_string_limited(&mut reader, 4), "abcd");
+    }
+
+    /// 한도를 1바이트라도 넘으면 부분 JSON을 파싱하지 않고 빈 입력으로 안전 저하한다.
+    #[test]
+    fn read_to_string_limited_rejects_oversize_input() {
+        let mut reader = Cursor::new(b"abcde".to_vec());
+        assert_eq!(read_to_string_limited(&mut reader, 4), "");
+    }
+
+    /// 손상 UTF-8도 파서에 전달하지 않고 빈 입력으로 안전 저하한다.
+    #[test]
+    fn read_to_string_limited_rejects_invalid_utf8() {
+        let mut reader = Cursor::new(vec![0xff, 0xfe, 0xfd]);
+        assert_eq!(read_to_string_limited(&mut reader, 8), "");
+    }
 
     #[test]
     fn has_extra_args_detects_surplus() {
