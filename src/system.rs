@@ -208,20 +208,38 @@ fn snapshot_cpu_ticks() -> Option<CpuTickTotals> {
 /// 커널 CPU 틱 델타로 계산한다. 더블샘플 실패 시 loadavg 정규화로 저하하며,
 /// 폴백 공식은 0–100 클램프 `min(load1/hw.ncpu*100, 100)`이다(AC3, 패닉 금지).
 pub fn sample_cpu_reactive(sample_window_ms: u64) -> f64 {
+    sample_cpu_reactive_with(
+        sample_window_ms,
+        snapshot_cpu_ticks,
+        std::thread::sleep,
+        sample_cpu_loadavg_fallback,
+    )
+}
+
+/// [`sample_cpu_reactive`]의 테스트 가능한 코어.
+///
+/// FFI 스냅샷 함수와 sleeper를 주입해, 라이브 CPU 상태나 wall-clock에 의존하지 않고 sample window cap
+/// 적용과 더블샘플 산식을 검증한다.
+fn sample_cpu_reactive_with(
+    sample_window_ms: u64,
+    mut snapshot: impl FnMut() -> Option<CpuTickTotals>,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut fallback: impl FnMut() -> f64,
+) -> f64 {
     let sample_window_ms = bounded_cpu_sample_window_ms(sample_window_ms);
 
     // 1차 스냅샷 → sample_window_ms 만큼 대기 → 2차 스냅샷. 어느 한쪽이라도 실패하면
     // loadavg 폴백으로 저하한다.
-    let first = match snapshot_cpu_ticks() {
+    let first = match snapshot() {
         Some(snapshot) => snapshot,
-        None => return sample_cpu_loadavg_fallback(),
+        None => return fallback(),
     };
 
-    std::thread::sleep(std::time::Duration::from_millis(sample_window_ms));
+    sleep(std::time::Duration::from_millis(sample_window_ms));
 
-    let second = match snapshot_cpu_ticks() {
+    let second = match snapshot() {
         Some(snapshot) => snapshot,
-        None => return sample_cpu_loadavg_fallback(),
+        None => return fallback(),
     };
 
     // saturating_sub: 카운터 래핑/순서 역전 시 음수 델타를 0으로 방어.
@@ -792,6 +810,41 @@ mod tests {
             bounded_cpu_sample_window_ms(u64::MAX),
             MAX_CPU_SAMPLE_WINDOW_MS
         );
+    }
+
+    /// `sample_cpu_reactive` 코어가 실제 sleep 직전에 cap을 적용해야 한다. helper 단독 테스트만으로는
+    /// 호출부 배선 회귀를 못 잡으므로, 주입형 코어에서 관측된 sleep duration과 산출 CPU%를 함께 검증한다.
+    #[test]
+    fn sample_cpu_reactive_core_applies_capped_sleep() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+
+        let cpu = sample_cpu_reactive_with(
+            u64::MAX,
+            || {
+                calls += 1;
+                match calls {
+                    1 => Some(CpuTickTotals {
+                        busy: 1_000,
+                        total: 2_000,
+                    }),
+                    2 => Some(CpuTickTotals {
+                        busy: 1_050,
+                        total: 2_200,
+                    }),
+                    _ => panic!("CPU snapshot called too many times"),
+                }
+            },
+            |duration| sleeps.push(duration),
+            || panic!("fallback should not be used for successful snapshots"),
+        );
+
+        assert_eq!(calls, 2);
+        assert_eq!(
+            sleeps,
+            vec![std::time::Duration::from_millis(MAX_CPU_SAMPLE_WINDOW_MS)]
+        );
+        assert_eq!(cpu, 25.0, "busy_delta=50,total_delta=200 → 25%");
     }
 
     /// 실측 더블샘플/메모리 경로가 항상 0..=100 범위를 지키는지 무패닉으로 확인한다.

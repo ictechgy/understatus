@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// chain 실행 여부를 stdout으로 직접 관측하기 위한 센티널. chain_command가 도는 경우에만
 /// 자식 stdout에 합성되어 self 세그먼트와 함께 한 줄에 나타난다.
 const CHAIN_SENTINEL: &str = "CHAINSENTINEL";
+/// 프로덕션 `MAX_RENDER_STDIN_BYTES`(src/main.rs)와 동기화된 통합 테스트 상한.
+const RENDER_STDIN_LIMIT_BYTES: usize = 1024 * 1024;
+/// 프로덕션 `MAX_CONFIG_BYTES`(src/config.rs)와 동기화된 통합 테스트 상한.
+const CONFIG_LIMIT_BYTES: usize = 256 * 1024;
 
 /// 병렬 테스트 스레드 간 임시 경로 충돌을 막는 프로세스 전역 단조 카운터.
 ///
@@ -80,6 +84,40 @@ fn run_understatus_with_config(args: &[&str], stdin: &str, config_path: &str) ->
     output.stdout
 }
 
+/// HOME 캐시 루트까지 격리해 understatus를 실행한다.
+fn run_understatus_isolated_home(
+    args: &[&str],
+    stdin: &str,
+    config_path: &str,
+    home: &str,
+) -> Vec<u8> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_understatus"))
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("UNDERSTATUS_CONFIG", config_path)
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("understatus 바이너리 실행 실패");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin 핸들 없음")
+        .write_all(stdin.as_bytes())
+        .expect("stdin 쓰기 실패");
+
+    let output = child.wait_with_output().expect("자식 종료 대기 실패");
+    assert!(
+        output.status.success(),
+        "종료 코드 비정상: {:?}",
+        output.status
+    );
+    output.stdout
+}
+
 /// chain_command가 센티널을 출력하도록 설정한 임시 config.toml을 만들고 그 경로를 반환한다.
 ///
 /// chain 자식은 `sh -c <command>`로 실행되므로 `printf CHAINSENTINEL`이 도는지로 chain
@@ -99,6 +137,27 @@ fn write_chain_config(tag: &str) -> String {
     // [chain] chain_command가 sh -c로 실행된다. 센티널만 출력하는 최소 명령.
     let toml = format!("[chain]\nchain_command = \"printf {CHAIN_SENTINEL}\"\n");
     std::fs::write(&path, toml).expect("임시 config 작성 실패");
+    path.to_string_lossy().into_owned()
+}
+
+/// chain 자식이 전달받은 stdin byte 수를 `LEN:<n>`으로 출력하는 임시 config를 만든다.
+fn write_stdin_len_chain_config(tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "understatus-chain-len-cfg-{}-{tag}.toml",
+        unique_token()
+    ));
+    let command = "bytes=$(wc -c | tr -d ' '); printf 'LEN:%s' \"$bytes\"";
+    let toml = format!(
+        "[chain]\nchain_command = {command:?}\nchain_cache_ttl_seconds = 0\n[display]\nmax_width = 200\nshow_network = false\nshow_disk = false\nshow_battery = false\n"
+    );
+    std::fs::write(&path, toml).expect("stdin 길이 chain config 작성 실패");
+    path.to_string_lossy().into_owned()
+}
+
+/// 테스트별 HOME 캐시 루트를 만든다(chain/pulse/net 캐시 간섭 방지).
+fn make_isolated_home(tag: &str) -> String {
+    let path = std::env::temp_dir().join(format!("understatus-home-{}-{tag}", unique_token()));
+    std::fs::create_dir_all(&path).expect("격리 HOME 생성 실패");
     path.to_string_lossy().into_owned()
 }
 
@@ -132,6 +191,65 @@ fn default_render_has_trailing_newline() {
         text.ends_with('\n'),
         "기본 render는 println!으로 후행 개행이 있어야 함: {text:?}"
     );
+}
+
+/// oversized stdin은 실제 render 공개 경로에서 빈 입력으로 안전 저하하며, chain 자식에 원문을
+/// 전달하지 않아야 한다. helper 단위 테스트를 넘어 `read_stdin()` 배선 회귀를 잡는다.
+#[test]
+fn oversized_stdin_is_not_forwarded_to_chain() {
+    let config = write_stdin_len_chain_config("oversized-stdin");
+    let home = make_isolated_home("oversized-stdin");
+    let oversized = "x".repeat(RENDER_STDIN_LIMIT_BYTES + 1);
+
+    let stdout = run_understatus_isolated_home(&["render"], &oversized, &config, &home);
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+
+    assert!(
+        text.contains("LEN:0"),
+        "oversized stdin은 빈 raw_stdin으로 chain에 전달되어야 함: {text:?}"
+    );
+    assert!(
+        !text.contains(&format!("LEN:{}", RENDER_STDIN_LIMIT_BYTES + 1)),
+        "oversized 원문 길이가 chain에 노출되면 안 됨: {text:?}"
+    );
+
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// oversized config는 `UNDERSTATUS_CONFIG`를 통한 실제 render 공개 경로에서도 파싱되지 않고 기본값으로
+/// 저하해야 한다. 만약 unbounded read로 회귀하면 chain sentinel이 출력되어 이 테스트가 실패한다.
+#[test]
+fn oversized_config_is_ignored_by_render_path() {
+    let path = std::env::temp_dir().join(format!(
+        "understatus-oversized-render-cfg-{}.toml",
+        unique_token()
+    ));
+    let mut toml = format!("[chain]\nchain_command = \"printf {CHAIN_SENTINEL}\"\n#");
+    toml.push_str(&"x".repeat(CONFIG_LIMIT_BYTES + 1));
+    std::fs::write(&path, toml).expect("oversized config 작성 실패");
+    let config = path.to_string_lossy().into_owned();
+    let home = make_isolated_home("oversized-config");
+
+    let stdout = run_understatus_isolated_home(
+        &["render"],
+        r#"{"session_id":"oversized-config"}"#,
+        &config,
+        &home,
+    );
+    let text = String::from_utf8(stdout).expect("stdout는 UTF-8이어야 함");
+
+    assert!(
+        !text.contains(CHAIN_SENTINEL),
+        "oversized config는 파싱되지 않아 chain_command가 실행되면 안 됨: {text:?}"
+    );
+    assert!(
+        text.contains('%'),
+        "기본 설정 렌더는 계속 성공해야 함: {text:?}"
+    );
+
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// --oneline은 chain을 수행하지 않는다(실제 chain_command 설정 상태에서 직접 증명).
