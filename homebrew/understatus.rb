@@ -16,7 +16,6 @@
 class Understatus < Formula
   desc "Claude Code statusline addon: CPU/memory/session info with pulse glyphs"
   homepage "https://github.com/ictechgy/understatus"
-  version "0.7.1"
   license "MIT"
 
   # understatus uses macOS-only APIs (host_processor_info, sysctl, IOKit FFI).
