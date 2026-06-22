@@ -16,7 +16,7 @@ Most statusline widgets are noisy. understatus is designed around one principle:
 
 > **macOS only.** Apple Silicon (arm64) + Intel (x86\_64). Linux is not supported.
 >
-> **No Xcode required for the prebuilt paths.** Homebrew and npm install a **prebuilt binary** (deployment target macOS 11.0), so they need **no Xcode Command Line Tools and no Rust toolchain**, and run on **macOS 11 (Big Sur) and newer**. Only `cargo install` / building from source compiles locally and therefore needs the Rust toolchain + Command Line Tools.
+> **No Xcode required for the prebuilt paths.** Homebrew and npm install **prebuilt binaries** (deployment target macOS 11.0), so they need **no Xcode Command Line Tools and no Rust toolchain**, and run on **macOS 11 (Big Sur) and newer**. Only `cargo install` / building from source compiles locally and therefore needs the Rust toolchain + Command Line Tools.
 
 ---
 
@@ -237,7 +237,7 @@ All keys are optional; omitting a key uses its default.
 | `[display] show_disk` | `true` | Show disk usage via `statfs("/")`. |
 | `[display] show_network` | `true` | Show network throughput (getifaddrs counter delta). First render has no delta — omitted silently. |
 | `[display] show_rate_limit` | `true` | Show Claude Code 5h/weekly rate-limit usage when `rate_limits` is present in stdin. Codex 5h/wk usage is shown from Codex session enrichment when available. |
-| `[display] rate_limit_warn_threshold` | unset | Optional percent threshold. When set, Claude rate-limit values at or above the threshold are tinted with the critical color. |
+| `[display] rate_limit_warn_threshold` | not set | Optional percent threshold. When set, Claude rate-limit values at or above the threshold are tinted with the critical color. |
 | `[color] mode` | `"auto"` | `"auto"` \| `"truecolor"` \| `"256"` \| `"none"`. Respects `NO_COLOR`. |
 | `[color] band_tints` | see below | Five hex colors for idle→critical glyph tint. Filled by the active theme; override by writing this key explicitly. |
 | `[color] pulse_palette` | `["#b87848","#7a5030"]` | High/low brightness endpoints for the breath animation. Filled by the active theme; override by writing this key explicitly. |
@@ -267,8 +267,8 @@ Claude Code  (every refreshInterval seconds)
    │  stdin: one JSON line
    ▼
 understatus binary  (new process per call — no daemon, no state files, no locks)
-   ├─ read stdin (bounded to 1 MiB) → parse into ClaudeInput/lterm payload
-   ├─ load config (bounded to 256 KiB; invalid/oversized = defaults)
+   ├─ read bounded stdin (1 MiB) → parse into ClaudeInput/lterm payload
+   ├─ load bounded config (256 KiB; invalid/oversized = defaults)
    ├─ optional Codex enrich (`--source lterm|codex`, bounded ~/.codex scan)
    ├─ double-sample CPU  → cpu_percent (0–100%, average across all cores)
    │     on failure → loadavg fallback: min(load1 / ncpu × 100, 100)
@@ -306,7 +306,7 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 Examples:
 
 ```bash
-# lterm/codex-free tmux-style one-line text
+# Codex tmux-style one-line text
 printf '{"agent":"codex","cwd":"%s"}' "$PWD" | understatus render --source codex --oneline
 
 # lterm cmux native status pills (JSON, no ANSI)
@@ -322,7 +322,7 @@ For tmux status bars, prefer `color.mode = "none"` and let tmux apply its own `#
 
 - **macOS only.** Uses `host_processor_info`, `host_statistics64`, and `IOPSCopyPowerSourcesInfo` — all macOS-specific APIs.
 - **Apple Silicon (arm64) + Intel (x86\_64).** Tested on macOS arm64 with a 12-core Apple Silicon chip.
-- Linux: builds may succeed, but CPU double-sampling degrades silently to loadavg fallback. Not a supported target.
+- Linux: builds may succeed, but understatus is not a supported Linux target; macOS-specific metrics may degrade or be omitted.
 - **Rust edition 2021, MSRV 1.75+.**
 
 ---
@@ -342,8 +342,8 @@ macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리
 - **9종 테마** — `calm`(기본), `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. 테마는 8개 시각 키(글리프·색상 등)를 한 번에 설정하며, 개별 키를 config.toml에 명시하면 테마보다 우선합니다.
 - **COLOR-ONCE 원칙** — 색은 글리프 문자에만 적용. 숫자 값(CPU%, 비용 등)은 항상 무색.
 - **≥90% 호흡** — CPU가 90% 이상으로 유지되면 임계 밴드 글리프가 테라코타 명도로 천천히 숨쉽니다(hue 변화 없음). 부드러운 애니메이션에는 `pulse_period / interval_seconds >= 6` 조건이 필요하며, 위반 시 설치 시점에 경고가 출력됩니다.
-- **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격) 직접 측정. loadavg 아님.
-- **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원.
+- **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격)을 직접 측정합니다. loadavg가 아닙니다.
+- **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원합니다.
 - **세션 캐시 격리** — 체인 출력·펄스 상태·네트워크 델타 캐시는 `session_id`별로 분리되어 여러 터미널을 동시에 열어도 값이 섞이지 않습니다. 배터리는 머신 전역.
 - **Claude rate-limit 표시** — Claude Code stdin에 `rate_limits`가 들어오면 5h/weekly 사용률과 리셋 카운트다운을 네트워크 호출 없이 표시합니다.
 - **lterm/cmux·Codex 경로** — `--source lterm --surface-format cmux-status`는 cmux pill JSON을 출력하고, `--source codex --oneline`은 tmux 같은 수동 status integration에서 `~/.codex`를 best-effort로 보강합니다.
@@ -388,7 +388,7 @@ understatus themes         # 사용 가능한 테마 목록
 
 | 이름 | 글리프 램프 (idle → crit) | 설명 |
 |------|--------------------------|------|
-| `calm` | `○ ▁ ▄ ▆ ◆` | 차가운 blue-grey + 테라코타 호흡 (기본) |
+| `calm` | `○ ▁ ▄ ▆ ◆` | 차분한 blue-grey + 테라코타 호흡 (기본) |
 | `mono` | `○ ▁ ▄ ▆ ◆` | 무채색, 제로 색상 |
 | `vivid` | `░ ▒ ▓ █ █` | 신호등 색 + 블록 글리프 |
 | `ember` | `· ∙ • ● ◉` | 따뜻한 앰버/테라코타 단색 + 도트 글리프 |
@@ -411,7 +411,7 @@ CPU가 `pulse_on_threshold`(기본 90%) 이상이면 임계 밴드 글리프가 
 
 화려한 테마 기본: `neon`·`spectrum` = `hue`, `aurora`·`sunset` = `flash`. 기존 5종은 모두 `calm`. 개별 키로 재정의 가능.
 
-펄스가 OFF(CPU < `pulse_off_threshold`)이면 스타일과 무관하게 정적 밴드 틴트로 표시됩니다 (애니메이션 없음).
+펄스가 OFF(CPU < `pulse_off_threshold`)이면 스타일과 무관하게 정적 밴드 틴트로 표시됩니다(애니메이션 없음).
 
 ```toml
 # ~/.config/understatus/config.toml
