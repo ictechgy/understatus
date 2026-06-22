@@ -1,0 +1,6 @@
+{
+  "0.7.0": {
+    "aarch64-apple-darwin": "2ed437c931caec6b5d150a866c3e5b9a4dcfb3df3a6af1288b9280c5a3baf757",
+    "x86_64-apple-darwin": "1de3816c372ab8f3a69dc55e9a624bbf9c52a76d95938913b84c2866b72771a0"
+  }
+}

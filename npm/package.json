@@ -5,13 +5,20 @@
   "bin": {
     "understatus": "bin/understatus.js"
   },
-  "os": ["darwin"],
-  "cpu": ["arm64", "x64"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node test-verify-release.js && node test-install.js"
   },
   "files": [
     "install.js",
+    "checksums.json",
     "bin/understatus.js",
     "README.md"
   ],

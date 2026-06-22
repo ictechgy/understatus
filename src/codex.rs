@@ -8,7 +8,8 @@
 //! 설계 원칙(spec §2):
 //! 1. fail-safe + "모호한 성공도 실패로 취급"(잘못된 세션을 자신 있게 표시하는 fail-wrong 금지).
 //! 2. 디스크 I/O·스캔·tail은 본 모듈에 격리(claude.rs::parse_lterm_input은 순수 유지).
-//! 3. 바운디드 비용: 전체 파싱 금지(head 16KB + tail 256KB), 디스크 캐시로 정상상태 stat 1회.
+//! 3. 바운디드 비용: 전체 파싱 금지(head 16KB + tail 256KB), 디스크 캐시로 정상상태는
+//!    최근 일자 디렉터리 mtime + 캐시 경로 stat만 확인.
 //! 4. opt-out: `[codex] enabled=false`면 `~/.codex` 일절 안 읽음.
 //! 5. 모든 필드 lenient(Option): 부재/타입 드리프트/cli_version 변동 시 무패닉 → 세그먼트 생략.
 
@@ -20,7 +21,7 @@ use crate::claude::ClaudeInput;
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,17 @@ const FIRST_LINE_READ_BYTES: u64 = 128 * 1024;
 /// tail(뒷부분) 읽기 상한. 마지막 token_count + 최신 turn_context용(실측 gap max 14KB,
 /// 단일 라인 max 132KB → 256KB 안전마진, spec §8.1).
 const TAIL_READ_BYTES: u64 = 256 * 1024;
+/// 최근 일자 디렉터리에서 한 번의 해소가 검사할 디렉터리 엔트리 총량 상한.
+///
+/// 상한을 넘기면 단일 후보를 확정하지 않고 fail-safe(ambiguous와 동일하게 enrich 생략)로
+/// 저하한다. 그래야 큰 `sessions` 트리에서 statusline hot path가 무한히 파일을 stat/read하지
+/// 않고, 부분 스캔으로 잘못된 단일 세션을 표시하는 fail-wrong도 피한다.
+const MAX_CODEX_SCAN_ENTRIES: usize = 1024;
+/// `sessions/<year>/<month>/<day>` discovery에서 한 디렉터리 레벨마다 검사할 엔트리 상한.
+///
+/// 후보 파일 스캔 예산 전에 year/month/day discovery가 거대한 가짜 트리에 끌려가지 않도록
+/// 별도 상한을 둔다. 초과 시 단일 후보를 확정하지 않고 fail-safe로 저하한다.
+const MAX_CODEX_DATE_DIR_ENTRIES: usize = 512;
 /// 디스크 캐시 파일명(세션별 격리, chain.rs 인프라 재사용, spec §8).
 const CODEX_CACHE_FILE: &str = "codex_session";
 /// 대화형(TUI) originator 화이트리스트 prefix. `codex_exec` 등 비대화형은 제외(spec §5).
@@ -83,6 +95,56 @@ pub enum Resolution {
     Ambiguous,
     /// 후보 없음: enrich 생략.
     None,
+}
+
+/// 후보 스캔 결과와 캐시 재사용 안전성을 판정하기 위한 최근 rollout 트리 지문.
+#[derive(Debug, Clone, PartialEq)]
+struct CandidateScan {
+    /// cwd/originator/freshness 선필터를 통과한 후보.
+    candidates: Vec<PathBuf>,
+    /// 현재는 stale이라 후보에서 제외됐지만 cwd/originator가 같은 rollout. 나중에 fresh가
+    /// 되면 기존 단일 캐시를 재사용하면 안 되므로 cache hit에서 감시한다.
+    stale_same_cwd_rollouts: Vec<WatchedRollout>,
+    /// 최근 일자 디렉터리 mtime 지문.
+    fingerprint: CodexScanFingerprint,
+    /// `MAX_CODEX_SCAN_ENTRIES`를 초과해 전체 후보 유일성을 증명할 수 없는 상태.
+    budget_exceeded: bool,
+    /// read_dir/metadata 실패로 scan view가 완전하지 않은 상태.
+    scan_incomplete: bool,
+}
+
+struct RecentDayDirs {
+    dirs: Vec<PathBuf>,
+    budget_exceeded: bool,
+    scan_incomplete: bool,
+}
+
+struct BoundedSubdirs {
+    dirs: Vec<PathBuf>,
+    budget_exceeded: bool,
+    scan_incomplete: bool,
+}
+
+/// 캐시된 단일 후보가 여전히 "유일한 후보"인지 재검증하기 위한 경량 일자 지문.
+///
+/// 캐시 히트마다 rollout 파일들을 다시 순회하지는 않고, 최근 일자 디렉터리 mtime만 확인해
+/// 새 rollout 생성/삭제를 감지한다. 지문이 바뀌면 캐시를 바로 재사용하지 않고 후보 스캔으로
+/// 모호성을 다시 판정한다. 기존 stale 동일-cwd rollout이 fresh로 바뀌는 경우는 별도 watch-list로
+/// 감지한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexScanFingerprint {
+    days: Vec<CodexDayFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexDayFingerprint {
+    path: String,
+    mtime_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WatchedRollout {
+    path: String,
 }
 
 /// session_meta(첫 줄)에서 추출한 매칭 근거.
@@ -282,16 +344,24 @@ fn is_interactive_originator(originator: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// cwd 비교용 정규화. 존재 경로는 canonicalize하고, 부재 경로는 trailing slash만 제거한다.
+fn normalize_cwd_for_match(cwd: &str) -> PathBuf {
+    std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd.trim_end_matches('/')))
+}
+
+/// 반복 후보 스캔에서 target cwd canonicalize를 매 후보마다 반복하지 않기 위한 비교 헬퍼.
+fn cwd_matches_normalized(candidate_cwd: &str, normalized_target_cwd: &Path) -> bool {
+    normalize_cwd_for_match(candidate_cwd) == normalized_target_cwd
+}
+
 /// 두 cwd 문자열이 같은 디렉터리를 가리키는지 비교한다(정규화: canonicalize 실패 시 trim 비교).
 ///
 /// 외부 입력(payload.cwd)은 **비교에만** 쓰고 파일경로 구성엔 쓰지 않는다(traversal 무관, spec §5).
 /// trailing slash 등 표기 차이를 흡수하기 위해 canonicalize를 시도하고, 실패(부재 경로 등) 시
 /// trim된 문자열 동치로 폴백한다.
+#[cfg(test)]
 fn cwd_matches(candidate_cwd: &str, target_cwd: &str) -> bool {
-    let normalize = |p: &str| -> PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p.trim_end_matches('/')))
-    };
-    normalize(candidate_cwd) == normalize(target_cwd)
+    cwd_matches_normalized(candidate_cwd, &normalize_cwd_for_match(target_cwd))
 }
 
 // ============================== 발견/IO(spec §5/§8.1) ==============================
@@ -425,6 +495,7 @@ fn extract_from_file(path: &Path) -> Option<CodexSession> {
 /// # 반환
 /// 부합 후보 경로들. 1) 최근 scan_days 일자만(전체 4400+ 회피) 2) mtime freshness 선필터
 /// 3) 첫 줄 cwd 정규화 일치 AND originator 화이트리스트. 외부 cwd는 비교에만 사용한다.
+#[cfg(test)]
 fn find_codex_candidates(
     base: &Path,
     cwd: &str,
@@ -432,128 +503,347 @@ fn find_codex_candidates(
     freshness: u64,
     scan_days: usize,
 ) -> Vec<PathBuf> {
-    let sessions_dir = base.join("sessions");
-    let day_dirs = recent_day_dirs(&sessions_dir, scan_days);
+    scan_codex_candidates(base, cwd, now, freshness, scan_days).candidates
+}
 
+/// 후보 스캔 + rollout 트리 지문 계산을 한 번에 수행한다.
+///
+/// 지문은 캐시 히트 시 새 rollout 추가/삭제 여부를 확인하는 데 쓰이고, `budget_exceeded`
+/// 는 부분 스캔으로 단일 후보를 확정하지 않도록 fail-safe 판정에 쓰인다.
+fn scan_codex_candidates(
+    base: &Path,
+    cwd: &str,
+    now: SystemTime,
+    freshness: u64,
+    scan_days: usize,
+) -> CandidateScan {
+    let (rollout_paths, fingerprint, budget_exceeded, mut scan_incomplete) =
+        collect_rollout_scan(base, scan_days, true);
     let freshness_secs = freshness.saturating_mul(60);
+    let normalized_target_cwd = normalize_cwd_for_match(cwd);
     let mut candidates = Vec::new();
-    for day_dir in day_dirs {
-        let entries = match std::fs::read_dir(&day_dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+    let mut stale_same_cwd_rollouts = Vec::new();
+
+    if budget_exceeded || scan_incomplete {
+        return CandidateScan {
+            candidates,
+            stale_same_cwd_rollouts,
+            fingerprint,
+            budget_exceeded,
+            scan_incomplete,
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_rollout_file(&path) {
-                continue;
+    }
+
+    for path in rollout_paths {
+        // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
+        // stale 동일-cwd 파일도 기록해 둔다. 기존 파일 append는 day-dir mtime을 바꾸지 않을 수 있어,
+        // 나중에 fresh가 됐을 때 캐시 히트가 새 모호성을 놓치지 않도록 하기 위함이다.
+        let fresh = match is_fresh_checked(&path, now, freshness_secs) {
+            Ok(fresh) => fresh,
+            Err(_) => {
+                scan_incomplete = true;
+                break;
             }
-            // (2) cheap stat 선필터: mtime이 freshness 이내인 후보만.
-            if !is_fresh(&path, now, freshness_secs) {
-                continue;
-            }
-            // (3) 첫 줄 session_meta만 읽어 cwd 일치 + 대화형 originator를 확인한다.
-            if let Some(meta) = read_first_line_meta(&path) {
+        };
+        match read_first_line_meta_checked(&path) {
+            Ok(Some(meta)) => {
                 let cwd_ok = meta
                     .cwd
                     .as_deref()
-                    .map(|c| cwd_matches(c, cwd))
+                    .map(|c| cwd_matches_normalized(c, &normalized_target_cwd))
                     .unwrap_or(false);
                 let originator_ok = is_interactive_originator(meta.originator.as_deref());
-                if cwd_ok && originator_ok {
+                if fresh && cwd_ok && originator_ok {
                     candidates.push(path);
+                } else if !fresh && cwd_ok && originator_ok {
+                    stale_same_cwd_rollouts.push(WatchedRollout {
+                        path: path.to_string_lossy().into_owned(),
+                    });
                 }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                scan_incomplete = true;
+                break;
             }
         }
     }
-    candidates
+    CandidateScan {
+        candidates,
+        stale_same_cwd_rollouts,
+        fingerprint,
+        budget_exceeded,
+        scan_incomplete,
+    }
+}
+
+/// 후보 본문/파일 엔트리를 읽지 않고 최근 일자 디렉터리의 캐시 검증용 지문만 계산한다.
+fn current_scan_fingerprint(base: &Path, scan_days: usize) -> Option<CodexScanFingerprint> {
+    let (_rollout_paths, fingerprint, budget_exceeded, scan_incomplete) =
+        collect_rollout_scan(base, scan_days, false);
+    if budget_exceeded || scan_incomplete {
+        return None;
+    }
+    Some(fingerprint)
+}
+
+/// 최근 일자 디렉터리의 rollout 파일 경로(선택)와 스캔 지문을 수집한다.
+fn collect_rollout_scan(
+    base: &Path,
+    scan_days: usize,
+    collect_paths: bool,
+) -> (Vec<PathBuf>, CodexScanFingerprint, bool, bool) {
+    let sessions_dir = base.join("sessions");
+    let recent = recent_day_dirs(&sessions_dir, scan_days);
+    let mut rollout_paths = Vec::new();
+    let mut days = Vec::new();
+    let mut entries_seen = 0usize;
+    let mut budget_exceeded = recent.budget_exceeded;
+    let mut scan_incomplete = recent.scan_incomplete;
+
+    for day_dir in recent.dirs {
+        let day = match codex_day_fingerprint_checked(&day_dir) {
+            Ok(day) => day,
+            Err(_) => {
+                scan_incomplete = true;
+                CodexDayFingerprint {
+                    path: day_dir.to_string_lossy().into_owned(),
+                    mtime_ms: None,
+                }
+            }
+        };
+        if budget_exceeded || scan_incomplete {
+            days.push(day);
+            break;
+        }
+        let entries = match std::fs::read_dir(&day_dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                scan_incomplete = true;
+                days.push(day);
+                break;
+            }
+        };
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(_) => {
+                    scan_incomplete = true;
+                    break;
+                }
+            };
+            if entries_seen >= MAX_CODEX_SCAN_ENTRIES {
+                budget_exceeded = true;
+                break;
+            }
+            entries_seen += 1;
+
+            let path = entry.path();
+            match is_rollout_file(&path) {
+                Ok(true) if collect_paths => rollout_paths.push(path),
+                Ok(_) => {}
+                Err(_) => {
+                    scan_incomplete = true;
+                    break;
+                }
+            }
+        }
+        days.push(day);
+        if budget_exceeded || scan_incomplete {
+            break;
+        }
+    }
+
+    (
+        rollout_paths,
+        CodexScanFingerprint { days },
+        budget_exceeded,
+        scan_incomplete,
+    )
+}
+
+fn codex_day_fingerprint_checked(day_dir: &Path) -> std::io::Result<CodexDayFingerprint> {
+    Ok(CodexDayFingerprint {
+        path: day_dir.to_string_lossy().into_owned(),
+        mtime_ms: Some(file_mtime_ms_checked(day_dir)?),
+    })
 }
 
 /// `sessions/<year>/<month>/<day>` 트리에서 최근 `scan_days`개 일자 디렉터리를 내림차순으로 모은다.
 ///
 /// 연도 desc → 월 desc → 일 desc로 정렬해 최신부터 `scan_days`개만 취한다(전체 풀스캔 회피, spec §5).
 /// 폴더는 세션 시작시각 기준이라 scan_days 밖 장기 활성 세션은 미발견(알려진 한계, spec §10 S1).
-fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> Vec<PathBuf> {
+fn recent_day_dirs(sessions_dir: &Path, scan_days: usize) -> RecentDayDirs {
     let mut result = Vec::new();
     if scan_days == 0 {
-        return result;
+        return RecentDayDirs {
+            dirs: result,
+            budget_exceeded: false,
+            scan_incomplete: false,
+        };
     }
     // 연도 디렉터리 내림차순.
-    for year_dir in sorted_subdirs_desc(sessions_dir) {
-        for month_dir in sorted_subdirs_desc(&year_dir) {
-            for day_dir in sorted_subdirs_desc(&month_dir) {
+    let year_dirs = sorted_subdirs_desc_bounded(sessions_dir);
+    if year_dirs.budget_exceeded || year_dirs.scan_incomplete {
+        return RecentDayDirs {
+            dirs: result,
+            budget_exceeded: year_dirs.budget_exceeded,
+            scan_incomplete: year_dirs.scan_incomplete,
+        };
+    }
+    for year_dir in year_dirs.dirs {
+        let month_dirs = sorted_subdirs_desc_bounded(&year_dir);
+        if month_dirs.budget_exceeded || month_dirs.scan_incomplete {
+            return RecentDayDirs {
+                dirs: result,
+                budget_exceeded: month_dirs.budget_exceeded,
+                scan_incomplete: month_dirs.scan_incomplete,
+            };
+        }
+        for month_dir in month_dirs.dirs {
+            let day_dirs = sorted_subdirs_desc_bounded(&month_dir);
+            if day_dirs.budget_exceeded || day_dirs.scan_incomplete {
+                return RecentDayDirs {
+                    dirs: result,
+                    budget_exceeded: day_dirs.budget_exceeded,
+                    scan_incomplete: day_dirs.scan_incomplete,
+                };
+            }
+            for day_dir in day_dirs.dirs {
                 result.push(day_dir);
                 if result.len() >= scan_days {
-                    return result;
+                    return RecentDayDirs {
+                        dirs: result,
+                        budget_exceeded: false,
+                        scan_incomplete: false,
+                    };
                 }
             }
         }
     }
-    result
+    RecentDayDirs {
+        dirs: result,
+        budget_exceeded: false,
+        scan_incomplete: false,
+    }
 }
 
 /// 디렉터리의 하위 디렉터리를 이름 내림차순으로 반환한다(`2026` > `2025`, `06` > `05`).
 ///
 /// 이름이 zero-padded 날짜(`06`/`05`/`30`)라 문자열 desc 정렬이 곧 시간 desc와 일치한다.
-fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
+fn sorted_subdirs_desc_bounded(dir: &Path) -> BoundedSubdirs {
     let mut subdirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(_) => return Vec::new(),
+        Ok(entries) => {
+            let mut subdirs = Vec::new();
+            for (entries_seen, entry_result) in entries.enumerate() {
+                if entries_seen >= MAX_CODEX_DATE_DIR_ENTRIES {
+                    return BoundedSubdirs {
+                        dirs: Vec::new(),
+                        budget_exceeded: true,
+                        scan_incomplete: false,
+                    };
+                }
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        return BoundedSubdirs {
+                            dirs: Vec::new(),
+                            budget_exceeded: false,
+                            scan_incomplete: true,
+                        };
+                    }
+                };
+                let path = entry.path();
+                match path.metadata() {
+                    Ok(meta) if meta.is_dir() => subdirs.push(path),
+                    Ok(_) => {}
+                    Err(_) => {
+                        return BoundedSubdirs {
+                            dirs: Vec::new(),
+                            budget_exceeded: false,
+                            scan_incomplete: true,
+                        };
+                    }
+                }
+            }
+            subdirs
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => {
+            return BoundedSubdirs {
+                dirs: Vec::new(),
+                budget_exceeded: false,
+                scan_incomplete: true,
+            };
+        }
     };
     // 이름 내림차순(최신 우선). file_name 기준으로 비교한다.
     subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    subdirs
+    BoundedSubdirs {
+        dirs: subdirs,
+        budget_exceeded: false,
+        scan_incomplete: false,
+    }
 }
 
 /// 경로가 `rollout-*.jsonl` 형식인지 판정한다.
-fn is_rollout_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
+fn is_rollout_file(path: &Path) -> std::io::Result<bool> {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name,
-        None => return false,
+        None => return Ok(false),
     };
-    name.starts_with("rollout-") && name.ends_with(".jsonl")
+    if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+        return Ok(false);
+    }
+    path.metadata().map(|meta| meta.is_file())
 }
 
-/// 파일 mtime이 `now`로부터 `freshness_secs` 이내인지 판정한다(cheap stat 선필터).
-///
-/// 시계 이상/메타데이터 부재 시 보수적으로 `false`(제외). 미래 mtime(now보다 나중)은 fresh로 본다.
-fn is_fresh(path: &Path, now: SystemTime, freshness_secs: u64) -> bool {
-    let modified = match path.metadata().and_then(|m| m.modified()) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
+/// 파일 freshness의 fallible variant. 후보 스캔에서는 stat/mtime 실패를 단순 stale로 숨기지 않고
+/// scan_incomplete로 전파해 fail-safe Ambiguous로 저하시킨다.
+fn is_fresh_checked(path: &Path, now: SystemTime, freshness_secs: u64) -> std::io::Result<bool> {
+    let modified = path.metadata().and_then(|m| m.modified())?;
     match now.duration_since(modified) {
         // mtime이 과거: 경과가 freshness 이내면 fresh.
-        Ok(elapsed) => elapsed.as_secs() <= freshness_secs,
+        Ok(elapsed) => Ok(elapsed.as_secs() <= freshness_secs),
         // mtime이 미래(now보다 나중): 동시 쓰기 등 → fresh로 본다.
-        Err(_) => true,
+        Err(_) => Ok(true),
     }
 }
 
 /// rollout 파일의 첫 줄(session_meta)만 읽어 cwd/originator를 파싱한다(매칭 선필터용).
 ///
 /// 첫 줄은 inline `base_instructions` 때문에 실측 ~33KB에 달하므로([`FIRST_LINE_READ_BYTES`]
-/// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. 개행 미발견(상한 내
-/// 첫 줄 미완결)이면 부분 JSON을 파싱하지 않고 `None`(무패닉, 보수적 제외). 읽기/파싱 실패도 `None`.
+/// 참조), 그 상한까지 읽되 **개행으로 완결된 첫 줄이 잡힐 때만** 파싱한다. legacy bool API는
+/// 읽기/상한 실패를 `None`으로 숨기지만, 후보 스캔은 fallible variant로 scan_incomplete를 보존한다.
+#[cfg(test)]
 fn read_first_line_meta(path: &Path) -> Option<SessionMeta> {
-    let mut file = File::open(path).ok()?;
-    // 첫 줄은 base_instructions로 커지므로(실측 ~33KB) 별도의 넉넉한 상한까지 읽는다.
-    let mut buf = vec![0u8; FIRST_LINE_READ_BYTES as usize];
-    read_exact_lossy(&mut file, &mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    // 개행으로 완결된 첫 줄만 신뢰한다(부분 라인 파싱 금지). 파일 전체가 한 줄(개행 부재)이고
-    // 상한 미만이면 그 전체를 첫 줄로 본다(작은 파일 안전 처리).
-    let first_line = match text.split_once('\n') {
-        Some((line, _)) => line,
-        None => text.as_ref(),
-    };
-    parse_session_meta(first_line)
+    read_first_line_meta_checked(path).ok().flatten()
+}
+
+/// [`read_first_line_meta`]의 fallible variant. 파일 IO 실패 또는 상한 안에 완결 개행이 없는
+/// partial 첫 줄은 후보 없음으로 숨기지 않고 scan_incomplete로 전파한다.
+fn read_first_line_meta_checked(path: &Path) -> Result<Option<SessionMeta>, ()> {
+    let file = File::open(path).map_err(|_| ())?;
+    let reader = BufReader::new(file);
+    // `read_until`은 개행을 만날 때까지만 버퍼를 키운다. 이전처럼 후보마다 고정 128KiB를
+    // 선할당하지 않으므로 다수 후보 스캔에서 불필요한 메모리 churn을 줄인다.
+    let mut limited = reader.take(FIRST_LINE_READ_BYTES);
+    let mut buf = Vec::with_capacity(4 * 1024);
+    let bytes_read = limited.read_until(b'\n', &mut buf).map_err(|_| ())?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+    let has_newline = buf.last() == Some(&b'\n');
+    if !has_newline {
+        // newline으로 완결되지 않은 첫 줄은 길이와 무관하게 부분 라인으로 본다.
+        return Err(());
+    }
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let first_line = String::from_utf8_lossy(&buf);
+    parse_session_meta(&first_line).map(Some).ok_or(())
 }
 
 /// 후보를 스캔하고 모호성을 판정해 [`Resolution`]으로 해소한다(spec §5).
@@ -569,11 +859,19 @@ fn read_codex_session(
     freshness: u64,
     scan_days: usize,
 ) -> Resolution {
-    let candidates = find_codex_candidates(base, cwd, now, freshness, scan_days);
-    match candidates.len() {
+    let scan = scan_codex_candidates(base, cwd, now, freshness, scan_days);
+    resolution_from_scan(&scan)
+}
+
+/// 완료된 후보 스캔을 단일/모호/없음 해소 결과로 변환한다.
+fn resolution_from_scan(scan: &CandidateScan) -> Resolution {
+    if scan.budget_exceeded || scan.scan_incomplete {
+        return Resolution::Ambiguous;
+    }
+    match scan.candidates.len() {
         0 => Resolution::None,
         1 => {
-            let path = &candidates[0];
+            let path = &scan.candidates[0];
             match extract_from_file(path) {
                 Some(session) => Resolution::Single(session, path.clone()),
                 None => Resolution::None,
@@ -588,25 +886,39 @@ fn read_codex_session(
 
 /// 캐시 본문(serde_json 1라인 직렬화). 해소된 rollout 경로 + mtime + 파싱 결과.
 ///
-/// 정상상태(경로 mtime 불변 & freshness 이내)에는 stat 1회로 재사용된다(spec §8). 역직렬화
-/// 실패(스키마 드리프트)는 lenient로 무시 → 풀 재해소(캐시 버저닝 불필요).
+/// 정상상태(cwd 동일, 최근 일자 디렉터리 mtime 불변, 경로 mtime 불변 & freshness 이내)에는
+/// 후보 파일 본문을 다시 읽지 않고 재사용된다(spec §8). 역직렬화 실패(스키마 드리프트)는
+/// lenient로 무시 → 풀 재해소(캐시 버저닝 불필요).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexCacheEntry {
     /// 해소된 rollout 파일 경로.
     path: String,
     /// 그 파일의 mtime(epoch ms). 불변이면 재파싱 없이 재사용.
     mtime_ms: u128,
+    /// 단일 후보를 확정했던 호출의 정규화 cwd. 다른 cwd에는 캐시를 재사용하지 않는다.
+    #[serde(default)]
+    matched_cwd: Option<String>,
+    /// 단일 후보를 확정했던 시점의 최근 rollout 트리 지문.
+    #[serde(default)]
+    scan_fingerprint: Option<CodexScanFingerprint>,
+    /// 캐시 생성 시 동일 cwd/originator였지만 stale이라 제외된 rollout들.
+    #[serde(default)]
+    stale_same_cwd_rollouts: Vec<WatchedRollout>,
     /// 캐시된 파싱 결과.
     session: CodexSession,
 }
 
 /// 파일 mtime을 epoch ms로 반환한다(캐시 무효화 키). 실패 시 `None`.
 fn file_mtime_ms(path: &Path) -> Option<u128> {
-    let modified = path.metadata().and_then(|m| m.modified()).ok()?;
+    file_mtime_ms_checked(path).ok()
+}
+
+fn file_mtime_ms_checked(path: &Path) -> std::io::Result<u128> {
+    let modified = path.metadata().and_then(|m| m.modified())?;
     modified
         .duration_since(UNIX_EPOCH)
-        .ok()
         .map(|d| d.as_millis())
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "mtime precedes unix epoch"))
 }
 
 /// 캐시 히트 시 해소된 파일의 mtime(epoch ms)이 여전히 freshness 이내인지 판정한다(spec §5/§8).
@@ -638,15 +950,46 @@ fn is_mtime_fresh(mtime_ms: u128, now: SystemTime, freshness_secs: u64) -> bool 
     elapsed_secs <= freshness_secs as u128
 }
 
+/// 캐시 생성 시 stale이라 제외됐던 동일 cwd rollout들이 여전히 stale인지 확인한다.
+///
+/// 기존 stale 파일이 append 등으로 fresh가 되면 parent day directory mtime은 바뀌지 않을 수 있다.
+/// 그 경우 캐시된 단일 후보를 그대로 쓰면 새 모호성을 놓치므로, 감시 대상 중 하나라도 fresh가
+/// 되면 캐시를 무시하고 풀 재해소로 떨어진다. 삭제는 더 이상 후보가 아니므로 안전하지만,
+/// broken symlink/권한/race 등 stat 실패가 path 존재와 함께 관찰되면 캐시 재사용을 금지한다.
+fn watched_rollouts_still_stale(
+    watched: &[WatchedRollout],
+    now: SystemTime,
+    freshness_secs: u64,
+) -> bool {
+    watched.iter().all(|rollout| {
+        let path = PathBuf::from(&rollout.path);
+        match file_mtime_ms_checked(&path) {
+            Ok(mtime) => !is_mtime_fresh(mtime, now, freshness_secs),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                std::fs::symlink_metadata(&path).is_err()
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 /// 세션 데이터를 디스크 캐시에서 조회/갱신해 [`CodexSession`]을 반환한다(spec §8 매 틱 로직).
 ///
-/// 1) 캐시 히트 & 경로 mtime 불변 & **파일 mtime freshness 이내** → 재사용(스캔 0, stat 1회).
+/// 1) 캐시 히트 & rollout 트리 지문 불변 & 경로 mtime 불변 & **파일 mtime freshness 이내**
+///    → 재사용(후보 본문 재독해 없음).
 /// 2) 캐시 히트 & mtime 변동 & **파일 mtime freshness 이내** → 그 파일만 tail 재독 → 캐시 갱신.
-/// 3) 미스/경로 stale/**파일 mtime stale**/없음 → 풀 후보스캔 재해소. **Ambiguous는 캐시하지 않는다**.
+/// 3) 미스/트리 지문 변동/경로 stale/**파일 mtime stale**/없음 → 풀 후보스캔 재해소.
+///    **Ambiguous는 캐시하지 않는다**.
 ///
 /// **파일 freshness 재검증(spec §5 일관성)**: 캐시 신선도는 기록 시각 기준이라, 캐시 히트 시
 /// 해소된 파일의 mtime이 여전히 freshness 이내인지([`is_mtime_fresh`]) 추가 검증한다. stale이면
 /// 캐시를 무시하고 (3) 풀 재해소로 떨어진다 — 종료된 세션은 freshness 경과 후 더는 표시되지 않는다.
+///
+/// **모호성 재검증**: 캐시된 파일 자체가 그대로여도 같은 cwd의 새 rollout이 생기면 이전 단일
+/// 후보 판단은 무효다. 최근 rollout 트리 지문이 바뀌면 캐시를 바로 쓰지 않고 후보 스캔을 다시
+/// 수행해 새 모호성을 fail-safe로 반영한다. 또한 캐시 생성 당시 stale이었던 동일 cwd rollout이
+/// 이후 fresh가 되면 day-dir mtime이 유지될 수 있으므로, 해당 watch-list를 stat해 fresh 전환을
+/// 감지하고 재스캔한다.
 ///
 /// # 반환
 /// 단일 해소 시 `Some(session)`. 모호/없음 시 `None`(무변경 신호).
@@ -661,6 +1004,8 @@ fn resolve_with_cache(
 ) -> Option<CodexSession> {
     let now_ms = cache_now_millis();
     let freshness_secs = freshness.saturating_mul(60);
+    let normalized_cwd = normalize_cwd_for_match(cwd);
+    let normalized_cwd_key = normalized_cwd.to_string_lossy().into_owned();
 
     // 캐시 조회.
     if let Some((written_ms, payload)) =
@@ -668,42 +1013,89 @@ fn resolve_with_cache(
     {
         if is_named_cache_fresh(written_ms, now_ms, freshness_secs) {
             if let Ok(entry) = serde_json::from_str::<CodexCacheEntry>(&payload) {
-                let cached_path = PathBuf::from(&entry.path);
-                match file_mtime_ms(&cached_path) {
-                    // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
-                    // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
-                    Some(current_mtime) if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
-                    // (1) 경로 mtime 불변 & fresh → 재사용(stat 1회).
-                    Some(current_mtime) if current_mtime == entry.mtime_ms => {
-                        return Some(entry.session);
-                    }
-                    // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
-                    Some(current_mtime) => {
-                        if let Some(session) = extract_from_file(&cached_path) {
-                            write_cache_entry(
-                                cache_base,
-                                session_key,
-                                &cached_path,
-                                current_mtime,
-                                &session,
-                                now_ms,
-                            );
-                            return Some(session);
+                let cwd_matches_cache = entry.matched_cwd.as_deref() == Some(&normalized_cwd_key);
+                if cwd_matches_cache {
+                    let current_fingerprint = current_scan_fingerprint(base, scan_days);
+                    let fingerprint_stable = entry
+                        .scan_fingerprint
+                        .as_ref()
+                        .zip(current_fingerprint.as_ref())
+                        .map(|(cached, current)| cached == current)
+                        .unwrap_or(false);
+                    let watched_still_stale = watched_rollouts_still_stale(
+                        &entry.stale_same_cwd_rollouts,
+                        now,
+                        freshness_secs,
+                    );
+                    if !fingerprint_stable || !watched_still_stale {
+                        // cwd는 같지만 최근 일자 디렉터리가 바뀌었다. 새 rollout 후보가 생겼을 수
+                        // 있거나, 기존 stale 동일-cwd rollout이 fresh가 됐을 수 있으므로 캐시를
+                        // 바로 쓰지 않고 아래 풀 해소로 폴백한다.
+                    } else {
+                        let cached_path = PathBuf::from(&entry.path);
+                        if !matches!(is_rollout_file(&cached_path), Ok(true)) {
+                            // 캐시 경로가 더 이상 regular rollout 파일이 아니면 mtime이 같아도
+                            // cached session을 신뢰하지 않는다. 아래 풀 스캔으로 폴백한다.
+                        } else {
+                            match file_mtime_ms(&cached_path) {
+                                // 파일 mtime이 stale(freshness 경과)이면 캐시를 무시하고 풀 재해소로 폴백한다
+                                // (종료된 세션의 stale 표시 차단, find_codex_candidates 선필터와 일관).
+                                Some(current_mtime)
+                                    if !is_mtime_fresh(current_mtime, now, freshness_secs) => {}
+                                // (1) 트리 지문/경로 mtime 불변 & fresh → 재사용(후보 본문 재독해 없음).
+                                Some(current_mtime) if current_mtime == entry.mtime_ms => {
+                                    return Some(entry.session);
+                                }
+                                // (2) mtime 변동(파일 존재) & fresh → 그 파일만 tail 재독 → 캐시 갱신.
+                                Some(current_mtime) => {
+                                    if let Some(session) = extract_from_file(&cached_path) {
+                                        write_cache_entry(
+                                            cache_base,
+                                            session_key,
+                                            CodexCacheEntry {
+                                                path: cached_path.to_string_lossy().into_owned(),
+                                                mtime_ms: current_mtime,
+                                                matched_cwd: Some(normalized_cwd_key.clone()),
+                                                scan_fingerprint: current_fingerprint.clone(),
+                                                stale_same_cwd_rollouts: entry
+                                                    .stale_same_cwd_rollouts
+                                                    .clone(),
+                                                session: session.clone(),
+                                            },
+                                            now_ms,
+                                        );
+                                        return Some(session);
+                                    }
+                                }
+                                // 경로 소실 → 풀 재해소로 폴백.
+                                None => {}
+                            }
                         }
                     }
-                    // 경로 소실 → 풀 재해소로 폴백.
-                    None => {}
                 }
             }
         }
     }
 
     // (3) 미스/stale/경로 소실 → 풀 후보스캔 재해소.
-    match read_codex_session(base, cwd, now, freshness, scan_days) {
+    let scan = scan_codex_candidates(base, cwd, now, freshness, scan_days);
+    match resolution_from_scan(&scan) {
         Resolution::Single(session, path) => {
             // 단일 해소만 캐시한다(모호는 비캐시 — TTL 고착 차단).
             if let Some(mtime) = file_mtime_ms(&path) {
-                write_cache_entry(cache_base, session_key, &path, mtime, &session, now_ms);
+                write_cache_entry(
+                    cache_base,
+                    session_key,
+                    CodexCacheEntry {
+                        path: path.to_string_lossy().into_owned(),
+                        mtime_ms: mtime,
+                        matched_cwd: Some(normalized_cwd_key.clone()),
+                        scan_fingerprint: Some(scan.fingerprint.clone()),
+                        stale_same_cwd_rollouts: scan.stale_same_cwd_rollouts.clone(),
+                        session: session.clone(),
+                    },
+                    now_ms,
+                );
             }
             Some(session)
         }
@@ -716,19 +1108,7 @@ fn resolve_with_cache(
 ///
 /// `cache_base`는 캐시 루트(런타임은 `chain::cache_dir()`, 테스트는 주입 tempdir)로,
 /// process-global `HOME` 비의존 hermetic 기록을 위해 [`write_session_named_cache_in`]에 위임한다.
-fn write_cache_entry(
-    cache_base: &Path,
-    session_key: &str,
-    path: &Path,
-    mtime_ms: u128,
-    session: &CodexSession,
-    now_ms: u128,
-) {
-    let entry = CodexCacheEntry {
-        path: path.to_string_lossy().into_owned(),
-        mtime_ms,
-        session: session.clone(),
-    };
+fn write_cache_entry(cache_base: &Path, session_key: &str, entry: CodexCacheEntry, now_ms: u128) {
     if let Ok(payload) = serde_json::to_string(&entry) {
         write_session_named_cache_in(cache_base, session_key, CODEX_CACHE_FILE, now_ms, &payload);
     }
@@ -1168,6 +1548,160 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 회귀: 상한까지 읽어도 개행이 없는 첫 줄은 부분 JSON으로 파싱하지 않고 제외한다.
+    #[test]
+    fn find_candidates_rejects_unterminated_over_limit_first_line() {
+        let base = unique_tmp("bigmeta-no-newline");
+        let cwd = "/Users/me/projBigMetaNoNewline";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        let path = day_dir.join("rollout-2026-06-05T20-40-45-bigmeta-no-newline.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            r#"{{"timestamp":"2026-06-05T11:41:50.379Z","type":"session_meta","payload":{{"id":"abc","cwd":"{cwd}","originator":"codex-tui","base_instructions":{{"text":""#
+        )
+        .unwrap();
+        write!(file, "{}", "A".repeat(FIRST_LINE_READ_BYTES as usize)).unwrap();
+        file.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&path).is_none(),
+            "개행 없이 상한에 걸린 첫 줄은 부분 session_meta로 파싱하면 안 됨"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "미완결 과대 첫 줄은 후보 없음이 아니라 불완전 스캔으로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "미완결 과대 첫 줄은 실제 해소 경로에서 fail-safe"
+        );
+        let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(
+            found.len(),
+            0,
+            "미완결 과대 첫 줄은 cwd/originator 후보에서 제외"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 회귀: 짧은 첫 줄도 개행으로 완결되지 않았으면 부분 라인으로 보고 fail-safe 처리한다.
+    #[test]
+    fn short_unterminated_first_line_fails_safe() {
+        let base = unique_tmp("short-no-newline");
+        let cwd = "/Users/me/projShortNoNewline";
+        write_rollout(
+            &base,
+            "short-valid",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        let partial_path = day_dir.join("rollout-2026-06-05T20-40-45-short-partial.jsonl");
+        let mut partial = std::fs::File::create(&partial_path).unwrap();
+        write!(partial, "{}", session_meta_line(cwd, "codex-tui")).unwrap();
+        partial.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&partial_path).is_none(),
+            "짧더라도 개행 없는 첫 줄은 legacy API에서 후보 없음으로 보임"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "짧은 미완결 첫 줄도 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "다른 valid 후보가 있어도 부분 라인 rollout이 있으면 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 회귀: 개행은 있어도 session_meta로 파싱되지 않는 첫 줄은 후보 없음이 아니라 불완전 스캔이다.
+    #[test]
+    fn malformed_first_line_fails_safe() {
+        let base = unique_tmp("malformed-first-line");
+        let cwd = "/Users/me/projMalformedFirstLine";
+        write_rollout(
+            &base,
+            "malformed-valid",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        let malformed_path = day_dir.join("rollout-2026-06-05T20-40-45-malformed.jsonl");
+        let mut malformed = std::fs::File::create(&malformed_path).unwrap();
+        writeln!(malformed, "{{not json").unwrap();
+        malformed.flush().unwrap();
+
+        assert!(
+            read_first_line_meta(&malformed_path).is_none(),
+            "legacy parser API는 malformed first line을 None으로 노출"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "malformed first line은 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "다른 valid 후보가 있어도 malformed rollout이 있으면 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rollout 이름 엔트리의 metadata를 확인할 수 없으면 단일 후보를 표시하지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn rollout_metadata_error_fails_safe() {
+        let base = unique_tmp("rollout-metadata-error");
+        let cwd = "/Users/me/projRolloutMetadataError";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let candidate_path = day_dir.join("rollout-2026-06-05T20-40-45-candidate.jsonl");
+        let mut candidate = std::fs::File::create(&candidate_path).unwrap();
+        for line in [
+            session_meta_line(cwd, "codex-tui"),
+            turn_context_line("gpt-5.5", "high"),
+            token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+        ] {
+            writeln!(candidate, "{line}").unwrap();
+        }
+
+        let broken = day_dir.join("rollout-2026-06-05T20-40-45-broken.jsonl");
+        std::os::unix::fs::symlink(day_dir.join("missing-target.jsonl"), &broken).unwrap();
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "rollout-*.jsonl metadata 실패는 scan_incomplete로 전파되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "metadata 실패가 있는 부분 스캔에서 본 단일 후보를 표시하면 안 됨"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// AC-X1: 동일 cwd·fresh 후보 2개 → Ambiguous → enrich 생략(ctx/rate 미표시).
     #[test]
     fn ambiguous_two_same_cwd_candidates() {
@@ -1237,6 +1771,201 @@ mod tests {
         // scan_days=1 → 최신 일자(06/05)만 스캔 → old(06/01) 미발견.
         let found = find_codex_candidates(&base, cwd, SystemTime::now(), 240, 1);
         assert_eq!(found.len(), 1, "scan_days=1은 최신 일자만 스캔");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 스캔 파일 총량 상한을 넘으면 부분 결과를 단일 후보로 신뢰하지 않고 fail-safe로 저하한다.
+    #[test]
+    fn scan_budget_exceeded_fails_safe() {
+        let base = unique_tmp("scan-budget");
+        let cwd = "/Users/me/projBudget";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        for idx in 0..=MAX_CODEX_SCAN_ENTRIES {
+            let path = day_dir.join(format!("rollout-2026-06-05T20-40-45-{idx:04}.jsonl"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "디렉터리 엔트리가 상한을 넘으면 budget_exceeded가 기록되어야 함"
+        );
+        let resolution = read_codex_session(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(
+            resolution,
+            Resolution::Ambiguous,
+            "부분 스캔으로 단일/없음을 확정하지 않고 enrich 생략 경로로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 예산 초과 전에 단일 후보를 찾았더라도 전체 유일성을 증명할 수 없으면 fail-safe다.
+    #[test]
+    fn scan_budget_with_prior_candidate_still_fails_safe() {
+        let base = unique_tmp("scan-budget-prior-candidate");
+        let cache_base = unique_tmp("scan-budget-prior-candidate-cache");
+        let cwd = "/Users/me/projBudgetPriorCandidate";
+        let newest_day = base.join("sessions").join("2026").join("06").join("06");
+        let older_day = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&newest_day).unwrap();
+        std::fs::create_dir_all(&older_day).unwrap();
+
+        let candidate_path = newest_day.join("rollout-2026-06-06T20-40-45-candidate.jsonl");
+        let mut candidate = std::fs::File::create(&candidate_path).unwrap();
+        for line in [
+            session_meta_line(cwd, "codex-tui"),
+            turn_context_line("gpt-5.5", "high"),
+            token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+        ] {
+            writeln!(candidate, "{line}").unwrap();
+        }
+
+        for idx in 0..MAX_CODEX_SCAN_ENTRIES {
+            let path = older_day.join(format!("noise-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "후보를 먼저 발견했더라도 뒤따른 디렉터리 엔트리 폭증은 budget_exceeded여야 함"
+        );
+        assert!(
+            scan.candidates.is_empty(),
+            "예산 초과 시에는 이미 존재하는 valid 후보도 신뢰 가능한 단일 후보로 노출하지 않음"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "부분 스캔에서 본 단일 후보를 표시하지 않고 Ambiguous로 저하"
+        );
+
+        let mut input = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some("scan-budget-prior-candidate-key".to_string()),
+            ..Default::default()
+        };
+        let before = input.clone();
+        maybe_enrich_in(
+            &mut input,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            input, before,
+            "budget_exceeded 상태에서는 이미 발견한 단일 후보로도 enrich하지 않아야 함"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// non-rollout 엔트리도 총 스캔 예산에 포함해 hot path 디렉터리 순회를 제한한다.
+    #[test]
+    fn scan_budget_counts_non_rollout_entries() {
+        let base = unique_tmp("scan-budget-noise");
+        let cwd = "/Users/me/projBudgetNoise";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        for idx in 0..=MAX_CODEX_SCAN_ENTRIES {
+            let path = day_dir.join(format!("noise-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "non-rollout 파일이 많아도 총 디렉터리 엔트리 예산을 초과해야 함"
+        );
+        assert_eq!(scan.candidates.len(), 0);
+        let resolution = read_codex_session(&base, cwd, SystemTime::now(), 240, 3);
+        assert_eq!(
+            resolution,
+            Resolution::Ambiguous,
+            "non-rollout 엔트리 폭증도 부분 스캔이므로 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 정확히 예산만큼의 엔트리는 overflow가 아니다(경계 회귀).
+    #[test]
+    fn scan_budget_exact_limit_is_allowed() {
+        let base = unique_tmp("scan-budget-exact");
+        let cwd = "/Users/me/projBudgetExact";
+        let day_dir = base.join("sessions").join("2026").join("06").join("05");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        for idx in 0..MAX_CODEX_SCAN_ENTRIES {
+            let path = day_dir.join(format!("noise-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            !scan.budget_exceeded,
+            "정확히 상한만큼의 엔트리는 budget_exceeded가 아니어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// year/month/day discovery 자체도 예산 초과 시 단일 후보를 확정하지 않는다.
+    #[test]
+    fn date_discovery_budget_exceeded_fails_safe() {
+        let base = unique_tmp("date-budget");
+        let cwd = "/Users/me/projDateBudget";
+        let sessions_dir = base.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        for idx in 0..=MAX_CODEX_DATE_DIR_ENTRIES {
+            std::fs::create_dir_all(sessions_dir.join(format!("{idx:04}"))).unwrap();
+        }
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.budget_exceeded,
+            "date discovery 엔트리 상한을 넘으면 budget_exceeded가 기록되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "date discovery 부분 스캔도 fail-safe로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// date discovery에서 `read_dir`가 실패하면 부분 view를 신뢰하지 않고 fail-safe로 저하한다.
+    #[test]
+    fn date_discovery_read_error_fails_safe() {
+        let base = unique_tmp("date-read-error");
+        let cwd = "/Users/me/projDateReadError";
+        let sessions_path = base.join("sessions");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&sessions_path, b"not a directory").unwrap();
+
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "date discovery read_dir 실패는 scan_incomplete로 기록되어야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "부분/불완전 스캔은 후보 없음으로 오판하지 않고 fail-safe"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1488,10 +2217,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_base);
     }
 
-    /// AC-X6: 캐시 정상상태 — 2회차는 경로 mtime 불변이면 재해소 없이 캐시를 재사용한다.
+    /// AC-X6: 캐시 정상상태 — 2회차는 같은 cwd와 경로 mtime 불변이면 후보 본문 재독해 없이
+    /// 캐시를 재사용한다.
     ///
-    /// 1회차에 캐시를 채운 뒤, 2회차는 매칭 불가 cwd로 호출한다. 캐시 재사용이면 같은 키로
-    /// 캐시 히트 → 경로 mtime 불변 → 재사용되어 여전히 enrich가 성공해야 한다(풀 재해소면 실패).
+    /// 1회차에 캐시를 채운 뒤, 2회차도 같은 cwd/key로 호출한다. 캐시 재사용이면 경로 mtime
+    /// 불변 → 재사용되어 여전히 enrich가 성공해야 한다.
     #[test]
     fn cache_steady_state_reuses_without_rescan() {
         let base = unique_tmp("cache-steady");
@@ -1523,11 +2253,10 @@ mod tests {
         );
         assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
 
-        // 2회차: 같은 캐시 키지만 매칭 불가 cwd. 풀스캔이면 0 발견이지만 캐시 히트 →
-        // 경로 mtime 불변 → 재사용되어 여전히 성공해야 한다(정상상태 stat 1회).
+        // 2회차: 같은 cwd/key. 최근 일자 디렉터리 mtime과 경로 mtime 불변 → 캐시 재사용.
         let mut second = ClaudeInput {
             model_display_name: Some("codex".to_string()),
-            cwd: Some("/no/match/here".to_string()),
+            cwd: Some(cwd.to_string()),
             session_id: Some(key.to_string()),
             ..Default::default()
         };
@@ -1540,9 +2269,480 @@ mod tests {
         assert_eq!(
             second.model_display_name.as_deref(),
             Some("gpt-5.5"),
-            "정상상태는 캐시 재사용(재스캔 없이 stat 1회)"
+            "정상상태는 캐시 재사용"
         );
         // cache_base 격리로 캐시는 temp 하위에만 존재하므로 실캐시 청소가 불필요하다.
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 같은 cache key라도 현재 cwd가 달라지면 cached session을 재사용하지 않는다.
+    #[test]
+    fn cache_hit_with_different_cwd_does_not_reuse() {
+        let base = unique_tmp("cache-cwd");
+        let cache_base = unique_tmp("cache-cwd-cache");
+        let cwd = "/Users/me/projCacheCwd";
+        let key = "cache-cwd-key";
+        write_rollout(
+            &base,
+            "cachecwd",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some("/no/match/here".to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "동일 key라도 cwd가 다르면 cached Codex session을 표시하면 안 됨"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시 히트라도 같은 cwd의 새 fresh rollout이 생기면 이전 단일 후보를 재사용하지 않는다.
+    ///
+    /// 1회차 단일 후보로 캐시를 채운 뒤 2회차 전에 같은 cwd 후보를 추가한다. 캐시가 rollout
+    /// 트리 지문 변화를 무시하면 stale 단일 세션을 계속 표시하지만, 올바른 동작은 재스캔 후
+    /// Ambiguous로 안전 저하되어 input을 그대로 두는 것이다.
+    #[test]
+    fn cache_hit_rechecks_new_same_cwd_rollout_before_reuse() {
+        let base = unique_tmp("cache-amb");
+        let cache_base = unique_tmp("cache-amb-cache");
+        let cwd = "/Users/me/projCacheAmb";
+        let key = "cache-amb-key";
+        write_rollout(
+            &base,
+            "cacheamb1",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        let second_rollout = write_rollout(
+            &base,
+            "cacheamb2",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+        if let Some(day_dir) = second_rollout.parent() {
+            set_file_mtime(day_dir, SystemTime::now() + Duration::from_secs(1));
+        }
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "새 같은-cwd 후보가 생긴 뒤에는 캐시 재사용 대신 Ambiguous로 안전 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 기존 stale 동일-cwd rollout이 append 등으로 fresh가 되면 day-dir mtime이 그대로여도
+    /// 캐시를 재사용하지 않고 재스캔해 Ambiguous로 안전 저하한다.
+    #[test]
+    fn cache_hit_rechecks_stale_same_cwd_rollout_becoming_fresh() {
+        let base = unique_tmp("cache-stale-watch");
+        let cache_base = unique_tmp("cache-stale-watch-cache");
+        let cwd = "/Users/me/projCacheStaleWatch";
+        let key = "cache-stale-watch-key";
+        let fresh_path = write_rollout(
+            &base,
+            "fresh",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let stale_path = write_rollout(
+            &base,
+            "stale-watch",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+        let day_dir = fresh_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(30);
+        let stale_time = SystemTime::now() - Duration::from_secs(5 * 3600);
+        set_file_mtime(&stale_path, stale_time);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        // 기존 stale 파일만 fresh로 바꾼다. parent day-dir mtime은 원래 지문과 같게 되돌려
+        // day-dir fingerprint만으로는 변화를 볼 수 없는 케이스를 박제한다.
+        set_file_mtime(&stale_path, SystemTime::now() + Duration::from_secs(1));
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "기존 stale 동일-cwd rollout이 fresh가 되면 cached 단일 세션 대신 Ambiguous로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// watched stale rollout의 stat 실패는 "아직 stale"이 아니라 cache reuse 금지로 처리한다.
+    #[cfg(unix)]
+    #[test]
+    fn cache_hit_rejects_watched_rollout_stat_failure() {
+        let base = unique_tmp("cache-watch-stat-failure");
+        let cache_base = unique_tmp("cache-watch-stat-failure-cache");
+        let cwd = "/Users/me/projCacheWatchStatFailure";
+        let key = "cache-watch-stat-failure-key";
+        let fresh_path = write_rollout(
+            &base,
+            "watchfresh",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let stale_path = write_rollout(
+            &base,
+            "watchbroken",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.4-mini", "medium"),
+                token_count_line(100, 1000, 0, 2.0, 10.0, "pro"),
+            ],
+        );
+        let day_dir = fresh_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(30);
+        set_file_mtime(
+            &stale_path,
+            SystemTime::now() - Duration::from_secs(5 * 3600),
+        );
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        std::fs::remove_file(&stale_path).unwrap();
+        std::os::unix::fs::symlink(day_dir.join("missing-watch-target.jsonl"), &stale_path)
+            .unwrap();
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "watched rollout stat 실패는 cached 단일 세션 재사용 대신 fail-safe로 저하"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// day directory mtime을 증명할 수 없으면 cache fingerprint도, full scan도 fail-safe 처리한다.
+    #[cfg(unix)]
+    #[test]
+    fn day_dir_mtime_error_invalidates_cache_and_scan() {
+        let base = unique_tmp("cache-day-mtime-error");
+        let cache_base = unique_tmp("cache-day-mtime-error-cache");
+        let cwd = "/Users/me/projCacheDayMtimeError";
+        let key = "cache-day-mtime-error-key";
+        let rollout_path = write_rollout(
+            &base,
+            "daymtime",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        set_file_mtime_before_epoch(&day_dir);
+        assert!(
+            current_scan_fingerprint(&base, 3).is_none(),
+            "day-dir mtime 불확실성은 cache fingerprint 재사용을 금지해야 함"
+        );
+        let scan = scan_codex_candidates(&base, cwd, SystemTime::now(), 240, 3);
+        assert!(
+            scan.scan_incomplete,
+            "day-dir mtime 불확실성은 full scan에서도 scan_incomplete여야 함"
+        );
+        assert_eq!(
+            read_codex_session(&base, cwd, SystemTime::now(), 240, 3),
+            Resolution::Ambiguous,
+            "mtime 불확실성이 있으면 valid 후보가 있어도 fail-safe"
+        );
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "day-dir mtime 불확실성은 cached 단일 세션 재사용 대신 fail-safe"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시된 rollout 경로가 더 이상 regular 파일이 아니면 동일 mtime이어도 재사용하지 않는다.
+    #[test]
+    fn cache_hit_rejects_cached_path_file_type_change() {
+        let base = unique_tmp("cache-file-type");
+        let cache_base = unique_tmp("cache-file-type-cache");
+        let cwd = "/Users/me/projCacheFileType";
+        let key = "cache-file-type-key";
+        let rollout_path = write_rollout(
+            &base,
+            "filetype",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+        let stable_rollout_mtime = SystemTime::now() - Duration::from_secs(30);
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(20);
+        set_file_mtime(&rollout_path, stable_rollout_mtime);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        std::fs::remove_file(&rollout_path).unwrap();
+        std::fs::create_dir(&rollout_path).unwrap();
+        set_file_mtime(&rollout_path, stable_rollout_mtime);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "cached path가 directory로 바뀌면 mtime이 같아도 cached Codex session을 재사용하면 안 됨"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&cache_base);
+    }
+
+    /// 캐시 히트에서도 현재 scan budget을 재검증해 부분 visibility에서 재사용하지 않는다.
+    #[test]
+    fn cache_hit_rechecks_scan_budget_even_when_day_mtime_stable() {
+        let base = unique_tmp("cache-hit-budget");
+        let cache_base = unique_tmp("cache-hit-budget-cache");
+        let cwd = "/Users/me/projCacheHitBudget";
+        let key = "cache-hit-budget-key";
+        let rollout_path = write_rollout(
+            &base,
+            "hitbudget",
+            &[
+                session_meta_line(cwd, "codex-tui"),
+                turn_context_line("gpt-5.5", "high"),
+                token_count_line(275, 1000, 0, 3.0, 21.0, "pro"),
+            ],
+        );
+        let day_dir = rollout_path.parent().expect("day dir").to_path_buf();
+        let stable_day_mtime = SystemTime::now() - Duration::from_secs(20);
+        set_file_mtime(&day_dir, stable_day_mtime);
+
+        let mut first = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        maybe_enrich_in(
+            &mut first,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(first.model_display_name.as_deref(), Some("gpt-5.5"));
+
+        for idx in 0..MAX_CODEX_SCAN_ENTRIES {
+            let path = day_dir.join(format!("noise-cache-hit-{idx:04}.txt"));
+            std::fs::File::create(path).unwrap();
+        }
+        set_file_mtime(&day_dir, stable_day_mtime);
+        assert!(
+            current_scan_fingerprint(&base, 3).is_none(),
+            "cache-hit fingerprint probe must fail closed when current scan budget is exceeded"
+        );
+
+        let mut second = ClaudeInput {
+            model_display_name: Some("codex".to_string()),
+            cwd: Some(cwd.to_string()),
+            session_id: Some(key.to_string()),
+            ..Default::default()
+        };
+        let before = second.clone();
+        maybe_enrich_in(
+            &mut second,
+            &Config::default(),
+            Some(&base),
+            Some(&cache_base),
+        );
+        assert_eq!(
+            second, before,
+            "day mtime이 안정적이어도 current scan budget 초과 시 cached 단일 세션을 재사용하면 안 됨"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&cache_base);
     }
@@ -1551,7 +2751,7 @@ mod tests {
     ///
     /// 캐시 신선도는 기록 시각 기준이라, 세션 종료 후 파일 mtime이 고정돼도 마지막 캐시 write로부터
     /// freshness 동안 stale 세션을 계속 표시하는 결함을 박제한다(spec §5 "fresh 후보만" 일관성).
-    /// 1회차로 캐시를 채운 뒤 해소된 파일 mtime을 freshness보다 오래되게 만들고, 2회차는 매칭 불가
+    /// 1회차로 캐시를 채운 뒤 해소된 파일 mtime을 freshness보다 오래되게 만들고, 2회차는 같은
     /// cwd로 호출한다. 캐시가 stale로 무시되면 풀 재해소가 0 후보 → None(model="codex" 유지)이어야 한다.
     /// (이전 동작은 stale 캐시를 재사용해 enrich를 유지했으므로 이 단언이 회귀 가드 역할을 한다.)
     #[test]
@@ -1593,11 +2793,11 @@ mod tests {
         let five_hours_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
         set_file_mtime(&rollout_path, five_hours_ago);
 
-        // 2회차: 같은 캐시 키지만 매칭 불가 cwd. 캐시 히트하더라도 파일 mtime이 stale이므로
+        // 2회차: 같은 캐시 키/cwd. 캐시 히트하더라도 파일 mtime이 stale이므로
         // 캐시를 무시하고 풀 재해소 → 0 후보 → None(무변경, model="codex" 유지)이어야 한다.
         let mut second = ClaudeInput {
             model_display_name: Some("codex".to_string()),
-            cwd: Some("/no/match/here".to_string()),
+            cwd: Some(cwd.to_string()),
             session_id: Some(key.to_string()),
             ..Default::default()
         };
@@ -1644,5 +2844,24 @@ mod tests {
         unsafe {
             libc::utimes(c_path.as_ptr(), times.as_ptr());
         }
+    }
+
+    /// 파일/디렉터리 mtime을 UNIX_EPOCH 이전으로 설정해 `file_mtime_ms_checked` 실패를 재현한다.
+    #[cfg(unix)]
+    fn set_file_mtime_before_epoch(path: &Path) {
+        let times = [
+            libc::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            },
+        ];
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: 유효한 경로/timeval 포인터로 utimes 호출한다. 테스트 픽스처이므로 실패 시 즉시 실패.
+        let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "pre-epoch mtime 설정 실패");
     }
 }

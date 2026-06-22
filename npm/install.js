@@ -17,22 +17,12 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const path = require('path');
+const os = require('os');
 
 // 네이티브 바이너리를 받아오는 GitHub 릴리스 태그.
-// npm 래퍼 패키지 버전(package.json)과는 분리되어 있습니다 —
-// 래퍼(이 스크립트/런처)만 패치 게시될 수 있으므로, 바이너리는 항상
-// 아래 고정된 릴리스에서 받습니다. 새 바이너리 릴리스를 낼 때 이 값을 올리세요.
+// release/publish guard가 Cargo.toml, npm/package.json, 이 값, git tag를 lockstep으로
+// 검증합니다. 새 네이티브 릴리스를 낼 때 네 버전을 함께 올리세요.
 const VERSION = '0.7.0';
-
-// 플랫폼 확인: macOS 전용 패키지
-if (process.platform !== 'darwin') {
-  process.stdout.write(
-    '[understatus] macOS 전용 패키지입니다. 현재 플랫폼(' +
-      process.platform +
-      ')에서는 설치를 건너뜁니다.\n'
-  );
-  process.exit(0);
-}
 
 // CPU 아키텍처를 Rust 타겟 트리플로 매핑
 const archMap = {
@@ -40,27 +30,15 @@ const archMap = {
   x64: 'x86_64-apple-darwin',
 };
 
-const target = archMap[process.arch];
-if (!target) {
-  process.stderr.write(
-    '[understatus] 지원하지 않는 아키텍처입니다: ' + process.arch + '\n' +
-    '[understatus] 지원 아키텍처: arm64 (Apple Silicon), x64 (Intel)\n'
-  );
-  process.exit(1);
-}
-
 // 다운로드 URL 구성
 const RELEASE_BASE =
   'https://github.com/ictechgy/understatus/releases/download/v' + VERSION + '/';
-const TARBALL_NAME = 'understatus-' + VERSION + '-' + target + '.tar.gz';
-const SHA256_NAME = TARBALL_NAME + '.sha256';
-const TARBALL_URL = RELEASE_BASE + TARBALL_NAME;
-const SHA256_URL = RELEASE_BASE + SHA256_NAME;
 
 // bin 디렉터리 경로
 const BIN_DIR = path.join(__dirname, 'bin');
-const TARBALL_PATH = path.join(BIN_DIR, TARBALL_NAME);
 const BINARY_PATH = path.join(BIN_DIR, 'understatus');
+const TAR = '/usr/bin/tar';
+const DOWNLOAD_TIMEOUT_MS = 30000;
 
 /**
  * HTTP(S) GET 요청으로 URL에서 데이터를 다운로드합니다.
@@ -77,68 +55,152 @@ function download(url, destPath, maxRedirects = 10) {
       return reject(new Error('너무 많은 리디렉션이 발생했습니다: ' + url));
     }
 
-    https
-      .get(url, (response) => {
-        // 리디렉션 처리
-        if (
-          [301, 302, 307, 308].includes(response.statusCode) &&
-          response.headers.location
-        ) {
-          response.resume(); // 현재 응답 본문 소비
-          return resolve(
-            download(response.headers.location, destPath, maxRedirects - 1)
-          );
-        }
+    function rejectWithCleanup(err) {
+      if (destPath) {
+        fs.unlink(destPath, () => {});
+      }
+      reject(err);
+    }
 
-        if (response.statusCode !== 200) {
-          response.resume();
-          return reject(
-            new Error(
-              'HTTP ' + response.statusCode + ' 오류: ' + url + '\n' +
-              '릴리즈가 존재하는지 확인하세요: ' +
-              'https://github.com/ictechgy/understatus/releases'
-            )
-          );
+    const request = https.get(url, (response) => {
+      // 리디렉션 처리
+      if (
+        [301, 302, 307, 308].includes(response.statusCode) &&
+        response.headers.location
+      ) {
+        response.resume(); // 현재 응답 본문 소비
+        let nextUrl;
+        try {
+          nextUrl = new URL(response.headers.location, url);
+        } catch (err) {
+          return rejectWithCleanup(new Error('잘못된 리디렉션 URL: ' + response.headers.location));
         }
+        if (nextUrl.protocol !== 'https:') {
+          return rejectWithCleanup(new Error('HTTPS가 아닌 리디렉션 거부: ' + nextUrl.toString()));
+        }
+        return resolve(download(nextUrl.toString(), destPath, maxRedirects - 1));
+      }
 
-        if (destPath) {
-          // 파일로 저장
-          const fileStream = fs.createWriteStream(destPath);
-          response.pipe(fileStream);
-          fileStream.on('finish', () => fileStream.close(resolve));
-          fileStream.on('error', (err) => {
-            fs.unlink(destPath, () => {}); // 실패 시 임시 파일 삭제
-            reject(err);
-          });
-          response.on('error', reject);
-        } else {
-          // Buffer로 수집
-          const chunks = [];
-          response.on('data', (chunk) => chunks.push(chunk));
-          response.on('end', () => resolve(Buffer.concat(chunks)));
-          response.on('error', reject);
-        }
-      })
-      .on('error', reject);
+      if (response.statusCode !== 200) {
+        response.resume();
+        return rejectWithCleanup(
+          new Error(
+            'HTTP ' + response.statusCode + ' 오류: ' + url + '\n' +
+            '릴리즈가 존재하는지 확인하세요: ' +
+            'https://github.com/ictechgy/understatus/releases'
+          )
+        );
+      }
+
+      if (destPath) {
+        // 파일로 저장
+        const fileStream = fs.createWriteStream(destPath);
+        response.pipe(fileStream);
+        fileStream.on('finish', () => fileStream.close(resolve));
+        fileStream.on('error', rejectWithCleanup);
+        response.on('error', rejectWithCleanup);
+      } else {
+        // Buffer로 수집
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => resolve(Buffer.concat(chunks)));
+        response.on('error', rejectWithCleanup);
+      }
+    });
+
+    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+      request.destroy(new Error('다운로드 시간 초과: ' + url));
+    });
+    request.on('error', rejectWithCleanup);
   });
 }
 
 /**
- * SHA-256 체크섬 파일을 파싱하여 기대 해시값을 반환합니다.
- * 형식: "<sha256>  <filename>"
+ * npm 패키지에 고정된 체크섬 manifest에서 기대 해시값을 반환합니다.
  *
- * @param {string} sha256Content - 체크섬 파일의 텍스트 내용
+ * @param {string} version - 네이티브 바이너리 버전
+ * @param {string} releaseTarget - Rust 타겟 트리플
  * @returns {string} 소문자 16진수 SHA-256 해시
  */
-function parseSha256(sha256Content) {
-  const line = sha256Content.trim().split('\n')[0];
-  const parts = line.split(/\s+/);
-  if (!parts[0] || parts[0].length !== 64) {
+function removeDirQuietly(dirPath) {
+  if (!dirPath) {
+    return;
+  }
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  } catch (_) {
+    // cleanup best effort
+  }
+}
+
+function expectedChecksum(version, releaseTarget) {
+  const checksums = require('./checksums.json');
+  const releaseChecksums = checksums[version];
+  const checksum = releaseChecksums && releaseChecksums[releaseTarget];
+  if (!checksum || !/^[0-9a-f]{64}$/.test(checksum)) {
     throw new Error(
-      'SHA-256 파일 형식을 파싱할 수 없습니다. 내용: ' + sha256Content
+      'npm/checksums.json에 ' + version + '/' + releaseTarget + ' 체크섬이 없습니다.'
     );
   }
-  return parts[0].toLowerCase();
+  return checksum;
+}
+
+/**
+ * tarball 항목을 검증하고 temp dir에 안전하게 압축 해제한 뒤 바이너리 경로를 반환합니다.
+ *
+ * @param {string} tarballPath - 검증할 tarball 경로
+ * @returns {string} temp dir 안에 압축 해제된 understatus 바이너리 경로
+ */
+function extractValidatedBinary(tarballPath) {
+  const listResult = spawnSync(TAR, ['-tzf', tarballPath], {
+    encoding: 'utf8',
+  });
+  if (listResult.error) {
+    throw new Error('tar 목록 조회 오류: ' + listResult.error.message);
+  }
+  if (listResult.status !== 0) {
+    throw new Error('tar 목록 조회 실패 (종료 코드 ' + listResult.status + '): ' + listResult.stderr);
+  }
+
+  const entries = listResult.stdout
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.length !== 1 || entries[0] !== 'understatus') {
+    throw new Error(
+      '예상하지 않은 tarball 항목: ' + (entries.length ? entries.join(', ') : '(비어 있음)')
+    );
+  }
+
+  const extractDir = fs.mkdtempSync(path.join(BIN_DIR, '.understatus-extract-'));
+  const extractResult = spawnSync(TAR, ['-xzf', tarballPath, '-C', extractDir, 'understatus'], {
+    stdio: 'pipe',
+    encoding: 'utf8',
+  });
+  if (extractResult.error) {
+    removeDirQuietly(extractDir);
+    throw new Error('tar 압축 해제 오류: ' + extractResult.error.message);
+  }
+  if (extractResult.status !== 0) {
+    removeDirQuietly(extractDir);
+    throw new Error(
+      'tar 압축 해제 실패 (종료 코드 ' + extractResult.status + '): ' + extractResult.stderr
+    );
+  }
+
+  const extractedBinary = path.join(extractDir, 'understatus');
+  let stat;
+  try {
+    stat = fs.lstatSync(extractedBinary);
+  } catch (err) {
+    removeDirQuietly(extractDir);
+    throw new Error('압축 해제된 understatus를 찾을 수 없습니다: ' + err.message);
+  }
+  if (!stat.isFile()) {
+    removeDirQuietly(extractDir);
+    throw new Error('압축 해제된 understatus가 regular file이 아닙니다.');
+  }
+  return extractedBinary;
 }
 
 /**
@@ -159,9 +221,31 @@ function computeSha256(filePath) {
 
 /**
  * 메인 설치 함수
- * 순서: SHA256 다운로드 → tarball 다운로드 → 체크섬 검증 → 압축 해제 → chmod
+ * 순서: 고정 checksum 조회 → tarball 다운로드 → 체크섬 검증 → 안전 압축 해제 → chmod
  */
 async function main() {
+  // 플랫폼 확인: macOS 전용 패키지
+  if (process.platform !== 'darwin') {
+    process.stdout.write(
+      '[understatus] macOS 전용 패키지입니다. 현재 플랫폼(' +
+        process.platform +
+        ')에서는 설치를 건너뜁니다.\n'
+    );
+    return;
+  }
+
+  const target = archMap[process.arch];
+  if (!target) {
+    process.stderr.write(
+      '[understatus] 지원하지 않는 아키텍처입니다: ' + process.arch + '\n' +
+      '[understatus] 지원 아키텍처: arm64 (Apple Silicon), x64 (Intel)\n'
+    );
+    process.exit(1);
+  }
+
+  const tarballName = 'understatus-' + VERSION + '-' + target + '.tar.gz';
+  const tarballUrl = RELEASE_BASE + tarballName;
+
   // bin 디렉터리가 없으면 생성
   if (!fs.existsSync(BIN_DIR)) {
     fs.mkdirSync(BIN_DIR, { recursive: true });
@@ -169,24 +253,24 @@ async function main() {
 
   process.stdout.write('[understatus] 설치 중... (버전 ' + VERSION + ', 타겟 ' + target + ')\n');
 
-  // 1단계: SHA-256 체크섬 파일 다운로드
-  process.stdout.write('[understatus] SHA-256 체크섬 다운로드 중: ' + SHA256_URL + '\n');
-  let sha256Buffer;
+  // 1단계: npm 패키지에 고정된 SHA-256 체크섬 조회
+  let expectedHash;
   try {
-    sha256Buffer = await download(SHA256_URL, null);
+    expectedHash = expectedChecksum(VERSION, target);
   } catch (err) {
-    process.stderr.write(
-      '[understatus] SHA-256 파일 다운로드 실패:\n  ' + err.message + '\n'
-    );
+    process.stderr.write('[understatus] 체크섬 manifest 오류: ' + err.message + '\n');
     process.exit(1);
   }
-  const expectedHash = parseSha256(sha256Buffer.toString('utf8'));
+
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'understatus-download-'));
+  const tarballPath = path.join(downloadDir, tarballName);
 
   // 2단계: tarball 다운로드
-  process.stdout.write('[understatus] 바이너리 다운로드 중: ' + TARBALL_URL + '\n');
+  process.stdout.write('[understatus] 바이너리 다운로드 중: ' + tarballUrl + '\n');
   try {
-    await download(TARBALL_URL, TARBALL_PATH);
+    await download(tarballUrl, tarballPath);
   } catch (err) {
+    removeDirQuietly(downloadDir);
     process.stderr.write(
       '[understatus] tarball 다운로드 실패:\n  ' + err.message + '\n'
     );
@@ -197,15 +281,15 @@ async function main() {
   process.stdout.write('[understatus] 체크섬 검증 중...\n');
   let actualHash;
   try {
-    actualHash = await computeSha256(TARBALL_PATH);
+    actualHash = await computeSha256(tarballPath);
   } catch (err) {
-    fs.unlink(TARBALL_PATH, () => {});
+    removeDirQuietly(downloadDir);
     process.stderr.write('[understatus] 체크섬 계산 실패: ' + err.message + '\n');
     process.exit(1);
   }
 
   if (actualHash !== expectedHash) {
-    fs.unlink(TARBALL_PATH, () => {});
+    removeDirQuietly(downloadDir);
     process.stderr.write(
       '[understatus] SHA-256 체크섬 불일치! 다운로드가 손상되었을 수 있습니다.\n' +
       '  기대값: ' + expectedHash + '\n' +
@@ -217,40 +301,29 @@ async function main() {
   }
   process.stdout.write('[understatus] 체크섬 검증 통과.\n');
 
-  // 4단계: tarball 압축 해제 (시스템 tar 사용)
-  // tarball 루트에 "understatus" 실행 파일 하나만 포함되어 있습니다.
+  // 4단계: tarball 항목 검증 후 temp dir에 안전 압축 해제
   process.stdout.write('[understatus] 압축 해제 중...\n');
-  const tarResult = spawnSync('tar', ['-xzf', TARBALL_PATH, '-C', BIN_DIR], {
-    stdio: 'inherit',
-  });
-
-  // tarball 임시 파일 삭제
+  let extractedBinary;
   try {
-    fs.unlinkSync(TARBALL_PATH);
-  } catch (_) {
-    // 삭제 실패는 무시
-  }
-
-  if (tarResult.error) {
-    process.stderr.write(
-      '[understatus] tar 실행 오류: ' + tarResult.error.message + '\n'
-    );
+    extractedBinary = extractValidatedBinary(tarballPath);
+    fs.renameSync(extractedBinary, BINARY_PATH);
+    removeDirQuietly(path.dirname(extractedBinary));
+  } catch (err) {
+    if (extractedBinary) {
+      removeDirQuietly(path.dirname(extractedBinary));
+    }
+    process.stderr.write('[understatus] 압축 해제 실패: ' + err.message + '\n');
     process.exit(1);
-  }
-  if (tarResult.status !== 0) {
-    process.stderr.write(
-      '[understatus] tar 압축 해제 실패 (종료 코드 ' + tarResult.status + ').\n'
-    );
-    process.exit(1);
+  } finally {
+    // tarball 임시 파일 삭제
+    removeDirQuietly(downloadDir);
   }
 
   // 5단계: 실행 권한 부여
   try {
     fs.chmodSync(BINARY_PATH, 0o755);
   } catch (err) {
-    process.stderr.write(
-      '[understatus] chmod 실패: ' + err.message + '\n'
-    );
+    process.stderr.write('[understatus] chmod 실패: ' + err.message + '\n');
     process.exit(1);
   }
 
@@ -259,7 +332,17 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  process.stderr.write('[understatus] 예기치 않은 오류: ' + err.message + '\n');
-  process.exit(1);
-});
+if (require.main !== module) {
+  module.exports = {
+    computeSha256,
+    download,
+    expectedChecksum,
+    extractValidatedBinary,
+    removeDirQuietly,
+  };
+} else {
+  main().catch((err) => {
+    process.stderr.write('[understatus] 예기치 않은 오류: ' + err.message + '\n');
+    process.exit(1);
+  });
+}

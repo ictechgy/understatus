@@ -16,7 +16,7 @@ Most statusline widgets are noisy. understatus is designed around one principle:
 
 > **macOS only.** Apple Silicon (arm64) + Intel (x86\_64). Linux is not supported.
 >
-> **No Xcode required for the prebuilt paths.** Homebrew and npm install a **prebuilt binary** (deployment target macOS 11.0), so they need **no Xcode Command Line Tools and no Rust toolchain**, and run on **macOS 11 (Big Sur) and newer**. Only `cargo install` / building from source compiles locally and therefore needs the Rust toolchain + Command Line Tools.
+> **No Xcode required for the prebuilt paths.** Homebrew and npm install **prebuilt binaries** (deployment target macOS 11.0), so they need **no Xcode Command Line Tools and no Rust toolchain**, and run on **macOS 11 (Big Sur) and newer**. Only `cargo install` / building from source compiles locally and therefore needs the Rust toolchain + Command Line Tools.
 
 ---
 
@@ -217,7 +217,7 @@ All keys are optional; omitting a key uses its default.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `theme` | `"calm"` | Active theme preset. Valid values: `calm`, `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. The theme fills all eight visual keys not explicitly set in config; individual keys can still override it. |
-| `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency. |
+| `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency; the renderer caps this at 100 ms to keep the statusline hot path bounded. |
 | `[cpu] load_glyphs` | `["○","▁","▄","▆","◆"]` | Glyphs for idle→critical load stages. Color is applied to the glyph only. Filled by the active theme; override by writing this key explicitly. |
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
 | `[pulse] pulse_off_threshold` | `80` | CPU% below which the breath turns off (hysteresis). |
@@ -231,10 +231,13 @@ All keys are optional; omitting a key uses its default.
 | `[display] show_model` | `true` | Show Claude model name. |
 | `[display] show_cost` | `true` | Show cumulative session cost. |
 | `[display] show_context` | `true` | Show context usage %. Omitted automatically when null. |
-| `[display] show_git` | `true` | Show git branch (derived from `workspace.git_worktree` / repo). |
+| `[display] show_git` | `true` | Show git branch (Claude workspace path, or lterm/codex `cwd` walk-up when available). |
+| `[display] show_session` | `true` | Show lterm/codex session/pane label such as `codex/%3` when supplied by the input payload. |
 | `[display] show_battery` | `true` | Show battery (IOKit, 30 s TTL cache). Silently omitted on desktops. |
 | `[display] show_disk` | `true` | Show disk usage via `statfs("/")`. |
 | `[display] show_network` | `true` | Show network throughput (getifaddrs counter delta). First render has no delta — omitted silently. |
+| `[display] show_rate_limit` | `true` | Show Claude Code 5h/weekly rate-limit usage when `rate_limits` is present in stdin. Codex 5h/weekly usage is shown from Codex session enrichment when available. |
+| `[display] rate_limit_warn_threshold` | not set | Optional percent threshold. When set, Claude rate-limit values at or above the threshold are tinted with the critical color. |
 | `[color] mode` | `"auto"` | `"auto"` \| `"truecolor"` \| `"256"` \| `"none"`. Respects `NO_COLOR`. |
 | `[color] band_tints` | see below | Five hex colors for idle→critical glyph tint. Filled by the active theme; override by writing this key explicitly. |
 | `[color] pulse_palette` | `["#b87848","#7a5030"]` | High/low brightness endpoints for the breath animation. Filled by the active theme; override by writing this key explicitly. |
@@ -243,6 +246,9 @@ All keys are optional; omitting a key uses its default.
 | `[color] separator_color` | `"#3b4048"` | Color for separator and HUD seam. |
 | `[color] hud_seam` | `"│"` | Character placed between understatus output and the chained command output. |
 | `[refresh] interval_seconds` | `5` | Value written to `settings.json` as `refreshInterval`. Set via `install --interval` or the interactive prompt. On reinstall the existing value is inherited unless `--interval` overrides it. ⚠️ Global side-effect — see above. |
+| `[codex] enabled` | `true` | Enable best-effort Codex session enrichment for `--source lterm` / `--source codex` payloads whose agent looks like Codex. |
+| `[codex] freshness_minutes` | `240` | Only consider Codex rollout files modified within this many minutes. |
+| `[codex] scan_days` | `3` | Scan only this many recent Codex session date directories to keep `~/.codex` reads bounded. |
 | `[context] hold_ttl_seconds` | `180` | How long (s) to hold the previous native context % when Claude Code omits `used_percentage`. Lower = faster tracking of the real value; too low and ctx can briefly blank out when both native and token counts are 0. `0` disables hold. |
 | `[context] drop_tolerance` | `12` | Downward threshold (percentage points) for breaking the hold and switching to the token fallback. The fallback must be at least this far below the held native to count as a real drop (e.g. `/compact`). ⚠️ Lowering below 12 can reintroduce flicker from the native↔token denominator gap (observed 86↔98 = 12 pp). |
 
@@ -261,7 +267,9 @@ Claude Code  (every refreshInterval seconds)
    │  stdin: one JSON line
    ▼
 understatus binary  (new process per call — no daemon, no state files, no locks)
-   ├─ parse stdin  → ClaudeInput  (session_id extracted here)
+   ├─ read bounded stdin (1 MiB) → parse into ClaudeInput/lterm payload
+   ├─ load bounded config (256 KiB; invalid/oversized = defaults)
+   ├─ optional Codex enrich (`--source lterm|codex`, bounded ~/.codex scan)
    ├─ double-sample CPU  → cpu_percent (0–100%, average across all cores)
    │     on failure → loadavg fallback: min(load1 / ncpu × 100, 100)
    ├─ memory (host_statistics64)
@@ -274,7 +282,9 @@ understatus binary  (new process per call — no daemon, no state files, no lock
    └─ compose → stdout (single newline)
 ```
 
-**CPU measurement:** Two `/proc`-equivalent snapshots are taken ~25 ms apart within the same process invocation. The delta gives true instantaneous utilization — not a smoothed load average. If the syscall fails (rare), `loadavg` serves as a silent fallback.
+**CPU measurement:** Two macOS `host_processor_info` snapshots are taken ~25 ms apart within the same process invocation. The delta gives true instantaneous utilization — not a smoothed load average. If the syscall fails (rare), `loadavg` serves as a silent fallback. User-configured sample windows are capped at 100 ms so a statusline render cannot be delayed indefinitely by config.
+
+**Claude rate limits:** When Claude Code includes `rate_limits` in its statusLine stdin payload, understatus renders the 5h/weekly usage percent and reset countdown without making network calls. The segment is gated by `[display].show_rate_limit` and can be optionally tinted via `[display].rate_limit_warn_threshold`.
 
 **Glyph + tint design (COLOR-ONCE):** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored. The active theme fills these colors; individual config keys override the preset.
 
@@ -288,11 +298,23 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 
 | CLI | Status | Notes |
 |-----|--------|-------|
-| **Claude Code** | ✅ Full support | Custom `statusLine.command`, stdin JSON, `refreshInterval` (default 5 s) — all supported. |
-| **Gemini CLI** | ⏳ Stub / forward-looking | `/footer` and `/statusline` expose built-in items only; custom commands not yet supported (open issue). |
-| **Codex CLI** | ⏳ Stub / forward-looking | `[tui].status_line` is a fixed built-in; custom commands not yet supported (open issue). |
+| **Claude Code** | ✅ Full support | Custom `statusLine.command`, stdin JSON, `refreshInterval`, chain preservation, and Claude `rate_limits` rendering are supported. |
+| **lterm / cmux** | ✅ Native pill surface | `understatus render --source lterm --surface-format cmux-status` emits one-line JSON for cmux status pills. The plain lterm path can also use `--source lterm --oneline`. |
+| **Codex CLI (standalone)** | ⚠️ Manual/tmux path | Codex has a built-in `[tui].status_line` item list, not a Claude-style command hook. For tmux or shell status integrations, feed a small JSON payload to `understatus render --source codex --oneline`; understatus then enriches from `~/.codex` on a best-effort basis. |
+| **Gemini CLI** | ⏳ Forward-looking | `/footer` and `/statusline` expose built-in items only; custom command-backed statuslines are not supported by understatus today. |
 
-Gemini and Codex integration is documented and stubbed (`CliAdapter` trait planned) but not yet functional — those CLIs do not currently expose a custom statusline command hook.
+Examples:
+
+```bash
+# Codex tmux-style one-line text
+printf '{"agent":"codex","cwd":"%s"}' "$PWD" | understatus render --source codex --oneline
+
+# lterm cmux native status pills (JSON, no ANSI)
+printf '{"source":"lterm","session":"codex","pane":"%%3","cwd":"%s","agent":"codex"}' "$PWD" \
+  | understatus render --source lterm --surface-format cmux-status
+```
+
+For tmux status bars, prefer `color.mode = "none"` and let tmux apply its own `#[fg=...]` styling if raw ANSI SGR is not desired.
 
 ---
 
@@ -300,7 +322,7 @@ Gemini and Codex integration is documented and stubbed (`CliAdapter` trait plann
 
 - **macOS only.** Uses `host_processor_info`, `host_statistics64`, and `IOPSCopyPowerSourcesInfo` — all macOS-specific APIs.
 - **Apple Silicon (arm64) + Intel (x86\_64).** Tested on macOS arm64 with a 12-core Apple Silicon chip.
-- Linux: builds may succeed, but CPU double-sampling degrades silently to loadavg fallback. Not a supported target.
+- Linux: builds may succeed, but understatus is not a supported Linux target; macOS-specific metrics may degrade or be omitted.
 - **Rust edition 2021, MSRV 1.75+.**
 
 ---
@@ -313,16 +335,18 @@ MIT — see [LICENSE](LICENSE).
 
 ## 한국어 안내
 
-macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리, 디스크, 네트워크, AI 세션 정보(모델명·비용·컨텍스트)를 Claude Code 하단 표시줄에 조용하고 자연스럽게 표시합니다.
+macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리, 디스크, 네트워크, AI 세션 정보(모델명·비용·컨텍스트·rate-limit)를 Claude Code 하단 표시줄에 조용하고 자연스럽게 표시합니다.
 
 **주요 특징**
 
 - **9종 테마** — `calm`(기본), `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. 테마는 8개 시각 키(글리프·색상 등)를 한 번에 설정하며, 개별 키를 config.toml에 명시하면 테마보다 우선합니다.
 - **COLOR-ONCE 원칙** — 색은 글리프 문자에만 적용. 숫자 값(CPU%, 비용 등)은 항상 무색.
 - **≥90% 호흡** — CPU가 90% 이상으로 유지되면 임계 밴드 글리프가 테라코타 명도로 천천히 숨쉽니다(hue 변화 없음). 부드러운 애니메이션에는 `pulse_period / interval_seconds >= 6` 조건이 필요하며, 위반 시 설치 시점에 경고가 출력됩니다.
-- **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격) 직접 측정. loadavg 아님.
-- **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원.
+- **반응형 CPU** — 매 렌더마다 두 스냅샷(~25ms 간격)을 직접 측정합니다. loadavg가 아닙니다.
+- **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원합니다.
 - **세션 캐시 격리** — 체인 출력·펄스 상태·네트워크 델타 캐시는 `session_id`별로 분리되어 여러 터미널을 동시에 열어도 값이 섞이지 않습니다. 배터리는 머신 전역.
+- **Claude rate-limit 표시** — Claude Code stdin에 `rate_limits`가 들어오면 5h/weekly 사용률과 리셋 카운트다운을 네트워크 호출 없이 표시합니다.
+- **lterm/cmux·Codex 경로** — `--source lterm --surface-format cmux-status`는 cmux pill JSON을 출력하고, `--source codex --oneline`은 tmux나 셸 status 연동 환경에서 `~/.codex`를 best-effort로 보강합니다.
 
 **설치**
 
@@ -342,6 +366,12 @@ npm install -g understatus
 ```bash
 understatus install [--interval N] [--theme NAME] [--yes]
 understatus uninstall   # 원상 복원
+```
+
+Codex를 tmux status에서 직접 쓰는 경우:
+
+```bash
+printf '{"agent":"codex","cwd":"%s"}' "$PWD" | understatus render --source codex --oneline
 ```
 
 `--interval`/`--theme` 미지정 + TTY 환경이면 각 항목을 대화형으로 묻습니다. `--yes`(또는 비TTY)이면 플래그·기존값·기본값을 그대로 사용합니다. 재설치 시 `--interval`을 지정하지 않으면 기존 `config.toml`의 interval이 그대로 승계됩니다(기본 5초로 초기화되지 않습니다).
@@ -381,7 +411,7 @@ CPU가 `pulse_on_threshold`(기본 90%) 이상이면 임계 밴드 글리프가 
 
 화려한 테마 기본: `neon`·`spectrum` = `hue`, `aurora`·`sunset` = `flash`. 기존 5종은 모두 `calm`. 개별 키로 재정의 가능.
 
-펄스가 OFF(CPU < `pulse_off_threshold`)이면 스타일과 무관하게 정적 밴드 틴트로 표시됩니다 (애니메이션 없음).
+펄스가 OFF(CPU < `pulse_off_threshold`)이면 스타일과 무관하게 정적 밴드 틴트로 표시됩니다(애니메이션 없음).
 
 ```toml
 # ~/.config/understatus/config.toml

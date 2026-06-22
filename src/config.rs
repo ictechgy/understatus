@@ -4,8 +4,15 @@
 //! 전 항목 기본값으로 안전 저하하며(깨진 TOML은 stderr 경고), 절대 패닉하지 않는다.
 
 use serde::Deserialize;
+use std::io::Read;
 
 use crate::themes;
+
+/// 렌더 핫패스에서 허용하는 config.toml 최대 크기.
+///
+/// 실제 설정은 수 KiB 수준이다. 비정상적으로 큰 파일이 매 statusline 렌더마다 무제한 read/parse 비용을
+/// 유발하지 않도록 256KiB에서 기본값으로 안전 저하한다.
+const MAX_CONFIG_BYTES: usize = 256 * 1024;
 
 /// understatus 전체 설정. 각 섹션은 §H-8 TOML의 테이블에 1:1 대응한다.
 ///
@@ -367,13 +374,39 @@ pub fn load_config() -> Config {
         None => return Config::default(),
     };
 
+    load_config_from_path(&path)
+}
+
+/// 주어진 경로의 config를 크기 제한 안에서 로드한다.
+///
+/// 파일 부재/읽기 실패/UTF-8 오류/크기 초과는 모두 [`Config::default`]로 안전 저하한다. TOML 파싱
+/// 실패만 기존처럼 [`parse_config_str`]에서 stderr 경고를 출력한다.
+fn load_config_from_path(path: &std::path::Path) -> Config {
     // 파일 부재 → 조용히 기본값(경고 없음, AC7).
-    let contents = match std::fs::read_to_string(&path) {
+    let contents = match read_config_file_limited(path, MAX_CONFIG_BYTES) {
         Ok(contents) => contents,
         Err(_) => return Config::default(),
     };
 
     parse_config_str(&contents)
+}
+
+/// `path`를 `max_bytes` 이하로만 읽어 UTF-8 문자열로 반환한다.
+///
+/// `max_bytes + 1`까지만 읽어서 초과 여부를 확인하므로, 큰 설정 파일도 bounded work로 끝난다.
+fn read_config_file_limited(path: &std::path::Path, max_bytes: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    file.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config.toml exceeds hot-path size limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// 설정 파일 경로를 결정한다.
@@ -612,6 +645,65 @@ mod tests {
         // 기본값과 동일해야 한다.
         assert_eq!(config.cpu.sample_window_ms, 25);
         assert_eq!(config.pulse.pulse_on_threshold, 90.0);
+    }
+
+    /// 테스트별 임시 config 경로를 만든다(프로세스 pid + 라벨로 충돌 회피).
+    fn temp_config_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("understatus-config-{label}-{}", std::process::id()))
+    }
+
+    /// config 파일 제한 헬퍼는 한도 이하 UTF-8 설정을 그대로 읽어야 한다.
+    #[test]
+    fn read_config_file_limited_accepts_within_limit() {
+        let path = temp_config_path("within-limit");
+        std::fs::write(&path, "[display]\nmax_width = 120\n").expect("임시 config 작성");
+
+        let contents = read_config_file_limited(&path, MAX_CONFIG_BYTES).expect("읽기 성공");
+        assert!(contents.contains("max_width = 120"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 정확히 한도 크기인 config는 허용한다(off-by-one 회귀 방지).
+    #[test]
+    fn read_config_file_limited_allows_exact_limit() {
+        let path = temp_config_path("exact-limit");
+        std::fs::write(&path, "abcd").expect("임시 config 작성");
+
+        assert_eq!(read_config_file_limited(&path, 4).unwrap(), "abcd");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 한도를 초과한 config는 파싱하지 않고 기본값으로 안전 저하한다.
+    #[test]
+    fn oversized_config_falls_back_to_default() {
+        let path = temp_config_path("oversize");
+        let mut contents = String::from("theme = \"vivid\"\n#");
+        contents.push_str(&"x".repeat(MAX_CONFIG_BYTES + 1));
+        std::fs::write(&path, contents).expect("임시 config 작성");
+
+        assert!(read_config_file_limited(&path, 8).is_err());
+        let config = load_config_from_path(&path);
+        assert_eq!(
+            config.theme, "calm",
+            "MAX_CONFIG_BYTES 초과 파일은 사용자 테마를 파싱하지 않고 기본값으로 저하"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 손상 UTF-8 config도 TOML 파서까지 넘기지 않고 기본값으로 저하한다.
+    #[test]
+    fn invalid_utf8_config_falls_back_to_default() {
+        let path = temp_config_path("invalid-utf8");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("임시 config 작성");
+
+        assert!(read_config_file_limited(&path, MAX_CONFIG_BYTES).is_err());
+        let config = load_config_from_path(&path);
+        assert_eq!(config.theme, "calm");
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// chain_command의 `$HOME`이 실제 홈 경로로 확장되어야 한다.

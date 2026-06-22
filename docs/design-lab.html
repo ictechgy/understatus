@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>understatus — Calm-by-Default Direction</title>
+<title>understatus — Calm Statusline Design Lab</title>
 <style>
   /* ── Reset & base ─────────────────────────────────────────────── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -21,21 +21,21 @@
     --tx-base:     #7c8899;   /* readable labels */
     --tx-mid:      #9aaabb;   /* slightly elevated values */
 
-    /* 5 load-state accent colors — all desaturated until critical */
-    --load-0:      #4a5160;   /* <25%   near-invisible gray-blue */
-    --load-1:      #5e6d7d;   /* 25-50% muted slate */
-    --load-2:      #7088a0;   /* 50-75% cool steel, barely perceptible shift */
-    --load-3:      #8fa4b8;   /* 75-90% elevated but still cool */
-    --load-4:      #c48f5a;   /* >=90%  restrained amber-warm — the ONLY warm tone */
+    /* Five load-state accent colors — all desaturated until critical */
+    --load-0:      #5a6878;   /* <25%   quiet blue-grey */
+    --load-1:      #6d8296;   /* 25-50% muted slate */
+    --load-2:      #86a0b4;   /* 50-75% cool steel, still restrained */
+    --load-3:      #9fbfce;   /* 75-90% elevated but still cool */
+    --load-4:      #b87848;   /* >=90%  restrained terracotta — the only warm tone */
 
-    /* OMC HUD tail dimming */
+    /* Chained HUD tail dimming */
     --hud-op:      0.28;
 
     /* Separator */
     --sep-color:   #252a34;
 
     /* Subtle pulse timing for critical state only */
-    --pulse-dur:   5s;        /* demo speed; real would be ~30s */
+    --pulse-dur:   5s;        /* demo speed; default runtime period is ~30s */
   }
 
   body {
@@ -165,12 +165,12 @@
 
   /* ── Load glyph — minimal, one char wide ─────────────────────── */
   /*
-    Glyph choices by state (replacing emoji faces):
-      state-0 (<25)  : ·  tiny dot, barely there
-      state-1 (25-50): ─  em-dash stand-in, stable
-      state-2 (50-75): ▸  small right triangle, present
-      state-3 (75-90): ▲  upward, slightly elevated
-      state-4 (>=90) : ◆  solid diamond, warm tint + pulse
+    Glyph choices by state (current calm ramp):
+      state-0 (<25)  : ○  open circle, quiet baseline
+      state-1 (25-50): ▁  low bar, stable
+      state-2 (50-75): ▄  half block, present
+      state-3 (75-90): ▆  high block, elevated
+      state-4 (>=90) : ◆  solid diamond, terracotta tint + pulse
   */
   .load-glyph {
     font-size: 11px;
@@ -179,29 +179,24 @@
     display: inline-block;
   }
 
-  /* Per load-state color for the glyph + CPU value */
-  .ls-0 .load-glyph, .ls-0 .cpu-val { color: var(--load-0); }
-  .ls-1 .load-glyph, .ls-1 .cpu-val { color: var(--load-1); }
-  .ls-2 .load-glyph, .ls-2 .cpu-val { color: var(--load-2); }
-  .ls-3 .load-glyph, .ls-3 .cpu-val { color: var(--load-3); }
-  .ls-4 .load-glyph, .ls-4 .cpu-val { color: var(--load-4); }
+  /* Per load-state color for the glyph only (COLOR-ONCE). */
+  .ls-0 .load-glyph { color: var(--load-0); }
+  .ls-1 .load-glyph { color: var(--load-1); }
+  .ls-2 .load-glyph { color: var(--load-2); }
+  .ls-3 .load-glyph { color: var(--load-3); }
+  .ls-4 .load-glyph { color: var(--load-4); }
 
-  /* Critical state: slow, restrained warm pulse on the glyph + cpu value */
+  /* Critical state: slow, restrained terracotta pulse on the glyph only. */
   @keyframes gentle-warm-pulse {
     0%   { opacity: 1.0; }
     50%  { opacity: 0.55; }
     100% { opacity: 1.0; }
   }
-  .ls-4 .load-glyph,
-  .ls-4 .cpu-val {
+  .ls-4 .load-glyph {
     animation: gentle-warm-pulse var(--pulse-dur) ease-in-out infinite;
   }
-  /* Slightly offset the glyph vs. the value for depth */
-  .ls-4 .cpu-val {
-    animation-delay: calc(var(--pulse-dur) * -0.12);
-  }
 
-  /* ── OMC HUD tail — heavily dimmed, not yours ─────────────────── */
+  /* ── Chained HUD tail — heavily dimmed secondary output ───────── */
   .hud-tail {
     opacity: var(--hud-op);
     color: var(--tx-mid);
@@ -300,9 +295,9 @@
 <body>
 
 <!-- ══════════════════════════════════════════════════════════
-     SECTION 1: All 5 load states — full segment set
+     SECTION 1: All five load states — full segment set
      ══════════════════════════════════════════════════════════ -->
-<div class="section-label">All 5 load states — full segment set</div>
+<div class="section-label">All five load states — full segment set</div>
 
 <!-- ── State 0: idle (<25%) ─────────────────────────────── -->
 <div class="preview-row">
@@ -324,7 +319,7 @@
       <div class="statusbar ls-0">
         <!-- understatus segment -->
         <span class="seg">
-          <span class="load-glyph">·</span>
+          <span class="load-glyph">○</span>
           <span class="cpu-val val">12%</span>
         </span>
         <span class="sep">·</span>
@@ -344,7 +339,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -354,7 +349,7 @@
         <span class="sep">·</span>
         <span class="seg">
           <span class="lbl">⎇</span>
-          <span class="val">master</span>
+          <span class="val">main</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -366,8 +361,8 @@
         </span>
         <!-- HUD boundary -->
         <span class="hud-boundary"></span>
-        <!-- OMC HUD tail — dimmed, not understatus's -->
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:12% | tokens:48k | cost:$1.23</span>
+        <!-- Chained HUD tail — dimmed secondary output -->
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:12% | tokens:48k | cost:$1.23</span>
       </div>
     </div>
   </div>
@@ -391,7 +386,7 @@
       </div>
       <div class="statusbar ls-1">
         <span class="seg">
-          <span class="load-glyph">─</span>
+          <span class="load-glyph">▁</span>
           <span class="cpu-val val">34%</span>
         </span>
         <span class="sep">·</span>
@@ -411,7 +406,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -421,7 +416,7 @@
         <span class="sep">·</span>
         <span class="seg">
           <span class="lbl">⎇</span>
-          <span class="val">master</span>
+          <span class="val">main</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -432,7 +427,7 @@
           <span class="lbl">$</span><span class="val">2.07</span>
         </span>
         <span class="hud-boundary"></span>
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:31% | tokens:89k | cost:$2.07</span>
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:31% | tokens:89k | cost:$2.07</span>
       </div>
     </div>
   </div>
@@ -455,7 +450,7 @@
       </div>
       <div class="statusbar ls-2">
         <span class="seg">
-          <span class="load-glyph">▸</span>
+          <span class="load-glyph">▄</span>
           <span class="cpu-val val">61%</span>
         </span>
         <span class="sep">·</span>
@@ -475,7 +470,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -496,7 +491,7 @@
           <span class="lbl">$</span><span class="val">4.51</span>
         </span>
         <span class="hud-boundary"></span>
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:58% | tokens:201k | cost:$4.51</span>
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:58% | tokens:201k | cost:$4.51</span>
       </div>
     </div>
   </div>
@@ -519,7 +514,7 @@
       </div>
       <div class="statusbar ls-3">
         <span class="seg">
-          <span class="load-glyph">▲</span>
+          <span class="load-glyph">▆</span>
           <span class="cpu-val val">83%</span>
         </span>
         <span class="sep">·</span>
@@ -539,7 +534,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -560,15 +555,15 @@
           <span class="lbl">$</span><span class="val">8.90</span>
         </span>
         <span class="hud-boundary"></span>
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:74% | tokens:398k | cost:$8.90</span>
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:74% | tokens:398k | cost:$8.90</span>
       </div>
     </div>
   </div>
 </div>
 
-<!-- ── State 4: critical (>=90%) — THE ONLY ONE THAT PULSES ── -->
+<!-- ── State 4: critical (>=90%) — the only pulsing state ── -->
 <div class="preview-row">
-  <div class="row-label">State 4 · CPU ≥90% · critical — restrained warm pulse (demo: 5s; real: ~30s)</div>
+  <div class="row-label">State 4 · CPU ≥90% · critical — restrained terracotta pulse (demo: 5s; runtime default: ~30s)</div>
   <div class="terminal">
     <div class="terminal-titlebar">
       <div class="dot dot-close"></div>
@@ -603,7 +598,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -624,7 +619,7 @@
           <span class="lbl">$</span><span class="val">14.02</span>
         </span>
         <span class="hud-boundary"></span>
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:88% | tokens:491k | cost:$14.02</span>
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:88% | tokens:491k | cost:$14.02</span>
       </div>
     </div>
   </div>
@@ -634,7 +629,7 @@
 <!-- ══════════════════════════════════════════════════════════
      SECTION 2: Palette legend
      ══════════════════════════════════════════════════════════ -->
-<div class="section-label">Palette — load-state accents + hierarchy</div>
+<div class="section-label">Palette — load-state accents and hierarchy</div>
 
 <div class="palette-grid">
   <div class="palette-chip">
@@ -673,38 +668,38 @@
     </div>
   </div>
   <div class="palette-chip">
-    <div class="color-swatch" style="background:#4a5160;border:1px solid #252a34;"></div>
+    <div class="color-swatch" style="background:#5a6878;border:1px solid #252a34;"></div>
     <div class="chip-info">
       <span class="chip-name">Load state 0 — idle</span>
-      <span class="chip-hex">#4a5160 · &lt;25%</span>
+      <span class="chip-hex">#5a6878 · &lt;25%</span>
     </div>
   </div>
   <div class="palette-chip">
-    <div class="color-swatch" style="background:#5e6d7d;"></div>
+    <div class="color-swatch" style="background:#6d8296;"></div>
     <div class="chip-info">
       <span class="chip-name">Load state 1 — light</span>
-      <span class="chip-hex">#5e6d7d · 25–50%</span>
+      <span class="chip-hex">#6d8296 · 25–50%</span>
     </div>
   </div>
   <div class="palette-chip">
-    <div class="color-swatch" style="background:#7088a0;"></div>
+    <div class="color-swatch" style="background:#86a0b4;"></div>
     <div class="chip-info">
       <span class="chip-name">Load state 2 — moderate</span>
-      <span class="chip-hex">#7088a0 · 50–75%</span>
+      <span class="chip-hex">#86a0b4 · 50–75%</span>
     </div>
   </div>
   <div class="palette-chip">
-    <div class="color-swatch" style="background:#8fa4b8;"></div>
+    <div class="color-swatch" style="background:#9fbfce;"></div>
     <div class="chip-info">
       <span class="chip-name">Load state 3 — elevated</span>
-      <span class="chip-hex">#8fa4b8 · 75–90%</span>
+      <span class="chip-hex">#9fbfce · 75–90%</span>
     </div>
   </div>
-  <div class="palette-chip" style="border-color:#c48f5a44;">
-    <div class="color-swatch" style="background:#c48f5a;"></div>
+  <div class="palette-chip" style="border-color:#b8784844;">
+    <div class="color-swatch" style="background:#b87848;"></div>
     <div class="chip-info">
       <span class="chip-name">Load state 4 — critical ◆</span>
-      <span class="chip-hex">#c48f5a · ≥90% · pulses</span>
+      <span class="chip-hex">#b87848 · ≥90% · pulses</span>
     </div>
   </div>
 </div>
@@ -716,18 +711,18 @@
 <div class="section-label">Design notes</div>
 
 <div class="notes">
-  <strong>Glyph strategy.</strong> Emoji faces replaced with five minimal Unicode characters:
-  <code>·</code> (idle) <code>─</code> (light) <code>▸</code> (moderate) <code>▲</code> (elevated) <code>◆</code> (critical).
-  Each is one character wide, readable in any terminal font, has no color of its own, and escalates
-  visually along a purely geometric axis — not an emotional one.
+  <strong>Glyph strategy.</strong> The calm ramp uses five minimal Unicode characters:
+  <code>○</code> (idle) <code>▁</code> (light) <code>▄</code> (moderate) <code>▆</code> (elevated) <code>◆</code> (critical).
+  Each is compact, readable in common terminal fonts, has no semantic color of its own, and escalates
+  visually along a geometric axis — not an emotional one.
   <ul>
-    <li><strong>States 0–3</strong> use only cool blue-grays, shifting temperature/brightness by ~15 L* steps.
-      No hue shift, no saturation increase. A developer reading code will not register these as "alerts".</li>
-    <li><strong>State 4</strong> is the single hue exception: amber <code>#c48f5a</code> — warm but desaturated,
-      closer to an aged document than a warning light. The slow opacity pulse (50s default / 5s demo)
-      is perceptible on the periphery without demanding attention.</li>
-    <li><strong>OMC HUD tail</strong> is rendered at 28% opacity with a hairline left border,
-      making it clearly separate yet readable when glanced at. understatus's own segment never competes.</li>
+    <li><strong>States 0–3</strong> use only cool blue-greys, increasing brightness without crossing into alert colors.
+      A developer reading code should not register these states as alarms.</li>
+    <li><strong>State 4</strong> is the single hue exception: terracotta <code>#b87848</code> — warm but desaturated,
+      closer to an aged document than a warning light. The slow opacity pulse (30s runtime default / 5s demo)
+      is perceptible at the edge of attention without demanding it.</li>
+    <li><strong>Chained HUD tail</strong> is rendered at 28% opacity with a hairline left border,
+      making it clearly separate yet readable at a glance. understatus's own segment never competes.</li>
     <li><strong>Separators</strong> are mid-dot <code>·</code> at near-invisible gray rather than pipes or slashes,
       keeping the baseline flat and undemanding.</li>
     <li><strong>Label/value split</strong>: short prefixes (<code>mem</code> <code>disk</code> <code>ctx</code> <code>⎇</code>)
@@ -739,7 +734,7 @@
 <!-- ══════════════════════════════════════════════════════════
      SECTION 4: Light-terminal variant (bonus)
      ══════════════════════════════════════════════════════════ -->
-<div class="section-label">Light terminal variant — state 4 critical (for reference)</div>
+<div class="section-label">Light terminal variant — state 4 critical reference</div>
 
 <style>
   .light-term {
@@ -754,7 +749,7 @@
     --load-1:      #9a9590;
     --load-2:      #8a7f78;
     --load-3:      #7a6e68;
-    --load-4:      #a0622a;
+    --load-4:      #b87848;
     --sep-color:   #d8d2ca;
     --hud-op:      0.35;
   }
@@ -783,12 +778,11 @@
   .light-term .sep        { color: var(--tx-dim); }
   .light-term .hud-tail   { color: var(--tx-mid); opacity: var(--hud-op); }
   .light-term .hud-boundary { border-color: var(--sep-color); opacity: 0.5; }
-  .light-term .ls-4 .load-glyph,
-  .light-term .ls-4 .cpu-val { color: var(--load-4); }
+  .light-term .ls-4 .load-glyph { color: var(--load-4); }
 </style>
 
 <div class="preview-row light-term">
-  <div class="row-label" style="color:#b8b0a4;">Light terminal · State 4 · CPU ≥90% · restrained warm pulse</div>
+  <div class="row-label" style="color:#b8b0a4;">Light terminal · State 4 · CPU ≥90% · restrained terracotta pulse</div>
   <div class="terminal">
     <div class="terminal-titlebar">
       <div class="dot dot-close"></div>
@@ -823,7 +817,7 @@
         </span>
         <span class="sep">·</span>
         <span class="seg">
-          <span class="val">Claude Opus 4.8</span>
+          <span class="val">Claude Opus</span>
         </span>
         <span class="sep">·</span>
         <span class="seg">
@@ -844,7 +838,7 @@
           <span class="lbl">$</span><span class="val">14.02</span>
         </span>
         <span class="hud-boundary"></span>
-        <span class="hud-tail">[OMC#4.14.2] | Model: Opus 4.8 | 5h:5% | session:361m | ctx:88% | tokens:491k | cost:$14.02</span>
+        <span class="hud-tail">[chain] | Model: Opus | 5h:5% | session:361m | ctx:88% | tokens:491k | cost:$14.02</span>
       </div>
     </div>
   </div>
