@@ -217,7 +217,7 @@ All keys are optional; omitting a key uses its default.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `theme` | `"calm"` | Active theme preset. Valid values: `calm`, `mono`, `vivid`, `ember`, `emoji`, `neon`, `aurora`, `sunset`, `spectrum`. The theme fills all eight visual keys not explicitly set in config; individual keys can still override it. |
-| `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency; render caps this at 100 ms to keep the statusline hot path bounded. |
+| `[cpu] sample_window_ms` | `25` | Interval (ms) between the two CPU snapshots. Larger = less noise, more latency; the renderer caps this at 100 ms to keep the statusline hot path bounded. |
 | `[cpu] load_glyphs` | `["○","▁","▄","▆","◆"]` | Glyphs for idle→critical load stages. Color is applied to the glyph only. Filled by the active theme; override by writing this key explicitly. |
 | `[pulse] pulse_on_threshold` | `90` | CPU% at which the critical glyph starts breathing. |
 | `[pulse] pulse_off_threshold` | `80` | CPU% below which the breath turns off (hysteresis). |
@@ -236,7 +236,7 @@ All keys are optional; omitting a key uses its default.
 | `[display] show_battery` | `true` | Show battery (IOKit, 30 s TTL cache). Silently omitted on desktops. |
 | `[display] show_disk` | `true` | Show disk usage via `statfs("/")`. |
 | `[display] show_network` | `true` | Show network throughput (getifaddrs counter delta). First render has no delta — omitted silently. |
-| `[display] show_rate_limit` | `true` | Show Claude Code 5h/weekly rate-limit usage when `rate_limits` is present in stdin. Codex 5h/wk usage is shown from Codex session enrichment when available. |
+| `[display] show_rate_limit` | `true` | Show Claude Code 5h/weekly rate-limit usage when `rate_limits` is present in stdin. Codex 5h/weekly usage is shown from Codex session enrichment when available. |
 | `[display] rate_limit_warn_threshold` | not set | Optional percent threshold. When set, Claude rate-limit values at or above the threshold are tinted with the critical color. |
 | `[color] mode` | `"auto"` | `"auto"` \| `"truecolor"` \| `"256"` \| `"none"`. Respects `NO_COLOR`. |
 | `[color] band_tints` | see below | Five hex colors for idle→critical glyph tint. Filled by the active theme; override by writing this key explicitly. |
@@ -284,7 +284,7 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 
 **CPU measurement:** Two macOS `host_processor_info` snapshots are taken ~25 ms apart within the same process invocation. The delta gives true instantaneous utilization — not a smoothed load average. If the syscall fails (rare), `loadavg` serves as a silent fallback. User-configured sample windows are capped at 100 ms so a statusline render cannot be delayed indefinitely by config.
 
-**Claude rate limits:** When Claude Code includes `rate_limits` in its statusLine stdin payload, understatus renders the 5h/weekly usage percent and reset countdown without making network calls. The segment is gated by `[display].show_rate_limit` and can be opt-in tinted with `[display].rate_limit_warn_threshold`.
+**Claude rate limits:** When Claude Code includes `rate_limits` in its statusLine stdin payload, understatus renders the 5h/weekly usage percent and reset countdown without making network calls. The segment is gated by `[display].show_rate_limit` and can be optionally tinted via `[display].rate_limit_warn_threshold`.
 
 **Glyph + tint design (COLOR-ONCE):** `band_tints[0..3]` are cool blue-grey values of increasing brightness (idle to high load). `band_tints[4]` is the lone warm color — terracotta — reserved for the critical stage. Only the glyph character receives color; all numeric values and labels stay uncolored. The active theme fills these colors; individual config keys override the preset.
 
@@ -300,7 +300,7 @@ understatus binary  (new process per call — no daemon, no state files, no lock
 |-----|--------|-------|
 | **Claude Code** | ✅ Full support | Custom `statusLine.command`, stdin JSON, `refreshInterval`, chain preservation, and Claude `rate_limits` rendering are supported. |
 | **lterm / cmux** | ✅ Native pill surface | `understatus render --source lterm --surface-format cmux-status` emits one-line JSON for cmux status pills. The plain lterm path can also use `--source lterm --oneline`. |
-| **Codex CLI (standalone)** | ⚠️ Manual/tmux path | Codex has a built-in `[tui].status_line` item list, not a Claude-style command hook. For tmux or shell status integrations, feed a small JSON payload to `understatus render --source codex --oneline`; understatus then best-effort enriches from `~/.codex`. |
+| **Codex CLI (standalone)** | ⚠️ Manual/tmux path | Codex has a built-in `[tui].status_line` item list, not a Claude-style command hook. For tmux or shell status integrations, feed a small JSON payload to `understatus render --source codex --oneline`; understatus then enriches from `~/.codex` on a best-effort basis. |
 | **Gemini CLI** | ⏳ Forward-looking | `/footer` and `/statusline` expose built-in items only; custom command-backed statuslines are not supported by understatus today. |
 
 Examples:
@@ -346,7 +346,7 @@ macOS용 AI 코딩 CLI statusline 애드온입니다. CPU%, 메모리, 배터리
 - **비파괴 설치** — 기존 `statusLine.command`를 체이닝으로 보존하고 정확히 복원합니다.
 - **세션 캐시 격리** — 체인 출력·펄스 상태·네트워크 델타 캐시는 `session_id`별로 분리되어 여러 터미널을 동시에 열어도 값이 섞이지 않습니다. 배터리는 머신 전역.
 - **Claude rate-limit 표시** — Claude Code stdin에 `rate_limits`가 들어오면 5h/weekly 사용률과 리셋 카운트다운을 네트워크 호출 없이 표시합니다.
-- **lterm/cmux·Codex 경로** — `--source lterm --surface-format cmux-status`는 cmux pill JSON을 출력하고, `--source codex --oneline`은 tmux 같은 수동 status integration에서 `~/.codex`를 best-effort로 보강합니다.
+- **lterm/cmux·Codex 경로** — `--source lterm --surface-format cmux-status`는 cmux pill JSON을 출력하고, `--source codex --oneline`은 tmux나 셸 status 연동 환경에서 `~/.codex`를 best-effort로 보강합니다.
 
 **설치**
 
@@ -388,7 +388,7 @@ understatus themes         # 사용 가능한 테마 목록
 
 | 이름 | 글리프 램프 (idle → crit) | 설명 |
 |------|--------------------------|------|
-| `calm` | `○ ▁ ▄ ▆ ◆` | 차분한 blue-grey + 테라코타 호흡 (기본) |
+| `calm` | `○ ▁ ▄ ▆ ◆` | 차가운 blue-grey + 테라코타 호흡 (기본) |
 | `mono` | `○ ▁ ▄ ▆ ◆` | 무채색, 제로 색상 |
 | `vivid` | `░ ▒ ▓ █ █` | 신호등 색 + 블록 글리프 |
 | `ember` | `· ∙ • ● ◉` | 따뜻한 앰버/테라코타 단색 + 도트 글리프 |
