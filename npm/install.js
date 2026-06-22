@@ -22,7 +22,7 @@ const os = require('os');
 // 네이티브 바이너리를 받아오는 GitHub 릴리스 태그.
 // release/publish guard가 Cargo.toml, npm/package.json, 이 값, git tag를 lockstep으로
 // 검증합니다. 새 네이티브 릴리스를 낼 때 네 버전을 함께 올리세요.
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 
 // CPU 아키텍처를 Rust 타겟 트리플로 매핑
 const archMap = {
